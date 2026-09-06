@@ -71,6 +71,7 @@ import pathlib
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -733,11 +734,89 @@ def _git_ignored_snapshot_paths(target_workdir: pathlib.Path) -> set[pathlib.Pat
     }
 
 
+def _git_path_is_ignored(target_workdir: pathlib.Path, relative_path: pathlib.Path) -> bool:
+    """Return whether Git ignores a candidate path, including an absent one."""
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(target_workdir),
+                "check-ignore",
+                "--quiet",
+                "--no-index",
+                "--",
+                os.fspath(relative_path),
+            ],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Cannot determine whether review path is Git-ignored") from exc
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    raise RuntimeError("Cannot determine whether review path is Git-ignored")
+
+
+def _git_tracked_symlink_paths(target_workdir: pathlib.Path) -> set[pathlib.Path]:
+    """Return tracked symlink paths from the target repository index."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(target_workdir), "ls-files", "--stage", "-z"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Cannot determine tracked review symlinks") from exc
+    if proc.returncode != 0:
+        raise RuntimeError("Cannot determine tracked review symlinks")
+
+    tracked: set[pathlib.Path] = set()
+    for raw in proc.stdout.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            metadata, path = raw.split(b"\t", 1)
+        except ValueError as exc:
+            raise RuntimeError("Cannot parse tracked review symlinks") from exc
+        if metadata.split(maxsplit=1)[0] == b"120000":
+            tracked.add(pathlib.Path(os.fsdecode(path)))
+    return tracked
+
+
+def _safe_relative_symlink_target(
+    entry: pathlib.Path, target_workdir: pathlib.Path
+) -> pathlib.Path | None:
+    """Return an in-tree lexical target for a safe relative symlink."""
+    try:
+        raw_target = os.readlink(entry)
+        if os.path.isabs(raw_target):
+            return None
+        target_real = target_workdir.resolve(strict=True)
+        resolved = (entry.parent / raw_target).resolve(strict=False)
+        if resolved == target_real or resolved == entry:
+            return None
+        entry_parent = entry.parent.resolve(strict=True)
+        if resolved in entry_parent.parents:
+            return None
+        resolved.relative_to(target_real)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if resolved.is_symlink():
+        return None
+    return resolved
+
+
 def _validate_snapshot_symlinks(
     target_workdir: pathlib.Path, ignored_paths: set[pathlib.Path]
 ) -> None:
-    """Validate that target_workdir contains no unsafe, escaping, or dangling symlinks."""
+    """Validate only tracked, relative, in-tree, non-looping symlinks."""
     target_real = target_workdir.resolve(strict=True)
+    tracked_symlinks = _git_tracked_symlink_paths(target_workdir)
     for root, dirs, files in os.walk(target_workdir, topdown=True, followlinks=False):
         root_path = pathlib.Path(root)
         root_relative = root_path.relative_to(target_workdir)
@@ -750,25 +829,32 @@ def _validate_snapshot_symlinks(
                 continue
             if entry.is_symlink():
                 try:
-                    resolved = entry.resolve(strict=True)
-                except (OSError, RuntimeError) as exc:
+                    raw_target = os.readlink(entry)
+                except OSError as exc:
+                    raise RuntimeError(f"Cannot read workspace symlink: {entry}") from exc
+                if os.path.isabs(raw_target):
+                    raise RuntimeError(
+                        f"Target workspace contains unsupported absolute symlink: {entry}"
+                    )
+                relative_entry = entry.relative_to(target_workdir)
+                if relative_entry not in tracked_symlinks:
+                    raise RuntimeError(
+                        f"Target workspace contains untracked symlink: {entry}"
+                    )
+                safe_target = _safe_relative_symlink_target(entry, target_workdir)
+                if safe_target is None:
                     raise RuntimeError(
                         f"Target workspace contains unsafe dangling or looping symlink: {entry}"
-                    ) from exc
-                if not (resolved == target_real or target_real in resolved.parents):
-                    raise RuntimeError(
-                        f"Target workspace contains unsafe escaping symlink: {entry} -> {resolved}"
                     )
-                entry_parent = entry.parent.resolve(strict=True)
-                if resolved == entry_parent or resolved in entry_parent.parents:
+                safe_relative = safe_target.relative_to(target_real)
+                if _git_path_is_ignored(target_workdir, safe_relative):
                     raise RuntimeError(
-                        f"Target workspace symlink resolves to its own ancestor or root: {entry}"
+                        f"Target workspace symlink resolves into a Git-ignored path: {entry}"
                     )
-                resolved_relative = resolved.relative_to(target_real)
                 if any(
-                    ignored == resolved_relative
-                    or ignored in resolved_relative.parents
-                    or resolved_relative in ignored.parents
+                    ignored == safe_relative
+                    or ignored in safe_relative.parents
+                    or safe_relative in ignored.parents
                     for ignored in ignored_paths
                 ):
                     raise RuntimeError(
@@ -776,35 +862,629 @@ def _validate_snapshot_symlinks(
                     )
 
 
-def _materialize_snapshot_symlinks(target_workdir: pathlib.Path, review_dir: pathlib.Path) -> None:
-    """Preserve safe relative links and materialize links that retain source reachability."""
-    target_real = target_workdir.resolve(strict=True)
-    review_real = review_dir.resolve(strict=True)
-    for root, dirs, files in os.walk(review_dir, topdown=False, followlinks=False):
-        root_path = pathlib.Path(root)
-        for name in dirs + files:
-            entry = root_path / name
-            if entry.is_symlink():
-                rel = entry.relative_to(review_dir)
-                orig = target_workdir / rel
+def _validate_regular_git_metadata_tree(git_dir: pathlib.Path, label: str) -> None:
+    """Reject symlinks and special files before they reach review Git metadata."""
+    _validate_git_metadata_path(git_dir, label)
+    try:
+        root_mode = git_dir.lstat().st_mode
+    except OSError as exc:
+        raise RuntimeError(f"Cannot inspect {label}: {git_dir}") from exc
+    if not stat.S_ISDIR(root_mode):
+        raise RuntimeError(f"{label} is not a real directory: {git_dir}")
+    for entry in git_dir.rglob("*"):
+        try:
+            mode = entry.lstat().st_mode
+        except OSError as exc:
+            raise RuntimeError(f"Cannot inspect {label}: {entry}") from exc
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise RuntimeError(f"Unsafe non-regular file in {label}: {entry}")
+
+
+def _validate_git_metadata_path(path: pathlib.Path, label: str) -> pathlib.Path:
+    """Reject symlinked path components before accessing Git metadata."""
+    candidate = pathlib.Path(path)
+    if not candidate.is_absolute():
+        candidate = pathlib.Path.cwd() / candidate
+    current = pathlib.Path(candidate.anchor)
+    for component in candidate.parts[1:]:
+        if component in ("", "."):
+            continue
+        if component == "..":
+            current = current.parent
+            continue
+        current /= component
+        try:
+            mode = current.lstat().st_mode
+        except OSError as exc:
+            raise RuntimeError(f"Cannot inspect {label}: {current}") from exc
+        if stat.S_ISLNK(mode):
+            raise RuntimeError(f"Symlinked path component in {label}: {current}")
+    return candidate
+
+
+def _git_metadata_path_fingerprint(
+    path: pathlib.Path, label: str
+) -> tuple[tuple[str, int, int], ...]:
+    """Capture component identities while rejecting symlinked components."""
+    candidate = _validate_git_metadata_path(path, label)
+    current = pathlib.Path(candidate.anchor)
+    fingerprint: list[tuple[str, int, int]] = []
+    for component in candidate.parts[1:]:
+        if component in ("", "."):
+            continue
+        if component == "..":
+            current = current.parent
+            continue
+        current /= component
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"Cannot inspect {label}: {current}") from exc
+        fingerprint.append((os.fspath(current), info.st_dev, info.st_ino))
+    return tuple(fingerprint)
+
+
+def _resolve_git_metadata_path(
+    raw_path: str, base_dir: pathlib.Path, label: str
+) -> pathlib.Path:
+    """Resolve a required Git metadata path without traversing symlinks."""
+    raw = pathlib.Path(raw_path)
+    candidate = raw if raw.is_absolute() else base_dir / raw
+    before = _git_metadata_path_fingerprint(candidate, label)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"Cannot resolve {label}: {candidate}") from exc
+    _validate_git_metadata_path(resolved, label)
+    after = _git_metadata_path_fingerprint(candidate, label)
+    if before != after:
+        raise RuntimeError(f"Git metadata path changed while resolving: {candidate}")
+    return resolved
+
+
+def _read_regular_git_metadata_file(source: pathlib.Path) -> tuple[bytes, int]:
+    """Read one metadata file without following a symlink at its final path."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise RuntimeError("Safe Git metadata copy requires O_NOFOLLOW")
+    before = _git_metadata_path_fingerprint(source, "Git metadata file")
+    try:
+        source_fd = os.open(source, os.O_RDONLY | nofollow)
+    except OSError as exc:
+        raise RuntimeError(f"Cannot safely read Git metadata file: {source}") from exc
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise RuntimeError(f"Unsafe non-regular Git metadata file: {source}")
+        with os.fdopen(source_fd, "rb", closefd=False) as source_file:
+            content = source_file.read()
+    finally:
+        os.close(source_fd)
+    try:
+        after = _git_metadata_path_fingerprint(source, "Git metadata file")
+    except RuntimeError as exc:
+        raise RuntimeError(f"Git metadata file changed while reading: {source}") from exc
+    if before != after:
+        raise RuntimeError(f"Git metadata file changed while reading: {source}")
+    return content, stat.S_IMODE(source_stat.st_mode)
+
+
+def _copy_regular_git_metadata_file(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Copy one metadata file without following a source or destination symlink."""
+    content, source_mode = _read_regular_git_metadata_file(source)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise RuntimeError("Safe Git metadata copy requires O_NOFOLLOW")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | nofollow,
+            source_mode,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Cannot safely write review Git metadata file: {destination}") from exc
+    try:
+        with os.fdopen(destination_fd, "wb", closefd=False) as destination_file:
+            destination_file.write(content)
+    finally:
+        os.close(destination_fd)
+    os.chmod(destination, source_mode)
+
+
+def _copy_pinned_git_metadata_tree(
+    source_root: pathlib.Path,
+    destination_root: pathlib.Path,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Copy a validated Git metadata tree through pinned directory FDs.
+
+    The source root is opened with ``O_NOFOLLOW`` and ``O_DIRECTORY`` and all
+    descendants are addressed relative to that pinned descriptor.  A
+    pathname-only copy would reopen a replaced common Git directory after the
+    validation pass and could copy attacker-controlled metadata into review.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise RuntimeError("Safe Git metadata copy requires O_NOFOLLOW and O_DIRECTORY")
+    source_root = pathlib.Path(source_root)
+    destination_root = pathlib.Path(destination_root)
+    destination_parent = destination_root.parent
+    _validate_git_metadata_path(source_root, "common Git metadata")
+    _validate_git_metadata_path(destination_parent, "review Git metadata destination")
+
+    directory_flags = os.O_RDONLY | nofollow | directory
+    source_fd: int | None = None
+    destination_parent_fd: int | None = None
+    destination_fd: int | None = None
+
+    def identity(info: os.stat_result) -> tuple[int, int]:
+        return (int(info.st_dev), int(info.st_ino))
+
+    def fail_swap(path: pathlib.Path) -> RuntimeError:
+        return RuntimeError(f"Git metadata path changed during copy: {path}")
+
+    def entry_stat(parent_fd: int, name: str, relative: pathlib.Path) -> os.stat_result:
+        try:
+            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot inspect common Git metadata entry: {relative}"
+            ) from exc
+
+    def assert_entry_unchanged(
+        parent_fd: int,
+        name: str,
+        expected: tuple[int, int],
+        relative: pathlib.Path,
+    ) -> None:
+        current = entry_stat(parent_fd, name, relative)
+        if identity(current) != expected:
+            raise fail_swap(relative)
+
+    def copy_directory(src_dir_fd: int, dst_dir_fd: int, relative: pathlib.Path) -> None:
+        try:
+            with os.scandir(src_dir_fd) as iterator:
+                names = [entry.name for entry in iterator]
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot enumerate common Git metadata: {relative or pathlib.Path('.') }"
+            ) from exc
+
+        for name in names:
+            child_relative = relative / name if relative != pathlib.Path(".") else pathlib.Path(name)
+            source_entry = entry_stat(src_dir_fd, name, child_relative)
+            source_identity = identity(source_entry)
+            mode = source_entry.st_mode
+            if stat.S_ISDIR(mode):
                 try:
-                    target_resolved = orig.resolve(strict=True)
-                except (OSError, RuntimeError) as exc:
-                    raise RuntimeError(f"Cannot resolve in-tree symlink {entry}") from exc
-                if not (target_resolved == target_real or target_real in target_resolved.parents):
-                    raise RuntimeError(f"Escaping symlink found during materialization: {entry}")
-                if not pathlib.Path(os.readlink(orig)).is_absolute():
+                    child_src_fd = os.open(
+                        name, directory_flags, dir_fd=src_dir_fd
+                    )
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Cannot safely open common Git metadata directory: {child_relative}"
+                    ) from exc
+                try:
+                    opened = os.fstat(child_src_fd)
+                    if identity(opened) != source_identity:
+                        raise fail_swap(child_relative)
                     try:
-                        review_resolved = entry.resolve(strict=True)
-                    except (OSError, RuntimeError) as exc:
-                        raise RuntimeError(f"Cannot resolve copied symlink {entry}") from exc
-                    if review_real in review_resolved.parents:
-                        continue
-                entry.unlink()
-                if target_resolved.is_dir():
-                    shutil.copytree(target_resolved, entry, symlinks=False)
-                else:
-                    shutil.copy2(target_resolved, entry)
+                        os.mkdir(
+                            name,
+                            stat.S_IMODE(mode),
+                            dir_fd=dst_dir_fd,
+                        )
+                    except FileExistsError as exc:
+                        raise RuntimeError(
+                            f"Review Git metadata destination already exists: {child_relative}"
+                        ) from exc
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"Cannot create review Git metadata directory: {child_relative}"
+                        ) from exc
+                    try:
+                        child_dst_fd = os.open(
+                            name,
+                            directory_flags,
+                            dir_fd=dst_dir_fd,
+                        )
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"Cannot safely open review Git metadata directory: {child_relative}"
+                        ) from exc
+                    try:
+                        copy_directory(child_src_fd, child_dst_fd, child_relative)
+                        os.fchmod(child_dst_fd, stat.S_IMODE(mode))
+                    finally:
+                        os.close(child_dst_fd)
+                    if identity(os.fstat(child_src_fd)) != source_identity:
+                        raise fail_swap(child_relative)
+                    assert_entry_unchanged(
+                        src_dir_fd,
+                        name,
+                        source_identity,
+                        child_relative,
+                    )
+                finally:
+                    os.close(child_src_fd)
+                continue
+
+            if not stat.S_ISREG(mode):
+                raise RuntimeError(
+                    f"Unsafe non-regular file in common Git metadata: {child_relative}"
+                )
+            try:
+                child_src_fd = os.open(
+                    name,
+                    os.O_RDONLY | nofollow,
+                    dir_fd=src_dir_fd,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Cannot safely open common Git metadata file: {child_relative}"
+                ) from exc
+            try:
+                opened = os.fstat(child_src_fd)
+                if identity(opened) != source_identity or not stat.S_ISREG(opened.st_mode):
+                    raise fail_swap(child_relative)
+                try:
+                    child_dst_fd = os.open(
+                        name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+                        stat.S_IMODE(mode),
+                        dir_fd=dst_dir_fd,
+                    )
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Cannot safely create review Git metadata file: {child_relative}"
+                    ) from exc
+                try:
+                    while True:
+                        chunk = os.read(child_src_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        offset = 0
+                        while offset < len(chunk):
+                            written = os.write(child_dst_fd, chunk[offset:])
+                            if written <= 0:
+                                raise RuntimeError(
+                                    f"Cannot copy review Git metadata file: {child_relative}"
+                                )
+                            offset += written
+                    os.fchmod(child_dst_fd, stat.S_IMODE(mode))
+                finally:
+                    os.close(child_dst_fd)
+                if identity(os.fstat(child_src_fd)) != source_identity:
+                    raise fail_swap(child_relative)
+                assert_entry_unchanged(
+                    src_dir_fd,
+                    name,
+                    source_identity,
+                    child_relative,
+                )
+            finally:
+                os.close(child_src_fd)
+
+    try:
+        try:
+            source_fd = os.open(source_root, directory_flags)
+        except OSError as exc:
+            raise RuntimeError(f"Cannot safely open common Git metadata: {source_root}") from exc
+        source_stat = os.fstat(source_fd)
+        if identity(source_stat) != expected_identity or not stat.S_ISDIR(source_stat.st_mode):
+            raise fail_swap(source_root)
+
+        try:
+            destination_parent_fd = os.open(destination_parent, directory_flags)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot safely open review Git metadata destination: {destination_parent}"
+            ) from exc
+        try:
+            os.mkdir(
+                destination_root.name,
+                stat.S_IMODE(source_stat.st_mode),
+                dir_fd=destination_parent_fd,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot create review Git metadata root: {destination_root}"
+            ) from exc
+        try:
+            destination_fd = os.open(
+                destination_root.name,
+                directory_flags,
+                dir_fd=destination_parent_fd,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot safely open review Git metadata root: {destination_root}"
+            ) from exc
+        copy_directory(source_fd, destination_fd, pathlib.Path("."))
+        os.fchmod(destination_fd, stat.S_IMODE(source_stat.st_mode))
+        if identity(os.fstat(source_fd)) != expected_identity:
+            raise fail_swap(source_root)
+        try:
+            source_path_after = _git_metadata_path_fingerprint(
+                source_root, "common Git metadata"
+            )
+        except RuntimeError as exc:
+            raise fail_swap(source_root) from exc
+        if not source_path_after:
+            raise fail_swap(source_root)
+        try:
+            source_path_stat = source_root.lstat()
+        except OSError as exc:
+            raise fail_swap(source_root) from exc
+        if identity(source_path_stat) != expected_identity:
+            raise fail_swap(source_root)
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        if destination_parent_fd is not None:
+            os.close(destination_parent_fd)
+        if source_fd is not None:
+            os.close(source_fd)
+
+
+def _copy_pinned_admin_overlay_files(
+    source_root: pathlib.Path,
+    destination_root: pathlib.Path,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Copy a validated linked-worktree admin overlay through pinned directory FDs.
+
+    The source root is opened with ``O_NOFOLLOW`` and ``O_DIRECTORY`` and
+    each entry is addressed relative to that pinned descriptor.  Reopening
+    ``gitdir_path`` by pathname here would let a swapped admin overlay
+    inject attacker-controlled metadata into the snapshot.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise RuntimeError(
+            "Safe admin overlay copy requires O_NOFOLLOW and O_DIRECTORY"
+        )
+    source_root = pathlib.Path(source_root)
+    destination_root = pathlib.Path(destination_root)
+    _validate_regular_git_metadata_tree(
+        source_root, "linked-worktree Git metadata"
+    )
+    _validate_regular_git_metadata_tree(
+        destination_root, "review Git metadata"
+    )
+
+    directory_flags = os.O_RDONLY | nofollow | directory
+    source_fd: int | None = None
+    destination_fd: int | None = None
+
+    def identity(info: os.stat_result) -> tuple[int, int]:
+        return (int(info.st_dev), int(info.st_ino))
+
+    def fail_swap(path: pathlib.Path) -> RuntimeError:
+        return RuntimeError(
+            f"Linked-worktree admin overlay path changed during copy: {path}"
+        )
+
+    def entry_stat(
+        parent_fd: int, name: str, relative: pathlib.Path
+    ) -> os.stat_result:
+        try:
+            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot inspect linked-worktree admin overlay entry: {relative}"
+            ) from exc
+
+    def assert_entry_unchanged(
+        parent_fd: int,
+        name: str,
+        expected: tuple[int, int],
+        relative: pathlib.Path,
+    ) -> None:
+        current = entry_stat(parent_fd, name, relative)
+        if identity(current) != expected:
+            raise fail_swap(relative)
+
+    def copy_directory(
+        src_dir_fd: int, dst_dir_fd: int, relative: pathlib.Path
+    ) -> None:
+        try:
+            with os.scandir(src_dir_fd) as iterator:
+                names = [entry.name for entry in iterator]
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot enumerate linked-worktree admin overlay: "
+                f"{relative or pathlib.Path('.')}"
+            ) from exc
+
+        for name in names:
+            child_relative = (
+                relative / name
+                if relative != pathlib.Path(".")
+                else pathlib.Path(name)
+            )
+            source_entry = entry_stat(src_dir_fd, name, child_relative)
+            source_identity = identity(source_entry)
+            mode = source_entry.st_mode
+            if stat.S_ISDIR(mode):
+                try:
+                    child_src_fd = os.open(
+                        name, directory_flags, dir_fd=src_dir_fd
+                    )
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Cannot safely open linked-worktree admin overlay "
+                        f"directory: {child_relative}"
+                    ) from exc
+                try:
+                    opened = os.fstat(child_src_fd)
+                    if identity(opened) != source_identity:
+                        raise fail_swap(child_relative)
+                    try:
+                        os.mkdir(
+                            name,
+                            stat.S_IMODE(mode),
+                            dir_fd=dst_dir_fd,
+                        )
+                    except FileExistsError:
+                        # Subdirectory may already exist from the common
+                        # copy; continue to merge its descendants.
+                        pass
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"Cannot create review admin overlay directory: "
+                            f"{child_relative}"
+                        ) from exc
+                    try:
+                        child_dst_fd = os.open(
+                            name, directory_flags, dir_fd=dst_dir_fd
+                        )
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"Cannot safely open review admin overlay "
+                            f"directory: {child_relative}"
+                        ) from exc
+                    try:
+                        copy_directory(
+                            child_src_fd, child_dst_fd, child_relative
+                        )
+                        os.fchmod(child_dst_fd, stat.S_IMODE(mode))
+                    finally:
+                        os.close(child_dst_fd)
+                    if identity(os.fstat(child_src_fd)) != source_identity:
+                        raise fail_swap(child_relative)
+                    assert_entry_unchanged(
+                        src_dir_fd,
+                        name,
+                        source_identity,
+                        child_relative,
+                    )
+                finally:
+                    os.close(child_src_fd)
+                continue
+
+            if not stat.S_ISREG(mode):
+                raise RuntimeError(
+                    f"Unsafe non-regular file in linked-worktree admin "
+                    f"overlay: {child_relative}"
+                )
+            if name in ("commondir", "gitdir"):
+                continue
+
+            try:
+                child_src_fd = os.open(
+                    name,
+                    os.O_RDONLY | nofollow,
+                    dir_fd=src_dir_fd,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Cannot safely open linked-worktree admin overlay "
+                    f"file: {child_relative}"
+                ) from exc
+            try:
+                opened = os.fstat(child_src_fd)
+                if (
+                    identity(opened) != source_identity
+                    or not stat.S_ISREG(opened.st_mode)
+                ):
+                    raise fail_swap(child_relative)
+                try:
+                    # Destination file may already exist from the common
+                    # copy (e.g. HEAD, packed-refs); overwrite with O_TRUNC.
+                    child_dst_fd = os.open(
+                        name,
+                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | nofollow,
+                        stat.S_IMODE(mode),
+                        dir_fd=dst_dir_fd,
+                    )
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Cannot safely create review admin overlay file: "
+                        f"{child_relative}"
+                    ) from exc
+                try:
+                    while True:
+                        chunk = os.read(child_src_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        offset = 0
+                        while offset < len(chunk):
+                            written = os.write(
+                                child_dst_fd, chunk[offset:]
+                            )
+                            if written <= 0:
+                                raise RuntimeError(
+                                    f"Cannot copy review admin overlay file: "
+                                    f"{child_relative}"
+                                )
+                            offset += written
+                    os.fchmod(child_dst_fd, stat.S_IMODE(mode))
+                finally:
+                    os.close(child_dst_fd)
+                if identity(os.fstat(child_src_fd)) != source_identity:
+                    raise fail_swap(child_relative)
+                assert_entry_unchanged(
+                    src_dir_fd,
+                    name,
+                    source_identity,
+                    child_relative,
+                )
+            finally:
+                os.close(child_src_fd)
+
+    try:
+        try:
+            source_fd = os.open(source_root, directory_flags)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot safely open linked-worktree admin overlay: "
+                f"{source_root}"
+            ) from exc
+        source_stat = os.fstat(source_fd)
+        if (
+            identity(source_stat) != expected_identity
+            or not stat.S_ISDIR(source_stat.st_mode)
+        ):
+            raise fail_swap(source_root)
+
+        try:
+            destination_fd = os.open(destination_root, directory_flags)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot safely open review admin overlay destination: "
+                f"{destination_root}"
+            ) from exc
+
+        copy_directory(source_fd, destination_fd, pathlib.Path("."))
+
+        if identity(os.fstat(source_fd)) != expected_identity:
+            raise fail_swap(source_root)
+        try:
+            source_path_after = _git_metadata_path_fingerprint(
+                source_root, "linked-worktree Git metadata"
+            )
+        except RuntimeError as exc:
+            raise fail_swap(source_root) from exc
+        if not source_path_after:
+            raise fail_swap(source_root)
+        try:
+            source_path_stat = source_root.lstat()
+        except OSError as exc:
+            raise fail_swap(source_root) from exc
+        if identity(source_path_stat) != expected_identity:
+            raise fail_swap(source_root)
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        if source_fd is not None:
+            os.close(source_fd)
 
 
 def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir: pathlib.Path) -> None:
@@ -814,23 +1494,139 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
     gitdir_path: pathlib.Path | None = None
     main_git_dir: pathlib.Path | None = None
 
-    if git_target.is_file():
-        gitdir_content = git_target.read_text(encoding="utf-8").strip()
+    try:
+        git_target_mode = git_target.lstat().st_mode
+    except OSError as exc:
+        raise RuntimeError(f"Cannot inspect target worktree .git path: {git_target}") from exc
+    if stat.S_ISLNK(git_target_mode):
+        raise RuntimeError(f"Target worktree .git path is a symlink: {git_target}")
+    if not stat.S_ISREG(git_target_mode) and not stat.S_ISDIR(git_target_mode):
+        raise RuntimeError(f"Target worktree .git path is not a file or directory: {git_target}")
+
+    if stat.S_ISREG(git_target_mode):
+        gitdir_content = _read_regular_git_metadata_file(git_target)[0].decode(
+            "utf-8"
+        ).strip()
         if not gitdir_content.startswith("gitdir:"):
             raise RuntimeError(f"Invalid worktree .git pointer file in {target_workdir}: {gitdir_content}")
         gitdir_raw = gitdir_content[len("gitdir:"):].strip()
-        gitdir_path = (target_workdir / gitdir_raw).resolve()
-        if not gitdir_path.is_dir():
-            raise RuntimeError(f"Worktree gitdir does not exist or is not a directory: {gitdir_path}")
+        gitdir_path = _resolve_git_metadata_path(
+            gitdir_raw,
+            target_workdir,
+            "linked-worktree Git metadata path",
+        )
+        try:
+            gitdir_stat = gitdir_path.lstat()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot inspect linked-worktree Git metadata: {gitdir_path}"
+            ) from exc
+        if not stat.S_ISDIR(gitdir_stat.st_mode):
+            raise RuntimeError(
+                f"Linked-worktree Git metadata is not a real directory: {gitdir_path}"
+            )
+        gitdir_identity = (int(gitdir_stat.st_dev), int(gitdir_stat.st_ino))
+        _validate_regular_git_metadata_tree(gitdir_path, "linked-worktree Git metadata")
+        try:
+            gitdir_after_validation = gitdir_path.lstat()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot inspect linked-worktree Git metadata: {gitdir_path}"
+            ) from exc
+        if (
+            not stat.S_ISDIR(gitdir_after_validation.st_mode)
+            or (int(gitdir_after_validation.st_dev), int(gitdir_after_validation.st_ino))
+            != gitdir_identity
+        ):
+            raise RuntimeError(
+                f"Linked-worktree Git metadata changed during validation: {gitdir_path}"
+            )
+
+        target_git_path = _resolve_git_metadata_path(
+            str(git_target), target_workdir, "target worktree .git path"
+        )
+        admin_gitdir_file = gitdir_path / "gitdir"
+        admin_gitdir_raw = _read_regular_git_metadata_file(admin_gitdir_file)[0].decode(
+            "utf-8"
+        ).strip()
+        if not admin_gitdir_raw:
+            raise RuntimeError(
+                f"Linked-worktree Git metadata has an empty gitdir back-reference: {gitdir_path}"
+            )
+        admin_target_path = _resolve_git_metadata_path(
+            admin_gitdir_raw,
+            gitdir_path,
+            "linked-worktree gitdir back-reference",
+        )
+        if admin_target_path != target_git_path:
+            raise RuntimeError(
+                "Linked-worktree gitdir back-reference does not identify the target worktree"
+            )
 
         commondir_file = gitdir_path / "commondir"
-        if commondir_file.is_file():
-            commondir_raw = commondir_file.read_text(encoding="utf-8").strip()
-            main_git_dir = (gitdir_path / commondir_raw).resolve()
+        try:
+            commondir_file.lstat()
+        except FileNotFoundError:
+            commondir_raw = ""
         else:
-            main_git_dir = gitdir_path
-        if not main_git_dir.is_dir():
-            raise RuntimeError(f"Common gitdir does not exist or is not a directory: {main_git_dir}")
+            commondir_raw = _read_regular_git_metadata_file(commondir_file)[0].decode(
+                "utf-8"
+            ).strip()
+            if not commondir_raw:
+                raise RuntimeError(
+                    f"Linked-worktree Git metadata has an empty commondir: {commondir_file}"
+                )
+            main_git_dir = _resolve_git_metadata_path(
+                commondir_raw, gitdir_path, "common Git metadata path"
+            )
+        if main_git_dir is None:
+            raise RuntimeError(
+                f"Linked-worktree Git metadata has no commondir: {gitdir_path}"
+            )
+        _validate_regular_git_metadata_tree(main_git_dir, "common Git metadata")
+        try:
+            main_git_stat = main_git_dir.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"Cannot inspect common Git metadata: {main_git_dir}") from exc
+        if not stat.S_ISDIR(main_git_stat.st_mode):
+            raise RuntimeError(f"Common Git metadata is not a real directory: {main_git_dir}")
+        main_git_identity = (int(main_git_stat.st_dev), int(main_git_stat.st_ino))
+
+        worktrees_dir = main_git_dir / "worktrees"
+        _validate_regular_git_metadata_tree(
+            worktrees_dir, "common Git worktree registration"
+        )
+        registered = False
+        for registration in worktrees_dir.iterdir():
+            registration_mode = registration.lstat().st_mode
+            if not stat.S_ISDIR(registration_mode):
+                continue
+            registration_path = _resolve_git_metadata_path(
+                str(registration),
+                worktrees_dir,
+                "common Git worktree registration",
+            )
+            if registration_path != gitdir_path:
+                continue
+            registration_gitdir = registration / "gitdir"
+            registered_target_raw = _read_regular_git_metadata_file(
+                registration_gitdir
+            )[0].decode("utf-8").strip()
+            registered_target = _resolve_git_metadata_path(
+                registered_target_raw,
+                registration_path,
+                "common Git worktree registration target",
+            )
+            if registered_target != target_git_path:
+                raise RuntimeError(
+                    "Common Git worktree registration does not identify the target worktree"
+                )
+            registered = True
+            break
+        if not registered:
+            raise RuntimeError(
+                "Common Git metadata has no registration for the target worktree"
+            )
 
         if git_review.exists() or git_review.is_symlink():
             if git_review.is_dir():
@@ -838,29 +1634,42 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
             else:
                 git_review.unlink()
 
-        shutil.copytree(
+        # The common metadata root is opened and copied through pinned
+        # descriptors.  Reopening ``main_git_dir`` by pathname here would
+        # permit a validated directory to be swapped before copy.
+        git_review = git_review.parent.resolve(strict=True) / git_review.name
+        _copy_pinned_git_metadata_tree(
             main_git_dir,
             git_review,
-            symlinks=True,
-            ignore_dangling_symlinks=False,
+            main_git_identity,
+        )
+        try:
+            git_review = git_review.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError(f"Cannot resolve review Git metadata: {git_review}") from exc
+        _validate_regular_git_metadata_tree(git_review, "review Git metadata")
+
+        # Copy the admin overlay through pinned descriptors.  The previous
+        # pathname walk could copy a swapped directory into the snapshot;
+        # root-identity-before/after validation fails closed on a swap.
+        _copy_pinned_admin_overlay_files(
+            gitdir_path,
+            git_review,
+            gitdir_identity,
         )
 
-        for entry in gitdir_path.rglob("*"):
-            if entry.is_dir() or entry.name in ("commondir", "gitdir"):
-                continue
-            rel = entry.relative_to(gitdir_path)
-            dest = git_review / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists() or dest.is_symlink():
-                if dest.is_dir():
-                    shutil.rmtree(dest)
-                else:
-                    dest.unlink()
-            shutil.copy2(entry, dest)
-
     if git_review.exists():
+        # ``tempfile`` may return the macOS ``/var`` alias.  Canonicalize the
+        # controller-owned destination before applying the strict metadata
+        # path-component check; source Git paths remain strictly checked at
+        # their original spelling above.
+        try:
+            git_review = git_review.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError(f"Cannot resolve review Git metadata: {git_review}") from exc
         if not git_review.is_dir() or git_review.is_symlink():
             raise RuntimeError(f"Review worktree .git is not a real directory: {git_review}")
+        _validate_regular_git_metadata_tree(git_review, "review Git metadata")
 
         wt_sub = git_review / "worktrees"
         if wt_sub.exists():
@@ -893,14 +1702,7 @@ def _normalize_and_validate_review_git(target_workdir: pathlib.Path, review_dir:
             forbidden_paths.append(str(main_git_dir).encode("utf-8"))
 
         for f in git_review.rglob("*"):
-            if f.is_symlink():
-                try:
-                    sym_target = f.resolve(strict=True)
-                except Exception as exc:
-                    raise RuntimeError(f"Unsafe symlink in review git metadata: {f}") from exc
-                if not (sym_target == git_review or git_review in sym_target.parents):
-                    raise RuntimeError(f"Escaping symlink in review git metadata: {f} -> {sym_target}")
-            elif f.is_file():
+            if f.is_file():
                 content = f.read_bytes()
                 for forbidden in forbidden_paths:
                     if forbidden in content:
@@ -935,8 +1737,11 @@ def _isolated_review_workdir(target_workdir: pathlib.Path):
             ignore_dangling_symlinks=False,
             ignore=ignore_git_ignored,
         )
-        _materialize_snapshot_symlinks(target_workdir, review_dir)
         _normalize_and_validate_review_git(target_workdir, review_dir)
+        review_ignored_paths = _git_ignored_snapshot_paths(review_dir)
+        if review_ignored_paths:
+            raise RuntimeError("Review snapshot contains Git-ignored paths after copy")
+        _validate_snapshot_symlinks(review_dir, review_ignored_paths)
         yield review_dir
 
 
