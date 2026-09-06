@@ -602,6 +602,7 @@ mod tests {
             session_ao_project: Some("dark-factory".into()),
             is_adopted: false,
             spawn_failure_count: 0,
+            transient_error_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,
