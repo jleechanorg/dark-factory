@@ -81,10 +81,31 @@ class _BackendLiteralExtractor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _name_of(self, node: ast.AST) -> str | None:
+        """Return the identifier that names the LHS of a comparison, if it
+        is unambiguously the ``backend`` parameter.
+
+        Accepts:
+
+          * ``backend`` — direct ``ast.Name``.
+          * ``self.backend`` / ``ctx.backend`` — ``ast.Attribute`` whose
+            ``value`` is an ``ast.Name`` whose id is in a small allowlist
+            of common parameter wrappers (so we don't accidentally
+            accept arbitrary attribute access like ``request.backend``).
+
+        Rejects:
+
+          * ``module.backend`` where module is anything not in the
+            allowlist (so an unrelated ``ctx.backend`` shape inside a
+            deeply nested closure does not contribute).
+          * Anything else (subscripts, calls, tuples, etc.).
+        """
+        _ALLOWED_ATTR_BASES = frozenset({"self", "ctx"})
         if isinstance(node, ast.Name):
             return node.id
         if isinstance(node, ast.Attribute):
-            return node.attr
+            base = node.value
+            if isinstance(base, ast.Name) and base.id in _ALLOWED_ATTR_BASES:
+                return node.attr
         return None
 
     def _iter_container(self, node: ast.AST):
@@ -200,4 +221,40 @@ def f(backend, mode):
     found = _extract_literal_backends(source)
     assert found == {"echo"}, (
         f"Drift guard over-matched; expected only 'echo', got {found!r}"
+    )
+
+
+def test_ast_extractor_accepts_self_and_ctx_backend_attr():
+    """``self.backend`` and ``ctx.backend`` are common patterns for
+    passing the backend name through method/closure contexts. They
+    MUST contribute to the discovered backend set."""
+    source = '''
+def f(self):
+    if self.backend == "claude":
+        return 1
+    if ctx.backend in {"agy"}:
+        return 2
+'''
+    found = _extract_literal_backends(source)
+    assert found == {"claude", "agy"}
+
+
+def test_ast_extractor_rejects_unknown_attr_bases():
+    """Regression: arbitrary attribute access (e.g. ``request.backend``,
+    ``payload.backend``) MUST NOT contribute. Without the allowlist
+    guard, an unrelated ``request.backend == "x"`` deep inside a
+    helper would pollute the drift set."""
+    source = '''
+def f(request, payload):
+    if request.backend == "echo":
+        return 1
+    if payload.backend == "mock_llm":
+        return 2
+    if backend == "claude":
+        return 3
+'''
+    found = _extract_literal_backends(source)
+    assert found == {"claude"}, (
+        f"Drift guard over-matched on Attribute bases; "
+        f"expected only 'claude', got {found!r}"
     )

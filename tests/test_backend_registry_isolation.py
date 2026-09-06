@@ -110,24 +110,86 @@ def test_gate_env_builtin_backend_unaffected(monkeypatch):
 
 def test_probe_bin_rejects_registered_backend(monkeypatch):
     """``probe_bin`` MUST NOT silently fall back to the claude binary
-    for a registered name — the failure mode must be visible."""
-    # Build a minimal shadow state object with the attributes the
-    # probe_bin code path mutates.
+    for a registered name — the failure mode must be visible. This
+    test calls the production guard
+    (``_probe_registered_backend_guard``) rather than reimplementing
+    the condition, so any future change to the production guard is
+    caught here."""
     class _ShadowStub:
         launch_error = None
         proc = None
 
     shadow = _ShadowStub()
     _register_with_env({})
-    # Stub the rest of the shadow start path: we only want to exercise
-    # the probe_bin guard, not the full _start_shadow_gate_review path.
-    # The handler_dispatch module imports shutil lazily; stub it.
+    # Patch shutil.which to FAIL so we can prove the guard short-circuits
+    # BEFORE the probe_bin path is reached.
     import shutil as _shutil
-    monkeypatch.setattr(_shutil, "which", lambda _: "/usr/bin/claude")
-    # Call the probe path directly: it's a free-standing snippet, so we
-    # just verify the guard by replicating its intent.
-    import runner.backend_registry as _backend_registry
-    if _backend_registry.get_backend("leaky") is not None:
-        # The new guard short-circuits with a clear error.
-        shadow.launch_error = "leaky registered backend; probe_bin not supported"
+    def _which_should_not_be_called(_name):
+        raise AssertionError(
+            "probe_bin must not call shutil.which for a registered backend"
+        )
+    monkeypatch.setattr(_shutil, "which", _which_should_not_be_called)
+    # Invoke the production guard directly.
+    short_circuited = _dispatch._probe_registered_backend_guard("leaky", shadow)
+    assert short_circuited is True
     assert shadow.launch_error == "leaky registered backend; probe_bin not supported"
+
+
+def test_gate_subprocess_args_gate_args_exception_returns_none(monkeypatch):
+    """A buggy ``gate_args`` hook MUST NOT crash the runner — the
+    caller sees ``None`` (sandbox-unavailable), which the gate
+    handler maps to a structured ``outcome='error'`` Result that
+    ``_is_gate_infra_failure`` classifies for the fallback path."""
+    base_env = {"PATH": "/usr/bin"}
+    monkeypatch.setattr(
+        "runner.handlers._sanitized_env", lambda: dict(base_env)
+    )
+    monkeypatch.setattr(
+        "runner.handlers._sandboxed_args", lambda argv: list(argv)
+    )
+    monkeypatch.setattr(
+        "runner.handlers._sandboxed_args_for_workdir",
+        lambda argv, workdir: list(argv),
+    )
+
+    def _exploding_hook(*a, **kw):
+        raise RuntimeError("buggy downstream hook")
+
+    backend_registry.register_backend(
+        "boom",
+        gate_args=_exploding_hook,
+        gate_env=lambda b: {},
+    )
+    # Sealed-workdir path: returns None on exception.
+    sentinel_workdir = pathlib.Path("/tmp/sentinel-workdir")
+    sealed_result = _dispatch._gate_subprocess_args(
+        "boom", "prompt", ctx=None, timeout=300, workdir=sentinel_workdir
+    )
+    assert sealed_result is None
+    # Legacy path (workdir=None): also returns None on exception.
+    legacy_result = _dispatch._gate_subprocess_args(
+        "boom", "prompt", ctx=None, timeout=300
+    )
+    assert legacy_result is None
+
+
+def test_gate_subprocess_env_gate_env_exception_returns_base(monkeypatch):
+    """A buggy ``gate_env`` hook returns the sanitized base env
+    unchanged (no hook override applied)."""
+    base_env = {"PATH": "/usr/bin"}
+    monkeypatch.setattr(
+        "runner.handlers._sanitized_env", lambda: dict(base_env)
+    )
+
+    def _exploding_hook(_backend):
+        raise RuntimeError("buggy downstream hook")
+
+    backend_registry.register_backend(
+        "boom-env",
+        gate_args=lambda *a, **kw: ["custom-cli"],
+        gate_env=_exploding_hook,
+    )
+    env = _dispatch._gate_subprocess_env("boom-env")
+    assert env == base_env, (
+        f"Hook exception should fall back to base env, got {env!r}"
+    )
