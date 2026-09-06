@@ -40,6 +40,7 @@ monkeypatch on its attributes.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import pathlib
 import shutil
@@ -51,6 +52,32 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 from .handler_core import Result
+
+logger = logging.getLogger(__name__)
+
+
+def _probe_registered_backend_guard(backend: str, shadow: Any) -> bool:
+    """Reject registered (non-built-in) backends from the probe_bin path.
+
+    Built-in backends have known executables; probe those. Registered
+    backends are NOT probed here — they enter via node ``backend=`` /
+    ``model=`` attrs only, not the ``--backend`` CLI choices list
+    (runner/__main__.py:322). A registered name without a working
+    executable should surface as a launch failure, not a silent
+    fallback to the Claude binary.
+
+    Returns True if the guard short-circuited (caller should return
+    ``shadow`` unchanged); False if the caller should proceed to the
+    normal probe_bin path.
+
+    The function is module-level so ``test_backend_registry_isolation``
+    can call it directly rather than reimplementing the condition.
+    """
+    import runner.backend_registry as _backend_registry  # late-bound shim
+    if _backend_registry.get_backend(backend) is not None:
+        shadow.launch_error = f"{backend} registered backend; probe_bin not supported"
+        return True
+    return False
 
 if TYPE_CHECKING:
     from .parser import Node
@@ -249,6 +276,8 @@ def _launch_shadow_gate_review(
             )
     except Exception:
         pass
+    if _probe_registered_backend_guard(backend, shadow):
+        return shadow
     probe_bin = "codex" if backend == "codex" else ("agy" if backend == "agy" else _handlers_shim._get_claude_executable())
     if shutil.which(probe_bin) is None:
         shadow.launch_error = f"{backend} executable not found"
@@ -594,6 +623,33 @@ def _gate_subprocess_args(
             return sealed_args_builder([
                 "codex", "exec", "--yolo", "--skip-git-repo-check", prompt,
             ], workdir)
+        # Registered (non-built-in) backends: route through their argv
+        # hook so downstream forks (snap_factory) can ship their own
+        # subprocess without colliding with the catch-all Claude line.
+        # The hook's argv is wrapped through the sealed sandbox-exec
+        # builder so the jleechan-113 holdout-deny rules still apply.
+        # The hook call is wrapped in try/except so a buggy hook does
+        # not crash the runner — callers see ``None`` (sandbox-exec
+        # unavailable) and the gate handler maps that to a structured
+        # ``outcome="error"`` Result, which ``_is_gate_infra_failure``
+        # classifies for the agy/claude fallback path.
+        import runner.backend_registry as _backend_registry  # late-bound shim
+        registered = _backend_registry.get_backend(backend)
+        if registered is not None:
+            try:
+                argv = registered.gate_args(
+                    backend, prompt, ctx, timeout, workdir=workdir
+                )
+            except Exception as exc:  # noqa: BLE001 - hook exceptions are infra failures
+                logger.warning(
+                    "registered backend %r gate_args raised %r; "
+                    "treating as sandbox-unavailable",
+                    backend, exc,
+                )
+                return None
+            if argv is None:
+                return None
+            return sealed_args_builder(list(argv), workdir)
         claude_bin = _handlers_shim._get_claude_executable()
         return sealed_args_builder([claude_bin, "--print", "--dangerously-skip-permissions", prompt], workdir)
     if backend == "agy":
@@ -609,6 +665,28 @@ def _gate_subprocess_args(
         return _handlers_shim._sandboxed_args([
             "codex", "exec", "--yolo", "--skip-git-repo-check", prompt,
         ])
+    # Registered (non-built-in) backends on the legacy holdout-only
+    # path. Hook argv is wrapped through ``_sandboxed_args`` so the
+    # legacy sandbox-exec deny rules still apply. Same try/except as
+    # the sealed branch — a buggy hook returns ``None`` so the gate
+    # handler maps it to a structured ``outcome="error"`` Result.
+    import runner.backend_registry as _backend_registry  # late-bound shim
+    registered = _backend_registry.get_backend(backend)
+    if registered is not None:
+        try:
+            argv = registered.gate_args(
+                backend, prompt, ctx, timeout, workdir=None
+            )
+        except Exception as exc:  # noqa: BLE001 - hook exceptions are infra failures
+            logger.warning(
+                "registered backend %r gate_args raised %r; "
+                "treating as sandbox-unavailable",
+                backend, exc,
+            )
+            return None
+        if argv is None:
+            return None
+        return _handlers_shim._sandboxed_args(list(argv))
     # ``claude-sonnet`` (priority-queue name), bare ``claude`` (run-level
     # default), and any other claude-routed backend → Anthropic Claude CLI.
     # ``minimax`` is a special case of this path with a different base URL
@@ -619,6 +697,7 @@ def _gate_subprocess_args(
 
 def _gate_subprocess_env(backend: str) -> dict[str, str]:
     import runner.handlers as _handlers_shim  # late-bound shim
+    import runner.backend_registry as _backend_registry  # late-bound shim
     """Env overrides for a reviewer-gate subprocess on ``backend``.
 
     For ``minimax`` the Claude CLI must route through the minimax Anthropic-
@@ -626,10 +705,38 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
     on top of ``_sanitized_env`` (never raw ``os.environ`` — holdout vars
     must not reach any reviewer subprocess). All other backends use
     ``_sanitized_env`` unchanged.
+
+    Registered (non-built-in) backends may add their own env vars via
+    ``gate_env``; the hook return is layered on top of the sanitized
+    base, and any key that looks like a holdout leak (matches
+    ``*HOLDOUT*`` / ``DARK_FACTORY_HOLDOUTS*``) is dropped before the
+    subprocess sees it — the hook can ONLY add benign env vars, never
+    override the isolation guarantee that ``_sanitized_env`` enforces.
     """
+    base = _handlers_shim._sanitized_env()
     if backend == "minimax":
-        return {**_handlers_shim._sanitized_env(), "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic"}
-    return _handlers_shim._sanitized_env()
+        base = {**base, "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic"}
+    registered = _backend_registry.get_backend(backend)
+    if registered is not None:
+        try:
+            hook_env = registered.gate_env(backend)
+        except Exception as exc:  # noqa: BLE001 - hook exceptions are infra failures
+            logger.warning(
+                "registered backend %r gate_env raised %r; "
+                "treating as built-in (no overrides)",
+                backend, exc,
+            )
+            return base
+        # Drop any key that looks like a holdout leak (jleechan-113 contract).
+        # A malicious or buggy hook cannot ship DARK_FACTORY_HOLDOUTS or
+        # anything matching *HOLDOUT* into the reviewer subprocess.
+        safe_hook_env = {
+            key: value
+            for key, value in hook_env.items()
+            if "HOLDOUT" not in key.upper()
+        }
+        return {**base, **safe_hook_env}
+    return base
 
 
 def _build_controller_codex_transport(
