@@ -1805,12 +1805,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&actual);
     }
 
-    #[cfg(test)]
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn resolve_beads_db_prefers_explicit_dark_factory_br_db() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // jleechan-9sl1: use the crate-wide `test_env_lock()` shared by every
+        // PATH/env-mutating test module — a module-local lock only
+        // serializes within this module, not against `adapters.rs`'s
+        // `cli_tracker_br_db_tests`, which mutate the same global
+        // `DARK_FACTORY_BR_DB` / `XDG_STATE_HOME` env vars.
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = std::env::temp_dir().join(format!("afd_resolve_db_explicit_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let explicit = tmp.join("custom/beads.db");
@@ -1845,7 +1847,7 @@ mod tests {
 
     #[test]
     fn resolve_beads_db_falls_back_to_xdg_state_when_db_exists() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = std::env::temp_dir().join(format!("afd_resolve_db_xdg_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let xdg = tmp.join("xdg");
