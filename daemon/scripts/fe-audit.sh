@@ -168,10 +168,16 @@ DISPATCHED_IDS="${DISPATCHED_IDS:-}"
 HUMAN_HELD_IDS="$(python3 "$QUERY_PY" g11_human_held "$LOG_FILE" "$CUTOFF_ISO" 2>/dev/null)" || HUMAN_HELD_IDS=""
 HUMAN_HELD_IDS="${HUMAN_HELD_IDS:-}"
 
+# Subtract beads in CANCELLED state (branch-collision dedup) — those are
+# closed/superseded, NOT stuck. Without this subtraction, a flood of
+# CANCELLED beads from dedup surfaces as a false stuck-bead surge.
+CANCELLED_IDS="$(python3 "$QUERY_PY" g11_cancelled "$LOG_FILE" "$CUTOFF_ISO" 2>/dev/null)" || CANCELLED_IDS=""
+CANCELLED_IDS="${CANCELLED_IDS:-}"
+
 # Find beads in ATTESTED that have NO dispatch follow-up AND have NOT
-# legitimately escalated to HUMAN_HELD. Sort explicitly because comm
+# legitimately escalated to HUMAN_HELD or CANCELLED. Sort explicitly because comm
 # requires lexically sorted input.
-STUCK_BEADS="$(comm -23 <(printf '%s\n' "$ATTESTED_IDS" | sort -u) <(printf '%s\n' "$DISPATCHED_IDS" | sort -u) | comm -23 - <(printf '%s\n' "$HUMAN_HELD_IDS" | sort -u) || true)"
+STUCK_BEADS="$(comm -23 <(printf '%s\n' "$ATTESTED_IDS" | sort -u) <(printf '%s\n' "$DISPATCHED_IDS" | sort -u) | comm -23 - <(printf '%s\n' "$HUMAN_HELD_IDS" | sort -u) | comm -23 - <(printf '%s\n' "$CANCELLED_IDS" | sort -u) || true)"
 STUCK_COUNT=0
 if [ -n "$STUCK_BEADS" ]; then
     STUCK_COUNT="$(echo "$STUCK_BEADS" | wc -l | tr -d ' ')"
