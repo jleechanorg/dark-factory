@@ -2255,7 +2255,8 @@ impl StateStore for SqliteStateStore {
                AND attempt < ?2 \
                AND session_id IS NULL \
                AND (park_reason IN (?3, ?4, ?5, ?6, ?7, ?8) \
-                    OR substr(park_reason, 1, length(?9)) = ?9) \
+                    OR substr(park_reason, 1, length(?9)) = ?9 \
+                    OR substr(park_reason, 1, length(?10)) = ?10) \
              RETURNING bead_id, state, attempt, reroll_count, autonomy_secs, spend_usd, \
                  pr_number, branch, session_id, is_adopted, spawn_failure_count, \
                  pre_session_head_sha, park_reason, target_repo, session_ao_project, attempt_started_at",
@@ -2273,6 +2274,7 @@ impl StateStore for SqliteStateStore {
                     &recoverable[4],
                     &recoverable[5],
                     ROUTER_PARSE_PARK_REASON_PREFIX,
+                    ROUTER_ERROR_PARK_REASON_PREFIX,
                 ],
                 |row| {
                     Ok((
@@ -4612,6 +4614,61 @@ mod tests {
             transient.park_reason, None,
             "recover_human_held clears park_reason once a bead is back in play"
         );
+    }
+
+    /// Adversarial /er review of PR #834: `HumanHoldReason::RouterError`
+    /// was added to `recoverable_prefix_values()`/`is_recoverable_value()`
+    /// (the in-memory predicate) but `SqliteStateStore::recover_human_held`'s
+    /// real SQL query bound only `ROUTER_PARSE_PARK_REASON_PREFIX` as its
+    /// prefix parameter — never updated to add
+    /// `ROUTER_ERROR_PARK_REASON_PREFIX`. The shipped unit test used
+    /// `FakeStateStore` (which delegates to the in-memory predicate and so
+    /// passed regardless), masking that a `router_error:`-parked bead could
+    /// never actually recover against the real store: permanently stuck
+    /// from attempt #1, with no path to the attempt-cap escalation either
+    /// (since `attempt` never increments without a recovery). This test
+    /// exercises the real `SqliteStateStore` directly, mirroring the
+    /// circuit-breaker/unmapped-repo tests above rather than the Fake.
+    #[test]
+    fn recover_human_held_recovers_router_error_parks() {
+        let schema = include_str!("../contracts/schema.sql");
+        let store = SqliteStateStore::open_in_memory_with_schema(schema).unwrap();
+
+        store
+            .save(&BeadOverlay {
+                bead_id: "router-error-parked".into(),
+                state: OverlayState::HumanHeld,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 60,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: Some("factory/router-error-parked-r1".into()),
+                session_id: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                pre_session_head_sha: None,
+                park_reason: Some(
+                    HumanHoldReason::RouterError("simulated non-Parse judge failure".into())
+                        .value(),
+                ),
+                target_repo: None,
+                attempt_started_at: None,
+                session_ao_project: None,
+            })
+            .unwrap();
+
+        let recovered = store.recover_human_held(10).unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "a router_error: park must be recovered by the real SqliteStateStore, \
+             not just the FakeStateStore's in-memory predicate"
+        );
+        assert_eq!(recovered[0].bead_id, "router-error-parked");
+        assert_eq!(recovered[0].state, OverlayState::Queued);
+        assert_eq!(recovered[0].attempt, 2);
+        assert_eq!(recovered[0].park_reason, None);
     }
 
     /// jleechan-35y4 (adversarial review of PR #245): a bead parked
