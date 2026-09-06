@@ -274,6 +274,47 @@ impl DaemonError {
         }
     }
 
+    /// True iff this error indicates AO itself is up and running, but the
+    /// specific project this daemon dispatches for is not registered in
+    /// AO's active project membership — the `ao-spawn-v013-bridge.mjs`
+    /// bridge script's distinct "running but not polling" rejection, e.g.
+    /// `[dark-factory AO bridge] running AO instance is not polling
+    /// project dark-factory`.
+    ///
+    /// Deliberately DISTINCT from `is_ao_not_running_error` (which detects
+    /// AO not being up at all, and drives an automatic bounded recovery
+    /// attempt via `ensure_ao_project_recovered`). This predicate's real
+    /// signature ("not polling project") was previously unrecognized by
+    /// that check's phrase list, so every occurrence fell through to the
+    /// generic `is_transient()` retry path — bare retry composes the
+    /// identical spawn request against the identical non-polling AO
+    /// instance every time, so it can never succeed. jleechan-vu3k: this is
+    /// exactly what happened live — attempt=10, spawn_failure_count=25,
+    /// parked `transient_spawn_retry_cap_exceeded` (a generic, operator-
+    /// opaque reason) with no signal that the real fix is an operator
+    /// action on AO itself, not a bead-level retry.
+    ///
+    /// This predicate intentionally does NOT trigger auto-recovery (unlike
+    /// `is_ao_not_running_error`) — a bounded auto-start action here could
+    /// pick between two currently-conflicting `agent-orchestrator.yaml`
+    /// configs (port 3000 vs 3020, different agent/worktree settings) and
+    /// make things worse. That decision stays with a human; this predicate
+    /// only exists so the daemon can escalate distinctly instead of
+    /// silently burning the retry cap.
+    pub fn is_ao_not_polling_project(&self) -> bool {
+        let msg = match self {
+            DaemonError::Tool { stderr, .. } => stderr.as_str(),
+            DaemonError::Config(msg) => msg.as_str(),
+            DaemonError::Parse(msg) => msg.as_str(),
+            DaemonError::SpawnFallbackExhausted(list) => {
+                return list.iter().any(|(_, e)| e.is_ao_not_polling_project());
+            }
+            _ => return false,
+        };
+        let lower = msg.to_lowercase();
+        lower.contains("not polling project") || lower.contains("lifecycle polling is inactive")
+    }
+
     /// Detects `br create --external-ref ...` failing because the ref is
     /// already tracked (`br`'s own uniqueness constraint on `external_ref`),
     /// e.g. `Error: Configuration error: External reference 'owner/repo#42'
@@ -703,6 +744,75 @@ mod tests {
             stderr: "gh: API rate limit exceeded for installation ID 12345".to_string(),
         };
         assert!(!err.is_github_comment_limit());
+    }
+
+    #[test]
+    fn is_ao_not_polling_project_detects_bridge_signature() {
+        // jleechan-vu3k live signature: `ao-spawn-v013-bridge.mjs`'s
+        // "running but not registered" rejection.
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "[dark-factory AO bridge] running AO instance is not polling project dark-factory"
+                .to_string(),
+        };
+        assert!(err.is_ao_not_polling_project());
+    }
+
+    #[test]
+    fn is_ao_not_polling_project_detects_lifecycle_polling_inactive_phrase() {
+        let err = DaemonError::Tool {
+            tool: "ao".to_string(),
+            rc: 1,
+            stderr: "AO is not running — lifecycle polling is inactive. Run `ao start` before spawning sessions.".to_string(),
+        };
+        assert!(err.is_ao_not_polling_project());
+    }
+
+    #[test]
+    fn is_ao_not_polling_project_recurses_into_spawn_fallback_exhausted() {
+        let err = DaemonError::SpawnFallbackExhausted(vec![
+            (
+                "minimax".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent minimax".to_string(),
+                    rc: 1,
+                    stderr: "[dark-factory AO bridge] running AO instance is not polling project dark-factory".to_string(),
+                },
+            ),
+            (
+                "antigravity".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent antigravity".to_string(),
+                    rc: 1,
+                    stderr: "[dark-factory AO bridge] running AO instance is not polling project dark-factory".to_string(),
+                },
+            ),
+        ]);
+        assert!(err.is_ao_not_polling_project());
+    }
+
+    #[test]
+    fn is_ao_not_polling_project_returns_false_for_unrelated_tool_error() {
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "some unrelated ao CLI validation error".to_string(),
+        };
+        assert!(!err.is_ao_not_polling_project());
+    }
+
+    #[test]
+    fn is_ao_not_polling_project_returns_false_for_generic_ao_not_running() {
+        // Must stay distinct from `is_ao_not_running_error` -- this phrase
+        // is that predicate's territory (drives auto-recovery), not this
+        // one's (drives immediate distinct escalation, no auto-recovery).
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "[dark-factory AO bridge] AO is not running; run `ao start` before factory dispatch".to_string(),
+        };
+        assert!(!err.is_ao_not_polling_project());
     }
 
     #[test]

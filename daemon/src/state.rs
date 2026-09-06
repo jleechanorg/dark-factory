@@ -673,6 +673,22 @@ const ROUTER_ERROR_PARK_REASON_PREFIX: &str = "router_error:";
 
 pub enum HumanHoldReason {
     TransientSpawnRetryCapExceeded,
+    /// jleechan-vu3k: a spawn attempt failed because AO itself is running
+    /// but the target project is not in its active/polled membership
+    /// (`DaemonError::is_ao_not_polling_project()`), distinct from a
+    /// generic transient spawn failure. Bare retry composes the identical
+    /// spawn request against the identical non-polling AO instance every
+    /// time and can never succeed, so this parks IMMEDIATELY on first
+    /// detection rather than burning `MAX_TRANSIENT_SPAWN_RETRY` attempts
+    /// first (live incident: attempt=10, spawn_failure_count=25, parked
+    /// under the generic `transient_spawn_retry_cap_exceeded` reason with
+    /// no operator-facing signal that the real fix is an AO-level action,
+    /// not a bead-level retry). Permanent — NOT in
+    /// `recoverable_exact_values()`, since a plain requeue replays the
+    /// exact same non-fix. An operator must ensure a running AO instance
+    /// has this project in its active membership (e.g. `ao start`) before
+    /// requeuing.
+    AoOrchestratorNotRunning,
     AdoptedPreSessionShaCaptureFailed,
     SessionStalled,
     Stage1GateNotGreen,
@@ -784,6 +800,7 @@ impl HumanHoldReason {
     pub fn value(&self) -> String {
         match self {
             Self::TransientSpawnRetryCapExceeded => "transient_spawn_retry_cap_exceeded",
+            Self::AoOrchestratorNotRunning => "ao_orchestrator_not_running",
             Self::AdoptedPreSessionShaCaptureFailed => "adopted_pre_session_sha_capture_failed",
             Self::SessionStalled => "session_stalled",
             Self::Stage1GateNotGreen => {

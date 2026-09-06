@@ -793,6 +793,37 @@ pub fn dispatch_ready_with_vcs(
                 ));
                 continue;
             }
+            // jleechan-vu3k: AO running but not polling this project is a
+            // DISTINCT failure mode from a genuine transient spawn error.
+            // `DaemonError::Tool`'s stderr for this case satisfies
+            // `is_transient()` too, so this arm MUST precede the general
+            // `is_transient()` arm below (same match-arm-order requirement
+            // as the `is_deferred()` arm above) or it would never fire.
+            // Bare retry composes the identical spawn request against the
+            // identical non-polling AO instance every time — it can never
+            // succeed on its own, so this parks IMMEDIATELY instead of
+            // burning `MAX_TRANSIENT_SPAWN_RETRY` attempts first (live
+            // incident: attempt=10, spawn_failure_count=25, generic
+            // `transient_spawn_retry_cap_exceeded` park with no signal that
+            // the real fix is an operator action on AO, not a bead retry).
+            // `spawn_failure_count` is deliberately NOT incremented — this
+            // isn't a per-bead vendor failure to charge against the bead's
+            // retry budget, it's an infrastructure-readiness gap.
+            Err(err) if err.is_ao_not_polling_project() => {
+                overlay.state = OverlayState::HumanHeld;
+                overlay.session_id = None;
+                overlay.session_ao_project = None;
+                set_human_hold_reason(&mut overlay, HumanHoldReason::AoOrchestratorNotRunning);
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    Some(branch.clone()),
+                    "ao_orchestrator_not_running",
+                    err,
+                ));
+                continue;
+            }
             Err(err) if err.is_transient() => {
                 overlay.spawn_failure_count += 1;
                 overlay.session_id = None;
@@ -1559,6 +1590,12 @@ mod tests {
         calls: RefCell<Vec<String>>,
         fail_spawn_for: RefCell<Vec<String>>,
         fail_spawn_fatal_for: RefCell<Vec<String>>,
+        // jleechan-vu3k: scripted spawn failure carrying the real
+        // "AO running but not polling this project" bridge signature —
+        // distinct from `fail_spawn_for`'s generic scripted `Tool` error,
+        // so tests can assert the dedicated escalation path fires instead
+        // of the generic transient-retry-cap path.
+        fail_spawn_ao_not_polling_for: RefCell<Vec<String>>,
         // jleechan-w28n: scripted `DaemonError::Deferred` spawn outcome,
         // distinct from `fail_spawn_for`'s `DaemonError::Tool` — exercises
         // the AO admission-control-queue path (session-cap backpressure)
@@ -1627,6 +1664,7 @@ mod tests {
                 calls: RefCell::new(Vec::new()),
                 fail_spawn_for: RefCell::new(Vec::new()),
                 fail_spawn_fatal_for: RefCell::new(Vec::new()),
+                fail_spawn_ao_not_polling_for: RefCell::new(Vec::new()),
                 fail_spawn_deferred_for: RefCell::new(Vec::new()),
                 fail_spawn_fallback_exhausted_deferred_for: RefCell::new(Vec::new()),
                 fail_spawn_cleanup_for: RefCell::new(Vec::new()),
@@ -1646,6 +1684,12 @@ mod tests {
 
         fn fail_spawn_fatal_for(&self, bead_id: &str) {
             self.fail_spawn_fatal_for
+                .borrow_mut()
+                .push(bead_id.to_string());
+        }
+
+        fn fail_spawn_ao_not_polling_for(&self, bead_id: &str) {
+            self.fail_spawn_ao_not_polling_for
                 .borrow_mut()
                 .push(bead_id.to_string());
         }
@@ -1754,6 +1798,17 @@ mod tests {
                     "scripted fatal spawn failure for {}",
                     spec.bead_id
                 )));
+            }
+            if self
+                .fail_spawn_ao_not_polling_for
+                .borrow()
+                .contains(&spec.bead_id)
+            {
+                return Err(DaemonError::Tool {
+                    tool: "ao spawn --agent minimax".to_string(),
+                    rc: 1,
+                    stderr: "[dark-factory AO bridge] running AO instance is not polling project dark-factory".to_string(),
+                });
             }
             if self.fail_spawn_cleanup_for.borrow().contains(&spec.bead_id) {
                 return Err(DaemonError::SpawnCleanupFailed {
@@ -3562,6 +3617,44 @@ mod tests {
         assert_eq!(report.failures[0].bead_id, "bead-0");
         assert_eq!(report.failures[0].phase, "spawn_failed");
         assert!(!report.failures[0].transient);
+        let calls = sessions.calls.borrow();
+        assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
+        assert!(calls.iter().any(|c| c == "spawn(bead-1)"));
+    }
+
+    #[test]
+    fn ao_not_polling_project_spawn_failure_parks_distinctly_without_retry() {
+        // jleechan-vu3k: the real live signature is a `Tool` error whose
+        // stderr is `is_transient() == true` (a generic tool failure would
+        // just retry). This test proves the daemon distinguishes AO
+        // running-but-not-polling from a generic transient spawn failure:
+        // it must park IMMEDIATELY under a distinct reason, WITHOUT
+        // incrementing `spawn_failure_count` (no retry budget burned) and
+        // WITHOUT going through the generic `transient_spawn_retry_cap_exceeded`
+        // path at all.
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_ao_not_polling_for("bead-0");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        let bead_0 = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(bead_0.state, OverlayState::HumanHeld);
+        assert_eq!(
+            bead_0.park_reason.as_deref(),
+            Some("ao_orchestrator_not_running")
+        );
+        assert_eq!(
+            bead_0.spawn_failure_count, 0,
+            "AO-not-polling must not charge the bead's spawn retry budget"
+        );
+        assert_eq!(report.success_count(), 1);
+        assert_eq!(report.successes[0].bead_id, "bead-1");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-0");
+        assert_eq!(report.failures[0].phase, "ao_orchestrator_not_running");
         let calls = sessions.calls.borrow();
         assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
         assert!(calls.iter().any(|c| c == "spawn(bead-1)"));

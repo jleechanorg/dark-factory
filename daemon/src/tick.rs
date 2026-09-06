@@ -2718,6 +2718,143 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 continue;
             }
 
+            if failure.phase == "ao_orchestrator_not_running" {
+                // jleechan-vu3k: `dispatch::dispatch_ready` already parked
+                // this bead HUMAN_HELD on disk under the DISTINCT
+                // `ao_orchestrator_not_running` reason (not the generic
+                // `transient_spawn_retry_cap_exceeded` this used to fall
+                // into). Mirrors the `spawn_retry_cap_exceeded` idiom above
+                // exactly, but the escalation comment names the real,
+                // operator-actionable cause instead of a generic
+                // "check session capacity" message.
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "ao_orchestrator_not_running",
+                        "branch": failure.branch.as_deref(),
+                        "error": failure.error.as_str(),
+                    }),
+                )?;
+                if escalation_already_recorded(deps, &failure.bead_id)? {
+                    continue;
+                }
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: bead `{}` failed to spawn a worker session because the Agent Orchestrator (AO) instance is running but is not polling this project. Retrying will not fix this — an operator must ensure a live AO instance has this project registered (e.g. `ao start`) before this bead can dispatch. Automation parked it HUMAN_HELD rather than burning retries against an infrastructure gap.\n\nUnderlying error: {}",
+                    failure.bead_id, failure.error
+                );
+                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
+                {
+                    if is_missing_scm_target_error(&err) {
+                        record_local_escalation_fallback(
+                            deps,
+                            &failure.bead_id,
+                            "ao_orchestrator_not_running",
+                        )?;
+                        summary.beads_escalated_locally += 1;
+                        emit(
+                            deps.telemetry_log,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "ESCALATED_LOCALLY",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "ao_orchestrator_not_running",
+                                "branch": failure.branch.as_deref(),
+                                "scm_error": err.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
+                    if !err.is_transient() {
+                        mark_escalation_undeliverable_and_emit(
+                            deps,
+                            summary,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "ao_orchestrator_not_running",
+                            &err,
+                        )?;
+                        continue;
+                    }
+                    let ctx = serde_json::json!({
+                        "reason": "ao_orchestrator_not_running",
+                        "error": err.to_string(),
+                    });
+                    let now_epoch = now_epoch_secs();
+                    let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                        deps,
+                        &failure.bead_id,
+                        "ao_orchestrator_not_running",
+                        &ctx,
+                        now_epoch,
+                    )?;
+                    if !should_emit {
+                        summary.escalations_suppressed += 1;
+                        continue;
+                    }
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_NOTIFICATION_FAILED",
+                        serde_json::json!({}),
+                        ctx,
+                    )?;
+                    record_escalation_emit_dedup(
+                        deps,
+                        &failure.bead_id,
+                        "ao_orchestrator_not_running",
+                        &ctx_hash,
+                        now_epoch,
+                    )?;
+                    continue;
+                }
+                record_escalation(deps, &failure.bead_id, "ao_orchestrator_not_running")?;
+                summary.beads_escalated += 1;
+                let ctx = serde_json::json!({
+                    "reason": "ao_orchestrator_not_running",
+                    "branch": failure.branch.as_deref(),
+                });
+                let now_epoch = now_epoch_secs();
+                let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                    deps,
+                    &failure.bead_id,
+                    "ao_orchestrator_not_running",
+                    &ctx,
+                    now_epoch,
+                )?;
+                if !should_emit {
+                    summary.escalations_suppressed += 1;
+                } else {
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_REQUIRED",
+                        serde_json::json!({}),
+                        ctx,
+                    )?;
+                    record_escalation_emit_dedup(
+                        deps,
+                        &failure.bead_id,
+                        "ao_orchestrator_not_running",
+                        &ctx_hash,
+                        now_epoch,
+                    )?;
+                }
+                continue;
+            }
+
             if failure.phase == "unmapped_repo" {
                 // jleechan-8jxr r3 (review follow-up, chatgpt-codex-connector
                 // P2 @ daemon/src/dispatch.rs:287): mirror the
