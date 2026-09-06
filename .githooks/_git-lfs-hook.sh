@@ -24,10 +24,17 @@
 
 set -eu
 
-verb=${GIT_LFS_VERB:?GIT_LFS_VERB must be set by the calling shim}
+verb="${GIT_LFS_VERB:-${1:-}}"
+if [ -z "$verb" ]; then
+  echo >&2 "error: ${0##*/}: GIT_LFS_VERB must be set by the calling shim or passed as first argument"
+  exit 2
+fi
+if [ -z "${GIT_LFS_VERB:-}" ] && [ "$#" -gt 0 ]; then
+  shift
+fi
 
 command -v git-lfs >/dev/null 2>&1 || {
-  echo >&2 "error: $(basename "$0"): git-lfs was not found on PATH (cannot run git lfs $verb)"
+  echo >&2 "error: ${0##*/}: git-lfs was not found on PATH (cannot run git lfs $verb)"
   exit 2
 }
 
