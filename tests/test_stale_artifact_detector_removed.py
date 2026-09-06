@@ -186,5 +186,31 @@ def test_parallel_reviewer_does_not_emit_stale_artifact_warning_event(
     )
 
 
+def test_no_stale_artifact_references_across_runner():
+    """Ensure no stale artifact detector functions, state keys, or event names exist in runner/."""
+    runner_dir = Path(__file__).resolve().parent.parent / "runner"
+    for py_file in runner_dir.glob("*.py"):
+        src = py_file.read_text(encoding="utf-8")
+        assert "_check_stale_artifacts" not in src, (
+            f"{py_file.name} still contains '_check_stale_artifacts'"
+        )
+        assert "_stale_artifact_warnings" not in src, (
+            f"{py_file.name} still contains '_stale_artifact_warnings'"
+        )
+        assert "stale_artifact_warning" not in src, (
+            f"{py_file.name} still contains 'stale_artifact_warning'"
+        )
+
+
+def test_parallel_reviewer_execution_with_stale_spec_succeeds(tmp_path):
+    """Reviewer runs to success even when spec contains previous run_id markers."""
+    _seed_stale_spec(tmp_path, run_id="prior-marker-run-12345")
+    ctx = _make_ctx(tmp_path)
+
+    mod = _reload_handler()
+    result = mod._parallel_reviewer(_make_node(tmp_path), ctx)
+    assert result.outcome == "success"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-vv"])
