@@ -440,6 +440,13 @@ pub struct FakeSessions {
     // end-to-end tests can exercise the two paths independently and prove
     // they never share `overlay.spawn_failure_count`.
     pub fail_spawn_deferred_for: RefCell<Vec<String>>,
+    /// jleechan-vu3k: scripted spawn failure carrying the real "AO running
+    /// but not polling this project" bridge signature — distinct from
+    /// `fail_spawn_for`'s generic scripted `Tool` error, so end-to-end tick
+    /// tests can prove the dedicated `ao_orchestrator_not_running` park +
+    /// escalation path fires (with its own comment text) instead of the
+    /// generic `transient_spawn_retry_cap_exceeded` path.
+    pub fail_spawn_ao_not_polling_for: RefCell<Vec<String>>,
     pub spawn_prompts: RefCell<Vec<(String, String)>>,
     pub calls: RefCell<Vec<String>>,
     /// Exact project-scoped AO cleanup calls. This is separate from `calls`
@@ -531,6 +538,7 @@ impl Default for FakeSessions {
             fail_spawn_cleanup_for: RefCell::new(Vec::new()),
             fail_stop_for: RefCell::new(Vec::new()),
             fail_spawn_deferred_for: RefCell::new(Vec::new()),
+            fail_spawn_ao_not_polling_for: RefCell::new(Vec::new()),
             spawn_prompts: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
             stop_in_project_calls: RefCell::new(Vec::new()),
@@ -568,6 +576,12 @@ impl FakeSessions {
 
     pub fn fail_spawn_for(&self, bead_id: &str) {
         self.fail_spawn_for.borrow_mut().push(bead_id.to_string());
+    }
+
+    pub fn fail_spawn_ao_not_polling_for(&self, bead_id: &str) {
+        self.fail_spawn_ao_not_polling_for
+            .borrow_mut()
+            .push(bead_id.to_string());
     }
 
     pub fn panic_after_spawn_for(&self, bead_id: &str) {
@@ -737,6 +751,17 @@ impl Sessions for FakeSessions {
                 tool: "ao".into(),
                 rc: 1,
                 stderr: format!("scripted spawn failure for {}", spec.bead_id),
+            });
+        }
+        if self
+            .fail_spawn_ao_not_polling_for
+            .borrow()
+            .contains(&spec.bead_id)
+        {
+            return Err(DaemonError::Tool {
+                tool: "ao spawn --agent minimax".into(),
+                rc: 1,
+                stderr: "[dark-factory AO bridge] running AO instance is not polling project dark-factory".into(),
             });
         }
         if self.fail_spawn_cleanup_for.borrow().contains(&spec.bead_id) {

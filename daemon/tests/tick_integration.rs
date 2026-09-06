@@ -4412,6 +4412,87 @@ fn run_slow_tier_router_error_does_not_abort_remaining_candidates() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// jleechan-vu3k end-to-end: a bead that routes fine but hits AO
+/// running-but-not-polling at spawn time must escalate under the DISTINCT
+/// `ao_orchestrator_not_running` reason, not the generic
+/// `transient_spawn_retry_cap_exceeded` path, and must not charge the
+/// bead's `spawn_failure_count`.
+#[test]
+fn ao_orchestrator_not_running_escalates_distinctly_end_to_end() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    tracker.candidates.borrow_mut().push(Bead {
+        id: "bead-vu3k-repro".into(),
+        title: "repro bead".into(),
+        description: String::new(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: Some("owner/repo#1".into()),
+    });
+    let sessions = FakeSessions::new();
+    sessions.fail_spawn_ao_not_polling_for("bead-vu3k-repro");
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"scripted"}"#.into(),
+    ));
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join("afd_ao_not_polling_e2e.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 0)
+        .expect("tick must succeed even though dispatch hits AO-not-polling for this bead");
+
+    assert_eq!(
+        summary.beads_routed, 1,
+        "the bead must route fine -- the failure is AO-side, not a routing problem"
+    );
+    assert_eq!(summary.beads_dispatched, 0);
+    assert_eq!(summary.beads_parked_human_held, 1);
+    assert_eq!(
+        summary.beads_escalated, 1,
+        "the distinct AO-not-polling escalation must fire, not silently no-op"
+    );
+
+    let overlay = store.load("bead-vu3k-repro").unwrap().unwrap();
+    assert_eq!(overlay.state, OverlayState::HumanHeld);
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("ao_orchestrator_not_running")
+    );
+    assert_eq!(
+        overlay.spawn_failure_count, 0,
+        "AO-not-polling must never charge the bead's spawn retry budget"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("\"eventType\":\"ESCALATION_REQUIRED\""),
+        "telemetry was:\n{telemetry}"
+    );
+    assert!(telemetry.contains("ao_orchestrator_not_running"));
+    assert!(
+        !telemetry.contains("transient_spawn_retry_cap_exceeded"),
+        "must not fall through to the generic transient-retry-cap escalation path; \
+         telemetry was:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 fn dependency_admission_fixture(
     state: OverlayState,
 ) -> (
