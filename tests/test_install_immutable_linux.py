@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_SHA = "0123456789abcdef0123456789abcdef01234567"
 RELEASE_TREE = "89abcdef0123456789abcdef0123456789abcdef"
+MIGRATED_RELEASE_TREE = "fedcba9876543210fedcba9876543210fedcba99"
 
 
 def _write_executable(path: Path, body: str) -> None:
@@ -61,9 +62,18 @@ def test_linux_install_keeps_all_runtime_payloads_outside_git_checkout(tmp_path)
         fake_bin / "git",
         f"""#!/bin/sh
 if [ "${{3:-}}" = "rev-parse" ] && [ "${{4:-}}" = "HEAD" ]; then
-  printf '{RELEASE_SHA}\\n'
+  if [ -n "${{DARK_FACTORY_TEST_HEAD_FILE:-}}" ] && [ -f "${{DARK_FACTORY_TEST_HEAD_FILE:-}}" ]; then
+    cat "$DARK_FACTORY_TEST_HEAD_FILE"
+  else
+    printf '{RELEASE_SHA}\\n'
+  fi
 elif [ "${{3:-}}" = "rev-parse" ] && [ "${{4:-}}" = '{RELEASE_SHA}^{{tree}}' ]; then
   printf '{RELEASE_TREE}\\n'
+elif [ "${{3:-}}" = "rev-parse" ] && [ "${{4%%^*}}" != "${{4:-}}" ]; then
+  # Any other <sha>^{{tree}} lookup (e.g. the migration re-run's new HEAD) —
+  # the manifest tree value is unasserted for that release, so any distinct
+  # valid 40-hex object id is enough.
+  printf '{MIGRATED_RELEASE_TREE}\\n'
 elif [ "${{3:-}}" = "archive" ]; then
   tar -C "${{2}}" --exclude=ignored-sentinel.bin -cf - .
 elif [ "${{3:-}}" = "status" ] && [ "${{DARK_FACTORY_FAKE_DIRTY:-0}}" = "1" ]; then
@@ -193,6 +203,32 @@ touch "$db"
         f"sync --db {state_db} --import-only",
     ]
 
+    # Verify migration on upgrade / re-run with existing DB
+    migrated_beads = '{"id":"factory-tdd"}\n{"id":"factory-migrated"}\n'
+    seed_beads.write_text(migrated_beads)
+    head_file = tmp_path / "head.txt"
+    head_file.write_text("fedcba9876543210fedcba9876543210fedcba98\n")
+    migrate_env = env.copy()
+    migrate_env["DARK_FACTORY_TEST_HEAD_FILE"] = str(head_file)
+    migrate_proc = subprocess.run(
+        [str(checkout / "install.sh"), "--no-smoke"],
+        cwd=checkout,
+        env=migrate_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert migrate_proc.returncode == 0, migrate_proc.stdout + migrate_proc.stderr
+    assert (state_root / ".beads" / "issues.jsonl").read_text() == migrated_beads
+    assert br_log.read_text().splitlines() == [
+        f"init --db {state_db}",
+        f"sync --db {state_db} --import-only",
+        f"sync --db {state_db} --import-only",
+    ]
+
+    new_release = install_root / "releases" / "fedcba9876543210fedcba9876543210fedcba98"
+    new_daemon_binary = new_release / "daemon" / "target" / "release" / "daemon"
+
     rendered_unit = subprocess.run(
         [str(checkout / "daemon" / "systemd" / "install-systemd-user.sh"), "--render-only"],
         cwd=checkout,
@@ -202,8 +238,8 @@ touch "$db"
         check=False,
     )
     assert rendered_unit.returncode == 0, rendered_unit.stdout + rendered_unit.stderr
-    assert f"WorkingDirectory={release}\n" in rendered_unit.stdout
-    assert f"ExecStart={daemon_binary}\n" in rendered_unit.stdout
+    assert f"WorkingDirectory={new_release}\n" in rendered_unit.stdout
+    assert f"ExecStart={new_daemon_binary}\n" in rendered_unit.stdout
     assert f"Environment=DARK_FACTORY_BR_DB={state_db}\n" in rendered_unit.stdout
     assert str(checkout) not in rendered_unit.stdout
 
@@ -221,7 +257,7 @@ touch "$db"
     assert launched.returncode == 0, launched.stdout + launched.stderr
     runtime_homes = runtime_log.read_text().splitlines()
     assert runtime_homes
-    assert all(Path(path) == release for path in runtime_homes)
+    assert all(Path(path) == new_release for path in runtime_homes)
 
     # Reuse must validate the complete executable/runtime payload with a
     # verifier outside the release. Restoring read-only mode after tampering

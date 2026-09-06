@@ -300,16 +300,38 @@ fi
 # Configure repo-local git hooks (.githooks/) so the pre-push graph-audit
 if [[ "${RUNTIME_ROOT}" != "${REPO_ROOT}" ]]; then
   STATE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/dark-factory"
-  BR_DB="${STATE_ROOT}/.beads/beads.db"
+  BR_DB="${DARK_FACTORY_BR_DB:-${STATE_ROOT}/.beads/beads.db}"
+  mkdir -p "${STATE_ROOT}/.beads"
+  if [[ -f "${RUNTIME_ROOT}/.beads/config.yaml" && ! -f "${STATE_ROOT}/.beads/config.yaml" ]]; then
+    cp "${RUNTIME_ROOT}/.beads/config.yaml" "${STATE_ROOT}/.beads/config.yaml"
+  fi
+  if [[ -f "${RUNTIME_ROOT}/.beads/metadata.json" && ! -f "${STATE_ROOT}/.beads/metadata.json" ]]; then
+    cp "${RUNTIME_ROOT}/.beads/metadata.json" "${STATE_ROOT}/.beads/metadata.json"
+  fi
   if [[ ! -f "${BR_DB}" ]]; then
-    mkdir -p "${STATE_ROOT}/.beads"
-    cp "${RUNTIME_ROOT}/.beads/issues.jsonl" "${STATE_ROOT}/.beads/issues.jsonl"
-    (
-      cd "${STATE_ROOT}"
-      br init --db "${BR_DB}"
-      br sync --db "${BR_DB}" --import-only
-    )
+    if [[ -f "${RUNTIME_ROOT}/.beads/issues.jsonl" ]]; then
+      cp "${RUNTIME_ROOT}/.beads/issues.jsonl" "${STATE_ROOT}/.beads/issues.jsonl"
+      (
+        cd "${STATE_ROOT}"
+        br init --db "${BR_DB}"
+        br sync --db "${BR_DB}" --import-only
+      )
+    else
+      (
+        cd "${STATE_ROOT}"
+        br init --db "${BR_DB}"
+      )
+    fi
     echo "==> initialized persistent Beads state: ${BR_DB}"
+  else
+    if [[ -f "${RUNTIME_ROOT}/.beads/issues.jsonl" ]]; then
+      cp "${RUNTIME_ROOT}/.beads/issues.jsonl" "${STATE_ROOT}/.beads/issues.jsonl"
+      (
+        cd "${STATE_ROOT}"
+        br sync --db "${BR_DB}" --import-only
+      )
+      echo "==> migrated persistent Beads state: ${BR_DB}"
+    fi
   fi
 fi
 

@@ -1211,6 +1211,31 @@ pub fn run_tool_with_env(
     run_tool_with_cwd(cmd, args, None, extra_env, timeout_secs)
 }
 
+pub fn resolve_beads_db() -> Option<std::path::PathBuf> {
+    if let Ok(db) = std::env::var("DARK_FACTORY_BR_DB") {
+        if !db.trim().is_empty() {
+            return Some(std::path::PathBuf::from(db));
+        }
+    }
+    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+        if !state_home.trim().is_empty() {
+            let path = std::path::PathBuf::from(state_home).join("dark-factory/.beads/beads.db");
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            let path = std::path::PathBuf::from(home).join(".local/state/dark-factory/.beads/beads.db");
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 fn run_tool_with_cwd(
     cmd: &str,
     args: &[&str],
@@ -1223,9 +1248,9 @@ fn run_tool_with_cwd(
 
     let res = (|| {
         let mut command = Command::new(cmd);
-        if cmd == "br" {
-            if let Ok(db) = std::env::var("DARK_FACTORY_BR_DB") {
-                command.args(["--db", db.as_str()]);
+        if cmd == "br" && !args.contains(&"--db") {
+            if let Some(db) = resolve_beads_db() {
+                command.args(["--db", db.to_str().unwrap_or_default()]);
             }
         }
         command
@@ -1778,5 +1803,79 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&expected);
         let _ = std::fs::remove_dir_all(&actual);
+    }
+
+    #[test]
+    fn resolve_beads_db_prefers_explicit_dark_factory_br_db() {
+        // jleechan-9sl1: use the crate-wide `test_env_lock()` shared by every
+        // PATH/env-mutating test module — a module-local lock only
+        // serializes within this module, not against `adapters.rs`'s
+        // `cli_tracker_br_db_tests`, which mutate the same global
+        // `DARK_FACTORY_BR_DB` / `XDG_STATE_HOME` env vars.
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = std::env::temp_dir().join(format!("afd_resolve_db_explicit_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let explicit = tmp.join("custom/beads.db");
+        let xdg = tmp.join("xdg");
+        let xdg_db = xdg.join("dark-factory/.beads/beads.db");
+        std::fs::create_dir_all(xdg_db.parent().unwrap()).unwrap();
+        std::fs::write(&xdg_db, "").unwrap();
+
+        let prior_db = std::env::var_os("DARK_FACTORY_BR_DB");
+        let prior_xdg = std::env::var_os("XDG_STATE_HOME");
+        unsafe {
+            std::env::set_var("DARK_FACTORY_BR_DB", &explicit);
+            std::env::set_var("XDG_STATE_HOME", &xdg);
+        }
+
+        let resolved = resolve_beads_db();
+
+        unsafe {
+            match prior_db {
+                Some(v) => std::env::set_var("DARK_FACTORY_BR_DB", v),
+                None => std::env::remove_var("DARK_FACTORY_BR_DB"),
+            }
+            match prior_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+
+        assert_eq!(resolved, Some(explicit));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn resolve_beads_db_falls_back_to_xdg_state_when_db_exists() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = std::env::temp_dir().join(format!("afd_resolve_db_xdg_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let xdg = tmp.join("xdg");
+        let xdg_db = xdg.join("dark-factory/.beads/beads.db");
+        std::fs::create_dir_all(xdg_db.parent().unwrap()).unwrap();
+        std::fs::write(&xdg_db, "").unwrap();
+
+        let prior_db = std::env::var_os("DARK_FACTORY_BR_DB");
+        let prior_xdg = std::env::var_os("XDG_STATE_HOME");
+        unsafe {
+            std::env::remove_var("DARK_FACTORY_BR_DB");
+            std::env::set_var("XDG_STATE_HOME", &xdg);
+        }
+
+        let resolved = resolve_beads_db();
+
+        unsafe {
+            match prior_db {
+                Some(v) => std::env::set_var("DARK_FACTORY_BR_DB", v),
+                None => std::env::remove_var("DARK_FACTORY_BR_DB"),
+            }
+            match prior_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+
+        assert_eq!(resolved, Some(xdg_db));
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
