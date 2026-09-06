@@ -40,6 +40,7 @@ Order of operations (each step is fail-closed over fail-open):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -87,6 +88,147 @@ MAX_DIFF_BYTES = 1024 * 1024  # 1 MiB
 # 131072-byte kernel limit, to leave room for the rest of `agy`'s argv
 # (binary path, flags) sharing the same limit (round-10 /advice, Opus).
 AGY_ARGV_PROMPT_SAFETY_LIMIT_BYTES = 120 * 1024
+
+# PR #819 round-11 /advice finding (Codex, HIGH): claudem/minimax/claude/
+# agy/cursor-agent(+cursor/agentf aliases) all run with full write access
+# (--dangerously-skip-permissions / -f) IN THE TARGET CHECKOUT being
+# reviewed, invoked via a plain `subprocess.run` with no `cwd=` override
+# (so they inherit the current process's working directory -- the coder's
+# worktree). Unlike codex (`--sandbox=read-only`) and gemini (`-s` +
+# `--approval-mode=default`), none of these five vendor names has any
+# sandboxing at all. Since the reviewer is fed a PR-controlled diff/prompt
+# and has full write permissions in the very tree it is grading, a
+# maliciously-crafted diff could in principle induce the reviewer to alter
+# the tree (e.g. "fix" a failing test, delete evidence, plant a passing
+# marker) BEFORE it reports its verdict -- undermining the SHA-bound
+# reviewer contract this whole gate exists to enforce. Fixed by
+# fingerprinting the checkout immediately before and after invoking any of
+# these five vendors and failing closed (discarding the reviewer's output
+# entirely, regardless of what it claims, and restoring the checkout) if
+# the checkout was mutated. Mirrors `checkout_fingerprint()` in
+# `${HOME}/.claude/skills/advice/scripts/run_primary_pair.py`, which
+# already does exactly this for its own (out-of-process) reviewer runs.
+WRITE_ACCESS_REVIEWER_VENDORS = frozenset(
+    {"claudem", "minimax", "claude", "agy", "cursor-agent", "cursor", "agentf"}
+)
+
+
+class _CheckoutFingerprintError(Exception):
+    """Raised when `_checkout_fingerprint` cannot prove the checkout's
+    state (git failure, unreadable file, etc). round-12 /advice finding
+    (Codex + Opus, both independently demonstrated real exploits): the
+    original version of this function's callers treated "cannot compute
+    a fingerprint" as equivalent to "no mutation" (fail OPEN) -- a
+    reviewer with write access can trivially trigger this (e.g. drop an
+    unreadable file, per Opus's reproduced exploit) to defeat the entire
+    guard. Every caller must now treat this exception as PROOF OF
+    MUTATION (fail CLOSED), matching the sibling contract in
+    `runner/handler_codergen.py` (`:1358-1363`, `:1550`), which already
+    treats an unobtainable fingerprint as `mutated = True`.
+    """
+
+
+def _checkout_fingerprint(repo: pathlib.Path, *, timeout: int = 30) -> str:
+    """Hash HEAD, tracked-file diff, and untracked file content.
+
+    Same shape as `checkout_fingerprint()` in the /advice skill's
+    `run_primary_pair.py` -- a git-aware content fingerprint used to
+    detect whether a reviewer subprocess mutated the checkout it was
+    only supposed to inspect. Raises `_CheckoutFingerprintError` (never
+    silently returns a placeholder) if the fingerprint cannot be proven
+    -- round-12 /advice: a wedged `git` (e.g. `index.lock` contention
+    with a concurrent reviewer) must not hang the gate indefinitely, and
+    an unreadable file must not silently make the fingerprint agree with
+    itself on both sides.
+    """
+
+    def _git(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=True,
+        ).stdout
+
+    try:
+        digest = hashlib.sha256()
+        digest.update(_git("rev-parse", "HEAD"))
+        digest.update(_git("diff", "--binary", "HEAD", "--"))
+        untracked = _git("ls-files", "--others", "--exclude-standard", "-z")
+        for raw_path in sorted(filter(None, untracked.split(b"\0"))):
+            digest.update(raw_path)
+            path = repo / os.fsdecode(raw_path)
+            if path.is_symlink():
+                digest.update(b"symlink\0" + os.fsencode(os.readlink(path)))
+            elif path.is_file():
+                digest.update(path.read_bytes())
+        return digest.hexdigest()
+    except Exception as exc:
+        raise _CheckoutFingerprintError(str(exc)) from exc
+
+
+def _checkout_head_sha(repo: pathlib.Path, *, timeout: int = 30) -> str:
+    """The exact commit `_restore_checkout` resets back to."""
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=True,
+    ).stdout.decode("utf-8", errors="replace").strip()
+
+
+def _checkout_changed_files(repo: pathlib.Path) -> str:
+    """Best-effort short description of what changed, for the failure message."""
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+            check=False,
+        ).stdout.decode("utf-8", errors="replace")
+    except Exception as exc:
+        return f"(could not enumerate changed files: {exc})"
+    lines = [line for line in status.splitlines() if line.strip()]
+    return "; ".join(lines[:10]) if lines else "(no porcelain status -- binary/ignored-file change?)"
+
+
+def _restore_checkout(repo: pathlib.Path, head_sha: str) -> bool:
+    """Discard any mutation a compromised reviewer subprocess left behind.
+
+    round-12 /advice finding (Opus, demonstrated exploit): `git checkout
+    -- .` only restores tracked files from the INDEX, not HEAD, so a
+    reviewer that `git add`s its own mutation survives "restoration"
+    untouched. Uses `git reset --hard <head_sha>` instead, which resets
+    BOTH the index and the working tree to the exact pre-review commit
+    (captured before the reviewer ran), then removes untracked files the
+    same way the fingerprint itself scoped them (`--exclude-standard`,
+    i.e. respecting .gitignore -- NOT `-x`, so legitimate gitignored
+    build artifacts the reviewer didn't touch are left alone). Returns
+    True only if the restore is independently verified to have actually
+    converged (re-fingerprinted and compared) -- round-12 /advice: the
+    original version used `check=False` and never verified success, so a
+    failed restore (index lock, permissions) was invisible and the
+    poisoned tree was silently handed to the next chain-walk vendor.
+    """
+    reset = subprocess.run(
+        ["git", "-C", str(repo), "reset", "--quiet", "--hard", head_sha],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    clean = subprocess.run(
+        ["git", "-C", str(repo), "clean", "--quiet", "-fd", "--"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    return reset.returncode == 0 and clean.returncode == 0
+
 
 # Default reviewer list. Both must PASS.
 DEFAULT_REVIEWERS_JSON = '[["codex", ""], ["gemini", "gemini-3.7-pro"]]'
@@ -781,6 +923,92 @@ def invoke_reviewer(
         env["ANTHROPIC_SMALL_FAST_MODEL"] = "MiniMax-M3"
         env["CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL"] = "0"
 
+    # PR #819 round-11/-12 /advice findings (Codex + Opus, HIGH, both
+    # independently reproduced real exploits): the five vendors in
+    # WRITE_ACCESS_REVIEWER_VENDORS run with full write access in this
+    # process's cwd (the target checkout being reviewed -- `subprocess.run`
+    # below has no `cwd=` override, so the child inherits it), with no
+    # sandboxing (unlike codex/gemini above). Fingerprint the checkout
+    # immediately before and after the reviewer subprocess and fail closed
+    # if it was mutated (or if mutation cannot be disproven), so a
+    # PR-controlled diff cannot induce the reviewer to alter the tree
+    # before reporting a (now-untrustworthy) verdict.
+    #
+    # round-12: three concrete bypasses Opus demonstrated against
+    # round-11's version, all fixed here:
+    #   1. Any exception while fingerprinting (before OR after) now fails
+    #      CLOSED (raises `_CheckoutFingerprintError`, treated as proof
+    #      of mutation), not open. A reviewer that drops one unreadable
+    #      file used to sail through with a trusted verdict.
+    #   2. The post-check now runs on EVERY exit path from the subprocess
+    #      call (timeout, FileNotFoundError, normal return), not just the
+    #      success path -- `subprocess.run(..., timeout=...)` kills the
+    #      child before raising `TimeoutExpired`, so it is safe to
+    #      fingerprint immediately after. Previously a timed-out reviewer
+    #      that mutated the tree first went undetected AND unrestored,
+    #      poisoning the NEXT chain-walk vendor's own "before" baseline.
+    #   3. `_restore_checkout` now resets to the exact pre-review HEAD sha
+    #      (not `checkout -- .`, which only restores from the index and
+    #      leaves a `git add`ed mutation in place) and its success is
+    #      independently re-verified by re-fingerprinting; if the tree is
+    #      STILL not back to the pre-review fingerprint after restore, the
+    #      error says so explicitly instead of silently handing a
+    #      possibly-still-poisoned tree to the next vendor.
+    checkout_repo: Optional[pathlib.Path] = None
+    fingerprint_before: Optional[str] = None
+    head_sha_before: Optional[str] = None
+    if reviewer in WRITE_ACCESS_REVIEWER_VENDORS:
+        checkout_repo = pathlib.Path.cwd()
+        try:
+            fingerprint_before = _checkout_fingerprint(checkout_repo)
+            head_sha_before = _checkout_head_sha(checkout_repo)
+        except Exception as exc:
+            # Cannot establish a baseline for a write-access vendor ->
+            # refuse to grant it write access on an unfingerprintable
+            # checkout at all (fail closed, matches the sibling contract
+            # in handler_codergen.py). This is the vendor's own
+            # unavailability, not a crash: the chain-walk advances past
+            # it exactly like a launch failure.
+            return None, (
+                f"cannot establish a checkout baseline for write-access "
+                f"reviewer '{reviewer}' ({exc}); refusing to grant it "
+                f"write access without an immutability proof"
+            )
+
+    def _post_review_mutation_check() -> Optional[str]:
+        """Returns an error string if a mutation was found (and
+        could not be safely restored), else None. No-op (returns None
+        immediately) for reviewers not in WRITE_ACCESS_REVIEWER_VENDORS."""
+        if checkout_repo is None or fingerprint_before is None or head_sha_before is None:
+            return None
+        try:
+            fingerprint_after = _checkout_fingerprint(checkout_repo)
+        except Exception as exc:
+            fingerprint_after = f"<unprovable: {exc}>"  # never equals a real hash
+        if fingerprint_after == fingerprint_before:
+            return None
+        changed = _checkout_changed_files(checkout_repo)
+        restored = _restore_checkout(checkout_repo, head_sha_before)
+        if restored:
+            try:
+                verify = _checkout_fingerprint(checkout_repo)
+            except Exception:
+                verify = None
+            restored = verify == fingerprint_before
+        if restored:
+            return (
+                f"reviewer '{reviewer}' mutated the target checkout during "
+                f"review -- discarding its verdict regardless of content; "
+                f"checkout restored and re-verified clean (changed: {changed})"
+            )
+        return (
+            f"reviewer '{reviewer}' mutated the target checkout during "
+            f"review AND restore did not converge back to the pre-review "
+            f"state -- discarding its verdict; the checkout may still be "
+            f"compromised, treat this run as unsafe to continue "
+            f"(changed: {changed})"
+        )
+
     try:
         proc = subprocess.run(
             cmd,
@@ -792,9 +1020,20 @@ def invoke_reviewer(
             check=False,
         )
     except FileNotFoundError as exc:
+        mutation_err = _post_review_mutation_check()
+        if mutation_err is not None:
+            return None, mutation_err
         return None, f"reviewer binary not found: {exc}"
     except subprocess.TimeoutExpired:
+        mutation_err = _post_review_mutation_check()
+        if mutation_err is not None:
+            return None, mutation_err
         return None, f"reviewer timed out after {timeout}s"
+
+    mutation_err = _post_review_mutation_check()
+    if mutation_err is not None:
+        return None, mutation_err
+
     if proc.returncode != 0:
         return proc.stdout, (
             f"reviewer rc={proc.returncode}: {proc.stderr.strip()[:300]}"
