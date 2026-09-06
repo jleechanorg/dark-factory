@@ -12,12 +12,16 @@ import hashlib
 import json
 import os
 import pathlib
+import re
+import stat
 import subprocess
 import threading
 import time
 import traceback
 import uuid
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from typing import Optional
 
 from . import engine_branches as _branches
@@ -31,6 +35,424 @@ from ._classify import _classify_outcome
 from .cxdb import CXDB
 from .handlers import Context, Result, resolve
 from .parser import Graph, Node, is_exit_node
+
+_CONTROLLER_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_CONTROLLER_SNAPSHOT_JOURNAL = "controller-snapshot-journal.json"
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+# D2/D3/D8a (docs/superpowers/specs/2026-09-01-factory-two-node-redesign-design.md):
+# ctx.state keys a successful worker visit mints via
+# handler_codergen._mint_post_worker_target — the typed target locator, its
+# Base64 intent envelope, the pin chain, and the frozen base SHA. Captured on
+# the worker's StepRecord.metadata (below) and restored on resume (in `run()`)
+# so a process restart never re-anchors the pin chain from a stale HEAD.
+_TARGET_MINT_STATE_KEYS = ("target", "intent", "_target_pin_chain", "_target_base_sha")
+
+
+def _set_controller_base_sha(ctx: Context, base_sha: str) -> None:
+    """Set controller provenance through the runner-owned initialization path."""
+    normalized = str(base_sha).strip().lower()
+    if not _CONTROLLER_SHA_RE.fullmatch(normalized):
+        raise ValueError("controller base SHA must be a full 40-hex revision")
+    ctx._controller_base_sha = normalized
+    ctx.state["_controller_base_sha"] = normalized
+
+
+def _seed_controller_base_sha(ctx: Context, graph: Graph) -> None:
+    """Bind a cold-review base to the selected target before any worker runs.
+
+    The runner owns this initial provenance. It never asks the target checkout
+    to resolve a mutable branch, and public state or graph attributes cannot
+    narrow the controller's review range. AO worktrees supplied before
+    execution are selected by ``_target_worktree`` and therefore receive the
+    same immutable HEAD capture as the ordinary CLI worktree.
+
+    Non-Git workdirs and unavailable HEADs are left unset so non-controller
+    pipelines retain their existing behavior; a controller request then fails
+    closed at its own validation boundary.
+    """
+    private_base = getattr(ctx, "_controller_base_sha", None)
+    if isinstance(private_base, str) and _CONTROLLER_SHA_RE.fullmatch(private_base.strip().lower()):
+        ctx.state["_controller_base_sha"] = private_base.strip().lower()
+        return
+    try:
+        from .handler_core import _target_worktree
+        from .handler_sandbox import _holdout_denied_paths
+        from .review_controller import ReviewContractError, validate_workspace_path
+
+        raw_target = _target_worktree(ctx)
+        holdout_roots = tuple(
+            str(pathlib.Path(root).resolve(strict=False))
+            for root in _holdout_denied_paths()
+        )
+        # Validate the lexical path before any target-owned Git operation.
+        target = validate_workspace_path(
+            str(raw_target),
+            holdout_roots=holdout_roots,
+        )
+        proc = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "HEAD^{commit}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        AttributeError,
+        TypeError,
+        ReviewContractError,
+    ):
+        return
+    base_sha = proc.stdout.strip().lower() if proc.returncode == 0 else ""
+    if _CONTROLLER_SHA_RE.fullmatch(base_sha):
+        _set_controller_base_sha(ctx, base_sha)
+
+
+def _is_controller_graph(graph: Graph) -> bool:
+    """Identify graphs whose cold-review contract requires durable provenance."""
+    if str(graph.attrs.get("review_contract", "")).strip() == "cold-review-v1":
+        return True
+    return any(
+        str(node.attrs.get("review_contract", "")).strip() == "cold-review-v1"
+        for node in graph.nodes.values()
+    )
+
+
+def _controller_snapshot_journal_path(ctx: Context) -> pathlib.Path | None:
+    """Return the durable snapshot journal path for this run, if addressable."""
+    run_id = str(
+        ctx.state.get("_controller_snapshot_journal_run_id")
+        or getattr(ctx, "run_id", "")
+        or ""
+    )
+    if not _RUN_ID_RE.fullmatch(run_id):
+        return None
+    home = pathlib.Path.home()
+    try:
+        home_info = home.lstat()
+    except OSError as exc:
+        raise ValueError("controller snapshot journal home is unavailable") from exc
+    if (
+        not home.is_absolute()
+        or stat.S_ISLNK(home_info.st_mode)
+        or not stat.S_ISDIR(home_info.st_mode)
+        or home_info.st_uid != os.getuid()
+        or home_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise ValueError("controller snapshot journal home is not private")
+    run_dir = home
+    for component in (".dark-factory", "runs", run_id):
+        run_dir /= component
+        try:
+            info = run_dir.lstat()
+        except FileNotFoundError:
+            try:
+                run_dir.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            info = run_dir.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise ValueError(f"controller snapshot journal directory is not private: {run_dir}")
+    return run_dir / _CONTROLLER_SNAPSHOT_JOURNAL
+
+
+def _controller_snapshot_dir_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _validate_controller_snapshot_dir_fd(fd: int, description: str) -> None:
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid not in {0, os.getuid()}
+        or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise ValueError(f"{description} is not private")
+
+
+@contextmanager
+def _controller_snapshot_journal_directory(
+    ctx: Context,
+) -> Iterator[tuple[pathlib.Path, int] | None]:
+    """Descend to the journal directory using validated, no-follow dirfds."""
+    run_id = str(
+        ctx.state.get("_controller_snapshot_journal_run_id")
+        or getattr(ctx, "run_id", "")
+        or ""
+    )
+    if not _RUN_ID_RE.fullmatch(run_id):
+        yield None
+        return
+    home = pathlib.Path.home()
+    try:
+        home_info = home.lstat()
+    except OSError as exc:
+        raise ValueError("controller snapshot journal home is unavailable") from exc
+    if (
+        not home.is_absolute()
+        or stat.S_ISLNK(home_info.st_mode)
+        or not stat.S_ISDIR(home_info.st_mode)
+        or home_info.st_uid not in {0, os.getuid()}
+        or home_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise ValueError("controller snapshot journal home is not private")
+
+    directory_fd: int | None = None
+    directory_path = home
+    try:
+        directory_fd = os.open(home, _controller_snapshot_dir_flags())
+        _validate_controller_snapshot_dir_fd(directory_fd, "controller snapshot journal home")
+        for component in (".dark-factory", "runs", run_id):
+            try:
+                next_fd = os.open(
+                    component,
+                    _controller_snapshot_dir_flags(),
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                try:
+                    next_fd = os.open(
+                        component,
+                        _controller_snapshot_dir_flags(),
+                        dir_fd=directory_fd,
+                    )
+                except OSError as exc:
+                    raise ValueError(
+                        f"controller snapshot journal directory {component} is unsafe "
+                        "(symlink or non-private)"
+                    ) from exc
+            except OSError as exc:
+                raise ValueError(
+                    f"controller snapshot journal directory {component} is unsafe "
+                    "(symlink or non-private)"
+                ) from exc
+            try:
+                _validate_controller_snapshot_dir_fd(
+                    next_fd, f"controller snapshot journal directory {component}"
+                )
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(directory_fd)
+            directory_fd = next_fd
+            directory_path /= component
+        yield directory_path / _CONTROLLER_SNAPSHOT_JOURNAL, directory_fd
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _read_controller_private_json(
+    path: pathlib.Path, *, dir_fd: int | None = None
+) -> object | None:
+    """Read a private JSON file through a validated no-follow descriptor."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        if dir_fd is None:
+            fd = os.open(path, flags)
+        else:
+            fd = os.open(path.name, flags, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid not in {0, os.getuid()}
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise ValueError("controller snapshot journal is not private")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    try:
+        return json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("controller private JSON is malformed") from exc
+
+
+def _read_controller_snapshot_journal(
+    path: pathlib.Path, *, dir_fd: int | None = None
+) -> list:
+    """Read a journal through a no-follow descriptor after validating its file."""
+    entries = _read_controller_private_json(path, dir_fd=dir_fd)
+    if entries is None:
+        return []
+    if not isinstance(entries, list):
+        raise TypeError("controller snapshot journal is malformed")
+    return entries
+
+
+@contextmanager
+def _controller_snapshot_journal_lock(
+    ctx: Context,
+) -> Iterator[tuple[pathlib.Path, int] | None]:
+    """Serialize journal updates with an owner-validated per-run lock."""
+    import fcntl
+
+    with _controller_snapshot_journal_directory(ctx) as location:
+        if location is None:
+            yield None
+            return
+        path, directory_fd = location
+        lock_name = f".{path.name}.lock"
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(lock_name, flags, 0o600, dir_fd=directory_fd)
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid not in {0, os.getuid()}
+                or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise ValueError("controller snapshot journal lock is not private")
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield location
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _write_controller_private_json(
+    path: pathlib.Path, entries: object, *, dir_fd: int | None = None
+) -> None:
+    """Atomically replace private JSON and flush file plus directory metadata."""
+    if dir_fd is None:
+        if path.is_symlink():
+            raise ValueError("controller snapshot journal is a symlink")
+    else:
+        try:
+            if stat.S_ISLNK(os.stat(path.name, dir_fd=dir_fd, follow_symlinks=False).st_mode):
+                raise ValueError("controller snapshot journal is a symlink")
+        except FileNotFoundError:
+            pass
+    payload = (json.dumps(entries, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    owns_directory_fd = dir_fd is None
+    directory_fd = (
+        os.open(path.parent, _controller_snapshot_dir_flags()) if owns_directory_fd else dir_fd
+    )
+    temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd: int | None = None
+    try:
+        try:
+            fd = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            if fd is not None:
+                os.close(fd)
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    except Exception:
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        if owns_directory_fd:
+            os.close(directory_fd)
+
+
+def _write_controller_snapshot_journal(
+    path: pathlib.Path, entries: list, *, dir_fd: int | None = None
+) -> None:
+    """Atomically replace a journal and flush both file and directory metadata."""
+    _write_controller_private_json(path, entries, dir_fd=dir_fd)
+
+
+def _persist_controller_snapshot_journal(
+    ctx: Context, *, remove_entry: dict | None = None
+) -> None:
+    """Merge and persist the controller snapshot journal under its run lock."""
+    raw = ctx.state.get("_controller_review_snapshots", "[]")
+    try:
+        entries = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("controller snapshot state is malformed") from exc
+    if not isinstance(entries, list):
+        raise TypeError("controller snapshot state is malformed")
+    with _controller_snapshot_journal_lock(ctx) as location:
+        if location is None:
+            return
+        path, dir_fd = location
+        merged = _read_controller_snapshot_journal(path, dir_fd=dir_fd)
+        for entry in entries:
+            if entry not in merged:
+                merged.append(entry)
+        if remove_entry is not None:
+            merged = [entry for entry in merged if entry != remove_entry]
+        ctx.state["_controller_review_snapshots"] = json.dumps(
+            merged, sort_keys=True, separators=(",", ":")
+        )
+        _write_controller_snapshot_journal(path, merged, dir_fd=dir_fd)
+
+
+def _load_controller_snapshot_journal(ctx: Context) -> None:
+    """Restore pending snapshots from disk before resume or early return."""
+    try:
+        with _controller_snapshot_journal_lock(ctx) as location:
+            if location is None:
+                return
+            path, dir_fd = location
+            disk_entries = _read_controller_snapshot_journal(path, dir_fd=dir_fd)
+    except (OSError, TypeError, ValueError):
+        return
+    raw = ctx.state.get("_controller_review_snapshots", "[]")
+    try:
+        local_entries = json.loads(raw) if raw not in (None, "") else []
+    except (TypeError, json.JSONDecodeError):
+        local_entries = []
+    if not isinstance(local_entries, list):
+        local_entries = []
+    entries = list(disk_entries)
+    for entry in local_entries:
+        if entry not in entries:
+            entries.append(entry)
+    if entries:
+        ctx.state["_controller_review_snapshots"] = json.dumps(
+            entries, sort_keys=True, separators=(",", ":")
+        )
 
 
 # Cross-run exhaustion circuit breaker (v4 hardening).
@@ -48,6 +470,48 @@ from .parser import Graph, Node, is_exit_node
 #
 # Set DARK_FACTORY_CROSS_RUN_CIRCUIT_THRESHOLD=0 to disable.
 CB_THRESHOLD = int(os.environ.get("DARK_FACTORY_CROSS_RUN_CIRCUIT_THRESHOLD", "3"))
+
+# Time decay (rev-vl3zr): a streak of N exhausted runs caused by a
+# transient condition (e.g. upstream LLM quota exhaustion) looks
+# identical in CXDB to N genuinely-stuck runs. Without decay, the breaker
+# stays tripped forever even after the quota resets. Every
+# CB_DECAY_HALF_LIFE_SECS of idle time since the most recent exhausted
+# run, the effective streak count is halved — so a long-enough gap
+# (default 30 min) drops the effective streak below CB_THRESHOLD and lets
+# the next dispatch proceed. Set DARK_FACTORY_CROSS_RUN_CIRCUIT_DECAY_HALF_LIFE_SECS=0
+# to disable decay (streak never decays, matching pre-rev-vl3zr behavior).
+CB_DECAY_HALF_LIFE_SECS = float(
+    os.environ.get("DARK_FACTORY_CROSS_RUN_CIRCUIT_DECAY_HALF_LIFE_SECS", "1800")
+)
+
+
+def _decayed_exhausted_streak(
+    streak_count: int,
+    most_recent_ended_ts: Optional[float],
+    now: Optional[float] = None,
+) -> float:
+    """Apply idle-time decay to a cross-run exhausted streak.
+
+    Returns ``streak_count`` unchanged when there's nothing to decay
+    against (no streak, no timestamp, decay disabled, or less than one
+    full half-life of idle time has elapsed). Otherwise halves the
+    effective streak for every *complete* ``CB_DECAY_HALF_LIFE_SECS`` of
+    idle time elapsed since ``most_recent_ended_ts``.
+
+    Decay is stepped (not continuous) so that ordinary sub-second
+    scheduling jitter between ``end_run`` and the next dispatch's
+    breaker check never nudges a genuine same-instant streak below the
+    integer threshold — the original v4 protection must still fire for
+    back-to-back exhaustion with no meaningful idle gap.
+    """
+    if streak_count <= 0 or not most_recent_ended_ts or CB_DECAY_HALF_LIFE_SECS <= 0:
+        return float(streak_count)
+    now = time.time() if now is None else now
+    idle_secs = max(0.0, now - most_recent_ended_ts)
+    half_lives_elapsed = int(idle_secs // CB_DECAY_HALF_LIFE_SECS)
+    if half_lives_elapsed <= 0:
+        return float(streak_count)
+    return streak_count / (2.0**half_lives_elapsed)
 
 
 def _auto_wip_commit_on_exhaustion(ctx: "Context", reason: str) -> None:
@@ -133,6 +597,122 @@ def _auto_wip_commit_on_exhaustion(ctx: "Context", reason: str) -> None:
         return
 
 
+def _cleanup_controller_snapshot(ctx: Context) -> None:
+    """Remove every exact controller snapshot after the engine owns run end.
+
+    Controller snapshots are detached worktrees created beneath the dedicated
+    snapshot root. Keep them alive through review and exit re-pin, then remove
+    only the exact validated paths recorded by the controller handler.
+    """
+    raw_snapshots = ctx.state.get("_controller_review_snapshots")
+    if not isinstance(raw_snapshots, str) or not raw_snapshots:
+        return
+    try:
+        entries = json.loads(raw_snapshots)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(entries, list):
+        return
+
+    # Use the same no-follow, owner/mode-checked root validator as snapshot
+    # creation. If an operator or another process replaced any parent with a
+    # symlink, skip cleanup rather than handing that path to Git.
+    try:
+        from .handler_parallel_reviewer import _controller_snapshot_root
+        from .handler_sandbox import _holdout_denied_paths
+        from .review_controller import validate_workspace_path
+
+        root = _controller_snapshot_root()
+    except (OSError, RuntimeError, ValueError):
+        return
+    seen: set[tuple[str, str]] = set()
+    for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"snapshot_path", "source_worktree"}
+            or not isinstance(entry["snapshot_path"], str)
+            or not isinstance(entry["source_worktree"], str)
+        ):
+            continue
+        snapshot = pathlib.Path(entry["snapshot_path"])
+        # Preserve the submitted spelling separately from any validated,
+        # canonical path. The lexical path must be revalidated before each
+        # independent Git mutation so an ancestor swap cannot redirect prune.
+        source_lexical = pathlib.Path(entry["source_worktree"])
+        source = source_lexical
+        key = (str(snapshot), str(source))
+        if key in seen:
+            continue
+        seen.add(key)
+        if (
+            not snapshot.is_absolute()
+            or snapshot.parent != root
+            or not snapshot.name.startswith("snapshot-")
+            or snapshot.is_symlink()
+            or not source.is_absolute()
+            or source.is_symlink()
+            or not source.is_dir()
+        ):
+            continue
+        try:
+            if snapshot.resolve(strict=False).parent != root.resolve(strict=False):
+                continue
+        except OSError:
+            continue
+        try:
+            # Validate the complete lexical source path immediately before
+            # every Git operation. Checking only ``source.is_symlink()`` would
+            # miss an ancestor being swapped to a symlink.
+            source = validate_workspace_path(
+                str(source),
+                holdout_roots=tuple(str(path) for path in _holdout_denied_paths()),
+            )
+            remove_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(snapshot),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if remove_result.returncode != 0 and snapshot.exists():
+                continue
+            if snapshot.exists():
+                continue
+            source_for_prune = validate_workspace_path(
+                str(source_lexical),
+                holdout_roots=tuple(str(path) for path in _holdout_denied_paths()),
+            )
+            prune_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source_for_prune),
+                    "worktree",
+                    "prune",
+                    "--expire",
+                    "now",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if prune_result.returncode != 0:
+                continue
+            _persist_controller_snapshot_journal(ctx, remove_entry=entry)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            # Cleanup is best-effort and must never mask the terminal result.
+            continue
+
+
 def _extract_coder_handoff(text: str) -> str:
     """Extract ## Coder Handoff section from reviewer output."""
     if not text:
@@ -173,11 +753,17 @@ def _run_single_node(
         records: list = []
         for attempt in results:
             attempt = _obs._normalized_result(attempt)
+            is_review = (
+                str(node.attrs.get("class", "")).strip().lower() == "review"
+            )
+            is_worker = (
+                str(node.attrs.get("class", "")).strip().lower() == "worker"
+            )
             ctx.state.update(attempt.context_updates)
             ctx.state["_last_node"] = node.name
             ctx.state["_last_outcome"] = attempt.outcome
             ctx.state["_last_output"] = attempt.output
-            if str(node.attrs.get("class", "")).strip().lower() == "review":
+            if is_review:
                 ctx.state["_last_review_feedback"] = attempt.output
             
             # Surface Coder Handoff section + verdict token (P5)
@@ -194,13 +780,30 @@ def _run_single_node(
                 ctx.state.pop("_last_coder_handoff", None)
 
             normalized_results.append(attempt)
+            record_metadata = dict(attempt.metadata)
+            if is_review:
+                record_metadata["_review_feedback"] = attempt.output
+            if is_worker and _classify_outcome(attempt.outcome) == "success":  # pyright: ignore[reportAttributeAccessIssue]
+                # D3/D8a: a successful worker visit mints/re-mints the review
+                # target locator, intent envelope, and pin chain directly
+                # into ctx.state (handler_codergen._mint_post_worker_target).
+                # Those keys are otherwise memory-only and never survive a
+                # checkpoint round-trip, so a process restart between this
+                # visit and the reviewer's next visit would silently lose
+                # pin-chain continuity and the task intent. Mirror the
+                # `_review_feedback` capture above so `run()`'s resume path
+                # can reconstruct them (see _TARGET_MINT_STATE_KEYS below).
+                for key in _TARGET_MINT_STATE_KEYS:
+                    value = ctx.state.get(key)
+                    if value is not None:
+                        record_metadata[key] = str(value)
             records.append(
                 _persist.StepRecord(
                     node=node.name,
                     outcome=attempt.outcome,
                     ts=time.time(),
                     output_preview=attempt.output[:280],
-                    metadata=attempt.metadata,
+                    metadata=record_metadata,
                 )
             )
             _persist._update_failure_state(node, ctx, attempt)
@@ -208,6 +811,40 @@ def _run_single_node(
         return normalized_results, records
     finally:
         _obs._write_heartbeat(ctx, graph, node, is_complete=True)
+
+
+def _restore_target_mint_state(ctx: Context, graph: Graph, resumed: list) -> None:
+    """D3/D8a: on resume, restore the mint-state keys from the most recent
+    worker-success step into `ctx.state` before letting either a worker retry
+    or a reviewer visit proceed. Without this, a process restart re-anchors
+    `_target_base_sha`/`_target_pin_chain` from the resumed HEAD instead of
+    the original frozen base. Only applies to graphs that opted into the
+    mint contract (`_df_mint_review_target`); fail-closed if opted in but the
+    keys are missing from that step's metadata.
+    """
+    mint_enabled = str(
+        ctx.state.get("_df_mint_review_target", "false")
+    ).strip().lower() in {"true", "1", "yes", "on"}
+    if not mint_enabled:
+        return
+    for previous in reversed(resumed):
+        previous_node = graph.nodes.get(previous.node)
+        if previous_node is None or (
+            str(previous_node.attrs.get("class", "")).strip().lower() != "worker"
+        ):
+            continue
+        if str(previous.outcome).strip().lower() == "success":
+            missing = [
+                key for key in _TARGET_MINT_STATE_KEYS if key not in previous.metadata
+            ]
+            if missing:
+                raise ValueError(
+                    "checkpoint is missing review-target mint state required "
+                    f"to resume: {missing!r}"
+                )
+            for key in _TARGET_MINT_STATE_KEYS:
+                ctx.state[key] = str(previous.metadata[key])
+        break
 
 
 def run(
@@ -222,6 +859,34 @@ def run(
     If `resume` is provided, execution restarts from the successor of the
     checkpointed last step.
     """
+    controller_graph = _is_controller_graph(graph)
+    if resume is not None and controller_graph:
+        raise ValueError("resume is not supported for cold-review-v1 graphs")
+
+    # Resume uses the checkpoint's run directory as the durable journal owner.
+    # Establish that identity before any terminal resume fast path can return.
+    if resume is not None:
+        candidate_run_id = pathlib.Path(resume).expanduser().parent.name
+        if _RUN_ID_RE.fullmatch(candidate_run_id):
+            ctx.state["_controller_snapshot_journal_run_id"] = candidate_run_id
+            if ctx.run_id is None:
+                ctx.run_id = candidate_run_id
+    if not ctx.run_id:
+        ctx.run_id = uuid.uuid4().hex[:12]
+    # dark-factory#828 item (e): snapshot HEAD + upstream SHA before any
+    # node runs so run_end can report commits_created/refs_pushed. Guarded
+    # so a resume (which reuses `ctx`) does not overwrite the ORIGINAL
+    # run's base with a mid-run snapshot.
+    if not ctx.state.get("_df_run_base_sha") and not ctx.state.get("_df_run_base_upstream_sha"):
+        ctx.state.update(_obs._capture_run_base_state(getattr(ctx, "workdir", None)))
+    if controller_graph or resume is not None:
+        _load_controller_snapshot_journal(ctx)
+
+    # Capture the controller-owned base before the first worker visit.  This
+    # runs after CLI/AO state has been assembled, so an explicitly selected AO
+    # worktree is the target whose immutable HEAD is bound.
+    if controller_graph or resume is not None:
+        _seed_controller_base_sha(ctx, graph)
     history: list = []
     visits: dict[str, int] = {}
     # Per-node ring of recent output hashes for the no_progress detector
@@ -250,10 +915,23 @@ def run(
             if last_node is None:
                 raise ValueError(f"checkpoint node missing from graph: {last.node!r}")
             if is_exit_node(last_node):
+                _cleanup_controller_snapshot(ctx)
                 return history
             if len(history) - _resumed_overhead >= max_steps:
+                _cleanup_controller_snapshot(ctx)
                 return history
             synthetic = _obs._normalized_result(Result(outcome=last.outcome))
+            is_review = (
+                str(last_node.attrs.get("class", "")).strip().lower() == "review"
+            )
+            if is_review and "_review_feedback" in last.metadata:
+                feedback = str(last.metadata["_review_feedback"])
+                ctx.state["_last_review_feedback"] = feedback
+                ctx.state["_last_output"] = feedback
+                ctx.state["_last_node"] = last.node
+                ctx.state["_last_outcome"] = last.outcome
+                if "verdict" in last.metadata:
+                    ctx.state["_last_verdict"] = str(last.metadata["verdict"])
             # Detect incomplete parallel fan-out: the fan-out step was checkpointed
             # but branches never ran (job was interrupted between the fan-out record
             # write and the ThreadPoolExecutor completing).  Re-run from the parallel
@@ -267,13 +945,53 @@ def run(
                 goal_gate_node = _persist._goal_gate_target(graph, last_node, synthetic, ctx)
                 next_node = goal_gate_node or _edges._pick_next(graph, last_node, synthetic, ctx)
                 if next_node is None:
+                    _cleanup_controller_snapshot(ctx)
                     return history
+                if (
+                    str(next_node.attrs.get("class", "")).strip().lower()
+                    == "worker"
+                ):
+                    for previous in reversed(resumed):
+                        previous_node = graph.nodes.get(previous.node)
+                        if previous_node is None or (
+                            str(previous_node.attrs.get("class", ""))
+                            .strip()
+                            .lower()
+                            != "review"
+                        ):
+                            continue
+                        if str(previous.outcome).strip().lower() == "failure":
+                            if "_review_feedback" not in previous.metadata:
+                                raise ValueError(
+                                    "checkpoint is missing full reviewer feedback required "
+                                    "for worker retry"
+                                )
+                            ctx.state["_last_review_feedback"] = str(
+                                previous.metadata["_review_feedback"]
+                            )
+                        break
+                    # D3/D8a: the retry visit re-mints from ctx.state["_target_base_sha"]
+                    # / ctx.state["_target_pin_chain"] (handler_codergen._mint_post_worker_target).
+                    # Those keys are memory-only and would not survive a
+                    # process restart between the reviewer's FAIL and this
+                    # worker retry, so restore them from the prior
+                    # worker-success step before the retry launches — mirrors
+                    # the review-branch restoration below.
+                    _restore_target_mint_state(ctx, graph, resumed)
+                elif (
+                    str(next_node.attrs.get("class", "")).strip().lower()
+                    == "review"
+                ):
+                    # D3/D8a: a successful worker visit mints the review
+                    # target locator, intent envelope, and pin chain directly
+                    # into ctx.state (stashed onto that worker step's
+                    # metadata above in `_run_single_node`). Restore them
+                    # before the reviewer visit launches.
+                    _restore_target_mint_state(ctx, graph, resumed)
                 current = next_node
 
     # Always have an addressable run_id so diagnostics are locatable even when
     # no CXDB is attached (ad-hoc smoke runs, echo backend, etc.).
-    if not ctx.run_id:
-        ctx.run_id = uuid.uuid4().hex[:12]
     event_path_is_default = getattr(ctx, "event_log_path", None) is None
 
     cxdb: Optional[CXDB] = None
@@ -297,7 +1015,7 @@ def run(
 
     if ctx.run_id is not None:
         run_dir = pathlib.Path.home() / ".dark-factory" / "runs" / ctx.run_id
-        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
         manifest_path = run_dir / "manifest.json"
         pipeline_val = str(graph.pipeline_path) if getattr(graph, "pipeline_path", None) else graph.name
         manifest_data = {
@@ -360,30 +1078,50 @@ def run(
             # (collision-free with real .dot node names) so the Healer can
             # cluster it distinctly from real exhaustion.
             if cxdb is not None and CB_THRESHOLD > 0:
-                _prior_finals = cxdb.recent_run_finals(graph.name, CB_THRESHOLD)
+                _prior_runs = cxdb.recent_run_finals_with_ts(graph.name, CB_THRESHOLD)
+                _prior_finals = [f for f, _ts in _prior_runs]
                 if (
                     len(_prior_finals) >= CB_THRESHOLD
                     and all(f == "exhausted" for f in _prior_finals)
                 ):
-                    _cb_record = _persist.StepRecord(
-                        node="__cross_run_circuit__",
-                        outcome="exhausted",
-                        ts=time.time(),
-                        output_preview=(
-                            f"cross_run_circuit_breaker: last {CB_THRESHOLD} "
-                            f"runs of pipeline {graph.name!r} all ended "
-                            f"exhausted; skipping run"
-                        ),
-                        metadata={
-                            "cross_run_circuit_breaker": "true",
-                            "threshold": str(CB_THRESHOLD),
-                            "prior_finals": json.dumps(_prior_finals),
-                        },
+                    # Time decay (rev-vl3zr): a streak that looks stuck can
+                    # actually be N transient failures (e.g. upstream quota
+                    # exhaustion) separated by idle time. Halve the
+                    # effective streak per CB_DECAY_HALF_LIFE_SECS of idle
+                    # time since the most recent exhausted run — once it
+                    # decays below CB_THRESHOLD, let this run proceed
+                    # instead of short-circuiting forever.
+                    _most_recent_ts = _prior_runs[0][1]
+                    _effective_streak = _decayed_exhausted_streak(
+                        len(_prior_finals), _most_recent_ts
                     )
-                    seq = _persist._append_record(
-                        history, checkpoint, cxdb, ctx, seq, _cb_record, "",
-                    )
-                    break
+                    if _effective_streak >= CB_THRESHOLD:
+                        _idle_secs = (
+                            max(0.0, time.time() - _most_recent_ts)
+                            if _most_recent_ts
+                            else 0.0
+                        )
+                        _cb_record = _persist.StepRecord(
+                            node="__cross_run_circuit__",
+                            outcome="exhausted",
+                            ts=time.time(),
+                            output_preview=(
+                                f"cross_run_circuit_breaker: last {CB_THRESHOLD} "
+                                f"runs of pipeline {graph.name!r} all ended "
+                                f"exhausted; skipping run"
+                            ),
+                            metadata={
+                                "cross_run_circuit_breaker": "true",
+                                "threshold": str(CB_THRESHOLD),
+                                "prior_finals": json.dumps(_prior_finals),
+                                "effective_streak": f"{_effective_streak:.4f}",
+                                "idle_secs": f"{_idle_secs:.1f}",
+                            },
+                        )
+                        seq = _persist._append_record(
+                            history, checkpoint, cxdb, ctx, seq, _cb_record, "",
+                        )
+                        break
 
             if len(history) - _parallel_overhead >= max_steps:
                 record = _persist.StepRecord(
@@ -982,6 +1720,8 @@ def run(
                 continue
 
             if next_node is None:
+                if _classify_outcome(result.outcome) == "error":
+                    break
                 _stuck_node = _para_jump_to if _para_jump_to is not None else current
                 record = _persist.StepRecord(
                     node=_stuck_node.name,
@@ -1022,6 +1762,35 @@ def run(
         # work sitting in the worktree. Surfaced into BOTH the run_end event
         # payload (CXDB record) AND the human-readable log line.
         uncommitted = _obs._collect_uncommitted_state(getattr(ctx, "workdir", None))
+        # dark-factory#828 item (c): the ONE centralized push the runner
+        # itself may perform, gated on --allow-push AND a genuine success
+        # final_outcome (never on exhausted/failure/error). Must run
+        # BEFORE _collect_commit_push_state below so refs_pushed reflects
+        # this push if it happened — every node-level subprocess is always
+        # blocked from pushing directly (see _sanitized_env), so this is
+        # the only path by which refs_pushed can ever become "1".
+        from . import push_guard as _push_guard
+
+        push_result = _push_guard.maybe_push_at_run_end(
+            getattr(ctx, "workdir", None), final_outcome
+        )
+        # dark-factory#828 item (e): commits_created/refs_pushed — the
+        # fields that would have caught the real incident even though
+        # "uncommitted_files": "0" was technically true (the coder had
+        # already committed AND pushed).
+        commit_push = _obs._collect_commit_push_state(
+            getattr(ctx, "workdir", None),
+            str(ctx.state.get("_df_run_base_sha", "") or ""),
+            str(ctx.state.get("_df_run_base_upstream_sha", "") or ""),
+        )
+        # Stash into ctx.state so the CLI's top-line JSON summary
+        # (runner/__main__.py) can surface the same values without a
+        # second round of git subprocess calls.
+        ctx.state["_df_run_commits_created"] = commit_push.get("commits_created", "")
+        ctx.state["_df_run_refs_pushed"] = commit_push.get("refs_pushed", "")
+        ctx.state["_df_run_push_attempted"] = push_result.get("push_attempted", "0")
+        ctx.state["_df_run_push_succeeded"] = push_result.get("push_succeeded", "0")
+        ctx.state["_df_run_push_skip_reason"] = push_result.get("push_skip_reason", "")
         _obs._emit_event(
             ctx,
             "run_end",
@@ -1031,13 +1800,18 @@ def run(
                 "ended_at_exit": str(ended_at_exit),
                 "steps": str(len(history)),
                 **uncommitted,
+                **commit_push,
+                **push_result,
             },
             seq,
         )
         uncommitted_log = _obs._format_uncommitted_for_log(uncommitted)
+        commit_push_log = _obs._format_commit_push_for_log(commit_push)
         log_line = f"run end final={final_outcome!r} steps={len(history)}"
         if uncommitted_log:
             log_line = f"{log_line} {uncommitted_log}"
+        if commit_push_log:
+            log_line = f"{log_line} {commit_push_log}"
         _obs._log(log, log_line)
         success_count, failure_count, error_count = _obs._outcome_counts(history)
         perf_log.close_run(
@@ -1098,5 +1872,6 @@ def run(
                 log.close()
             except OSError:
                 pass
+        _cleanup_controller_snapshot(ctx)
 
     return history

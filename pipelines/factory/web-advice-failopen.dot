@@ -1,0 +1,137 @@
+digraph web_advice_failopen {
+    graph [
+        goal="PR validation: sealed holdouts + 3 adversarial gates + /web-advice fail-open advisory."
+        level5="true"
+        label="PR Gates + /web-advice (fail-open)"
+        skip_explore="true"
+        skip_plan="true"
+        skip_implement="true"
+    ]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+
+    // Holdout-always policy: PR diffs run the sealed behavioral holdouts
+    // first — evidence gates grade the diff's story, holdouts grade its
+    // behavior. Feature comes from --feature / ctx.state["feature"].
+    holdout         [type="holdout_eval",        label="Behavioral Holdouts",          feature="${state.feature}", timeout=600]
+    gate_skeptic [
+        type="gate_skeptic",
+        label="Skeptic (inverted-incentive review)",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        prefer_adversarial="true",
+        timeout=600
+    ]
+    adversarial_reviewer [
+        type="parallel_reviewer",
+        label="Adversarial reviewer (primary + shadow Codex)",
+        review_contract="cold-review-v1",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        prefer_adversarial="true",
+        receipt_required="true",
+        timeout=600
+    ]
+    gate_es [
+        type="gate_es",
+        label="/es Evidence Standards",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        prefer_adversarial="true",
+        gate_strict="true",
+        timeout=600
+    ]
+    gate_er [
+        type="gate_er",
+        label="/er Evidence Review",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        prefer_adversarial="true",
+        gate_strict="true",
+        timeout=600
+    ]
+    gate_cs [
+        type="gate_code_standards",
+        label="/code_standards (ZFC + leveling + RCF)",
+        backend_priority="codex,minimax,agy,claude-sonnet",
+        prefer_adversarial="true",
+        gate_strict="true",
+        timeout=600
+    ]
+
+    // /web-advice fail-open advisory node (Lane B registers `type="web_advice"`
+    // in runner.handlers.TYPE_REGISTRY and adds it to graph_audit._REVIEWER_TYPE_NAMES
+    // as SOFT tier; missing handler is R1-warned, not G3-hard-stopped).
+    //
+    // Fail-open contract: this node ALWAYS returns outcome=success at the .dot
+    // layer. The actual /web-advice verdict (APPROVE / NOT MERGE / INCOMPLETE /
+    // infrastructure-failure) is surfaced out-of-band:
+    //   1. CXDB structured event (runner/cxdb.append_step),
+    //   2. PR comment via gh pr comment (REST, not GraphQL),
+    //   3. Follow-up bead via br create (when outcome is infra-failure or 3-of-4
+    //      NOT MERGE with concrete findings).
+    //
+    // Per docs/web-advice-failopen-design.md §3.5 the handler runs a ≤10s
+    // transport probe (aside-mcp / aside-cli / claude-in-chrome / cdp-9222)
+    // BEFORE opening any browser tab; when no transport is live it posts the
+    // §6.2 infra-disclosure and returns success — host-capability gaps NEVER
+    // block this PR.
+    //
+    // `min_diff_lines="5"` is the strict-lane default; cheap slim lanes can
+    // override to `min_diff_lines="20"` per lane. Below the threshold, the
+    // handler records `panel_decision="skipped_trivial_diff"` and posts no PR
+    // comment (silent skip).
+    web_advice [
+        type="web_advice",
+        label="/web-advice (fail-open)",
+        prompt="@prompts/web_advice.txt",
+        backend="claude",
+        timeout=900,
+        min_diff_lines="5",
+        transport="auto",
+        decision="continue",
+        fail_open="true",
+        description="Multi-model browser review (gemini/grok/chatgpt/perplexity) via real authenticated browser sessions. FAIL-OPEN: never blocks. Signal goes to CXDB + PR comment."
+    ]
+
+    // Bounded fix loop: any reviewer verdict other than success routes here
+    // so the PR lane can iterate on the diff rather than terminating on a
+    // first failure (per factory-evolve G2 fix-loop contract).
+    fix [
+        type="codergen",
+        label="Fix & Iterate",
+        class="fix",
+        prompt="@prompts/slim/fix.md",
+        max_visits="3",
+        timeout=600
+    ]
+
+    start -> holdout
+    holdout -> gate_skeptic [condition="outcome=success"]
+    holdout -> fix         [condition="outcome!=success"]
+
+    gate_skeptic -> adversarial_reviewer [condition="outcome=success"]
+    gate_skeptic -> fix                  [condition="outcome!=success"]
+
+    adversarial_reviewer -> gate_es [condition="outcome=success"]
+    adversarial_reviewer -> fix     [condition="outcome!=success"]
+
+    gate_es -> gate_er [condition="outcome=success"]
+    gate_es -> fix     [condition="outcome!=success"]
+
+    gate_er -> gate_cs [condition="outcome=success"]
+    gate_er -> fix     [condition="outcome!=success"]
+
+    // Strict gates still terminate on failure. Only after gate_cs succeeds do
+    // we hand off to /web-advice for the advisory lens.
+    gate_cs -> web_advice [condition="outcome=success"]
+
+    // The fail-open heart: web_advice routes unconditionally to exit. The
+    // engine sees outcome=success at the .dot layer regardless of the
+    // panel's verdict; the signal travels via CXDB + PR comment + bead
+    // instead. This is structurally identical to graph_audit G2's safe
+    // shape — a reviewer that never produces outcome!=success cannot
+    // trigger G2 because there is no `reviewer -> exit [outcome!=success]`
+    // edge.
+    web_advice -> exit
+
+    fix -> holdout
+}

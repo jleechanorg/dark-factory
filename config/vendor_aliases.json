@@ -1,0 +1,11 @@
+{
+  "vendor_aliases": {
+    "claudem": ["claudem", "minimax"],
+    "claude": ["claude"],
+    "agy": ["agy", "antigravity"],
+    "codex": ["codex"],
+    "gemini": ["gemini"],
+    "cursor-agent": ["cursor-agent", "cursor", "agentf"]
+  },
+  "_comment": "Single source of truth for daemon::tick::skeptic_evidence's coder/reviewer vendor canonicalization (bead rev-9zrgs). Keys are the canonical skeptic-reviewer vendor bucket names used by config/skeptic_reviewer_priority.json; each value lists the raw DARK_FACTORY_CODER_DEFAULT / DARK_FACTORY_REVIEWER_DEFAULT tokens that resolve to it. Matching is EXACT (trim + lowercase) against the WHOLE env var value, never substring .contains() -- this is what eliminates the 'claudem contains claude' ordering hazard the old code's inline comment flagged as a live risk. Investigation for rev-9zrgs: every real call site (daemon/tests/tick_integration.rs, daemon/systemd/drop-in/README.md, runner/__main__.py --ao-agent) sets this env var to a single bare token, never a compound/hyphenated/path-like string, so whole-string exact match is sufficient -- no token-splitting needed."
+}

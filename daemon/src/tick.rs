@@ -23,7 +23,10 @@ use crate::dispatch::{self, MAX_TRANSIENT_SPAWN_RETRY};
 use crate::errors::DaemonError;
 use crate::intake::{self, IntakeOutcome, IntakeVerdict};
 use crate::router::{self, RoutingVerdict};
-use crate::state::{set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore};
+use crate::state::{
+    set_human_hold_reason, AdoptedPrClaim, AdoptedPrIdentity, BeadOverlay, HumanHoldReason,
+    OverlayState, StateStore,
+};
 use crate::telemetry::{self, TelemetryEvent};
 use crate::tools::{Bead, Llm, PrHeadBranch, Scm, SessionId, Sessions, Tracker, Vcs};
 use crate::verifier::{self, PrEvidence};
@@ -116,6 +119,10 @@ pub struct TickSummary {
     /// full reroll cycle by the fast-rejection path" without re-deriving
     /// from telemetry.
     pub gates_assessed_fast_rejected: usize,
+    /// Bead rev-4ou1z: coder panes woken this tick by the quota watchdog
+    /// (an armed session whose recorded Gemini quota reset time, plus the
+    /// 60s wake grace, has passed).
+    pub quota_watchdog_wakes: usize,
 }
 
 /// Bounded retry cap for the automated HUMAN_HELD exit. Matches the shell
@@ -269,6 +276,7 @@ fn emit(
         telemetry_log,
         &TelemetryEvent {
             timestamp: now_iso8601(),
+            host: telemetry::local_hostname(),
             bead_id: bead_id.to_string(),
             attempt_id,
             lifecycle_state: lifecycle_state.to_string(),
@@ -565,12 +573,40 @@ fn emit_intake_outcome(telemetry_log: &Path, outcome: &IntakeOutcome) -> Result<
 /// operators the durable evidence they need to retry cleanup or kill the
 /// session manually. The `BEAD_SESSION_KILL_FAILED` telemetry event
 /// preserves visibility into the still-leaked session.
+fn overlay_session_project(deps: &TickDeps, overlay: &BeadOverlay) -> Result<String, DaemonError> {
+    overlay
+        .session_ao_project
+        .as_deref()
+        .map(str::to_owned)
+        .or_else(|| {
+            deps.cfg
+                .resolve_repo(overlay.repo(deps.cfg))
+                .map(|routing| routing.ao_project)
+        })
+        .ok_or_else(|| {
+            DaemonError::Config(format!(
+                "persisted AO session project ownership is unavailable for bead {}; refusing unowned session operation",
+                overlay.bead_id
+            ))
+        })
+}
+
+fn stop_overlay_session(
+    deps: &TickDeps,
+    overlay: &BeadOverlay,
+    session_id: &SessionId,
+) -> Result<(), DaemonError> {
+    let project = overlay_session_project(deps, overlay)?;
+    deps.sessions
+        .stop_in_project(session_id, &project)
+}
+
 fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
     let Some(session_id_str) = overlay.session_id.clone() else {
         return;
     };
     let session_id = SessionId(session_id_str.clone());
-    match deps.sessions.stop(&session_id) {
+    match stop_overlay_session(deps, overlay, &session_id) {
         Ok(()) => {
             let _ = emit(
                 deps.telemetry_log,
@@ -588,6 +624,47 @@ fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
             // recover_human_held and any operator-driven requeue without
             // risking a duplicate worker or AO dedup collision.
             overlay.session_id = None;
+            overlay.session_ao_project = None;
+            // Bead rev-3lm8k: the session is now provably dead, so its
+            // AO-managed worktree dir (if any) is stale immediately — do
+            // not wait for the TTL sweep. `clean_stale_worktree` is a
+            // no-op when `agent_worktree_root` is unset (legacy layout).
+            match crate::worktree_reaper::clean_stale_worktree(
+                deps.cfg,
+                overlay.repo(deps.cfg),
+                &session_id_str,
+            ) {
+                Ok(true) => {
+                    let _ = emit(
+                        deps.telemetry_log,
+                        &overlay.bead_id,
+                        overlay.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "WORKTREE_CLEANED_ON_SESSION_EXIT",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "session_id": session_id_str,
+                            "phase": "park_transition",
+                        }),
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    let _ = emit(
+                        deps.telemetry_log,
+                        &overlay.bead_id,
+                        overlay.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "WORKTREE_CLEAN_FAILED",
+                        serde_json::json!({}),
+                        serde_json::json!({
+                            "session_id": session_id_str,
+                            "error": format!("{e:?}"),
+                            "phase": "park_transition",
+                        }),
+                    );
+                }
+            }
         }
         Err(stop_err) => {
             // Stop failed: the session may still be live. RETAIN the handle
@@ -986,50 +1063,56 @@ pub fn run_tick(
                 // mismatch (or a confirmed-dead session) parks the bead.
                 if let Some(session_id_str) = overlay.session_id.clone() {
                     let session_id = SessionId(session_id_str.clone());
-                    if let Ok(Some(actual_branch)) = deps.sessions.session_branch(&session_id) {
-                        let expected_branch = overlay.branch.clone().unwrap_or_default();
-                        if actual_branch != expected_branch {
-                            overlay.state = OverlayState::HumanHeld;
-                            // jleechan-park-leaves-zombie-session-mh9o:
-                            // `session_branch` just proved the live session
-                            // belongs to a DIFFERENT bead/branch (the
-                            // `jleechan-5ia2` corruption case), so we MUST
-                            // NOT call `sessions.stop()` here — that would
-                            // terminate another bead's legitimate worker.
-                            // The right fix is to drop OUR overlay's bad
-                            // handle (the durable record pointing at a
-                            // session that was never ours to own) without
-                            // touching AO. The leaked overlay can then
-                            // never poison a future redispatch of THIS
-                            // bead via the AO dedup guard.
-                            overlay.session_id = None;
-                            set_human_hold_reason(
-                                &mut overlay,
-                                HumanHoldReason::SessionBranchMismatch,
-                            );
-                            deps.store.save(&overlay)?;
-                            emit(
-                                deps.telemetry_log,
-                                &overlay.bead_id,
-                                overlay.attempt,
-                                OverlayState::HumanHeld.as_str(),
-                                "PARKED_HUMAN_HELD",
-                                serde_json::json!({}),
-                                serde_json::json!({
-                                    "reason": "session_branch_mismatch",
-                                    "session_id": session_id_str,
-                                    "expected_branch": expected_branch,
-                                    "actual_branch": actual_branch,
-                                }),
-                            )?;
-                            let comment_body = format!(
-                                "🤖 **[dark-factory]** Escalation required: bead `{}` was recorded DISPATCHED with session `{}`, but that session's live branch (`{}`) does not match the bead's registered branch (`{}`). This record cannot be trusted and has been parked HUMAN_HELD for manual review (see jleechan-5ia2).",
-                                overlay.bead_id, session_id_str, actual_branch, expected_branch
-                            );
-                            let _ =
-                                post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
-                            summary.beads_parked_human_held += 1;
-                            continue;
+                    if let Ok(project) = overlay_session_project(deps, &overlay) {
+                        if let Ok(Some(actual_branch)) = deps
+                            .sessions
+                            .session_branch_in_project(&session_id, &project)
+                        {
+                            let expected_branch = overlay.branch.clone().unwrap_or_default();
+                            if actual_branch != expected_branch {
+                                overlay.state = OverlayState::HumanHeld;
+                                // jleechan-park-leaves-zombie-session-mh9o:
+                                // `session_branch` just proved the live session
+                                // belongs to a DIFFERENT bead/branch (the
+                                // `jleechan-5ia2` corruption case), so we MUST
+                                // NOT call `sessions.stop()` here — that would
+                                // terminate another bead's legitimate worker.
+                                // The right fix is to drop OUR overlay's bad
+                                // handle (the durable record pointing at a
+                                // session that was never ours to own) without
+                                // touching AO. The leaked overlay can then
+                                // never poison a future redispatch of THIS
+                                // bead via the AO dedup guard.
+                                overlay.session_id = None;
+                                overlay.session_ao_project = None;
+                                set_human_hold_reason(
+                                    &mut overlay,
+                                    HumanHoldReason::SessionBranchMismatch,
+                                );
+                                deps.store.save(&overlay)?;
+                                emit(
+                                    deps.telemetry_log,
+                                    &overlay.bead_id,
+                                    overlay.attempt,
+                                    OverlayState::HumanHeld.as_str(),
+                                    "PARKED_HUMAN_HELD",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "reason": "session_branch_mismatch",
+                                        "session_id": session_id_str,
+                                        "expected_branch": expected_branch,
+                                        "actual_branch": actual_branch,
+                                    }),
+                                )?;
+                                let comment_body = format!(
+                                    "🤖 **[dark-factory]** Escalation required: bead `{}` was recorded DISPATCHED with session `{}`, but that session's live branch (`{}`) does not match the bead's registered branch (`{}`). This record cannot be trusted and has been parked HUMAN_HELD for manual review (see jleechan-5ia2).",
+                                    overlay.bead_id, session_id_str, actual_branch, expected_branch
+                                );
+                                let _ =
+                                    post_scm_comment_by_bead_id(deps, &overlay.bead_id, &comment_body);
+                                summary.beads_parked_human_held += 1;
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1182,7 +1265,13 @@ pub fn run_tick(
                         let is_stalled_or_dead =
                             if let Some(ref session_id_str) = overlay.session_id {
                                 let session_id = SessionId(session_id_str.clone());
-                                deps.sessions.is_quiescent(&session_id)?
+                                match overlay_session_project(deps, &overlay) {
+                                    Ok(project) => {
+                                        deps.sessions
+                                            .is_quiescent_in_project(&session_id, &project)?
+                                    }
+                                    Err(_) => false,
+                                }
                             } else {
                                 emit(
                                     deps.telemetry_log,
@@ -1256,6 +1345,7 @@ pub fn run_tick(
                             // handle with the recoverable hold so recovery
                             // cannot overlap a live worker.
                             overlay.session_id = None;
+                            overlay.session_ao_project = None;
                             set_human_hold_reason(&mut overlay, HumanHoldReason::SessionStalled);
                             deps.store.save(&overlay)?;
                             emit(
@@ -1298,6 +1388,13 @@ pub fn run_tick(
         run_recovery_step(deps, &mut summary)?;
     }
 
+    // rev-4ou1z: slow-tier cadence matches the hours-long Gemini quota
+    // reset window — no need to poll for a wake-due session every fast
+    // tick.
+    if slow_tier_due {
+        run_quota_watchdog_wake(deps, &mut summary)?;
+    }
+
     run_fast_tier(deps, &mut summary)?;
 
     emit(
@@ -1319,6 +1416,7 @@ pub fn run_tick(
             "beadsHeldDispositionRequired": summary.beads_held_disposition_required,
             "escalationsSuppressed": summary.escalations_suppressed,
             "escalationsUndeliverable": summary.escalations_undeliverable,
+            "quotaWatchdogWakes": summary.quota_watchdog_wakes,
         }),
         serde_json::json!({"tick_index": tick_index, "slow_tier_due": slow_tier_due}),
     )?;
@@ -1544,8 +1642,67 @@ fn run_recovery_step(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), D
     Ok(())
 }
 
+/// Bead rev-4ou1z: quota watchdog wake sweep. Slow-tier cadence matches the
+/// hours-long Gemini quota reset window (no need to poll every fast tick).
+/// For every `(bead_id, session_id)` armed by `run_fast_tier`'s
+/// SESSION_HEALTH_FAILED handling whose recorded reset time (plus the 60s
+/// wake grace) has passed, sends an Enter keypress to the paused coder pane
+/// via `Sessions::wake_pane` — the SAME session that was paused, no
+/// respawn.
+fn run_quota_watchdog_wake(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Deliberately scoped to bead ids THIS store owns (same
+    // `owned_branches` walk `run_fast_tier` uses) rather than a blind sweep
+    // of the whole process-wide ledger: the ledger is a single static
+    // shared by every `TickDeps`/`StateStore` pairing in the process (see
+    // the module doc comment on `health::quota_watchdog`), so scoping the
+    // query to this store's own bead ids is what keeps two independent
+    // tick loops from reacting to each other's armed entries.
+    let branches = deps.store.owned_branches()?;
+    let mut bead_ids: Vec<String> = Vec::new();
+    for branch in &branches {
+        if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
+            bead_ids.push(bead_id);
+        }
+    }
+    bead_ids.sort();
+    bead_ids.dedup();
+
+    for bead_id in bead_ids {
+        let Some(session_id) = crate::health::quota_watchdog::take_due_wake(&bead_id, now_epoch)
+        else {
+            continue;
+        };
+        let attempt = deps
+            .store
+            .load(&bead_id)
+            .ok()
+            .flatten()
+            .map(|o| o.attempt)
+            .unwrap_or(0);
+        let woke = deps
+            .sessions
+            .wake_pane(&SessionId(session_id.clone()))
+            .unwrap_or(false);
+        emit(
+            deps.telemetry_log,
+            &bead_id,
+            attempt,
+            OverlayState::Dispatched.as_str(),
+            "QUOTA_WATCHDOG_WOKE_PANE",
+            serde_json::json!({}),
+            serde_json::json!({"session_id": session_id, "woke": woke}),
+        )?;
+        summary.quota_watchdog_wakes += 1;
+    }
+    Ok(())
+}
+
 /// Slow tier: intake new beads, route each freshly-queued bead, dispatch as
-/// many QUEUED beads as the safety envelope (30/15) allows.
+/// many QUEUED beads as the safety envelope (40/15) allows.
 fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), DaemonError> {
     // jleechan-gib: recovery runs AFTER this slow-tier dispatch pass (see
     // `run_tick`), so freshly-recovered QUEUED beads are NOT dispatched this
@@ -1606,8 +1763,126 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         if adopted.newly_created {
             summary.beads_created += 1;
         }
-        if let Some(owner) = deps.store.bead_id_for_branch(&adopted.head_ref_name)? {
-            if owner != adopted.bead_id {
+        let existing = deps.store.load(&adopted.bead_id)?;
+        let attempt = existing.as_ref().map(|o| o.attempt).unwrap_or(1);
+        // jleechan-mdun: capture the overlay state BEFORE the move into
+        // `should_adopt` (and the subsequent `unwrap_or` below) so the
+        // dedup check below can compare against the durable state of
+        // THIS tick's snapshot, not a stale or re-initialized copy.
+        let pre_adopt_state = existing.as_ref().map(|o| o.state);
+        let should_adopt = !matches!(
+            pre_adopt_state,
+            Some(OverlayState::Ready) | Some(OverlayState::HumanHeld)
+        );
+        let target_repo = intake::resolve_target_repo("", Some(adopted.external_ref.as_str()));
+        let mut overlay = existing.unwrap_or(BeadOverlay {
+            bead_id: adopted.bead_id.clone(),
+            state: OverlayState::Attested,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(adopted.pr_number),
+            branch: Some(adopted.head_ref_name.clone()),
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo,
+            attempt_started_at: None,
+        });
+        if should_adopt {
+            // jleechan-35y4 Stage A: adopted PRs are always same-repo
+            // (fork/cross-repo PRs are rejected earlier by `same_repo_pr`
+            // in intake.rs), so this always resolves to `cfg.target_repo`'s
+            // owner/repo today. Still resolved from `external_ref` (not
+            // left `None`) so it stays correct once Stage C/D lift the
+            // same-repo-only restriction for adopted PRs.
+            overlay.state = OverlayState::Attested;
+            overlay.pr_number = Some(adopted.pr_number);
+            overlay.branch = Some(adopted.head_ref_name.clone());
+            // Explicit stored provenance flag (bead jleechan-tfs1), NOT a
+            // branch-name pattern match: every bead that reaches this block
+            // arrived via `intake::normalize_labeled_prs` adopting an
+            // external contributor's own head_ref_name, so it is always
+            // adopted — including on a re-adopt of a pre-migration row that
+            // predates this field. `reroll()` reads this flag to choose
+            // append-only remediation instead of fabricating a replacement
+            // branch and closing the contributor's PR.
+            overlay.is_adopted = true;
+        }
+        let Some(head_sha) = adopted.head_sha.as_deref().filter(|sha| !sha.is_empty()) else {
+            emit(
+                deps.telemetry_log,
+                &adopted.bead_id,
+                attempt,
+                overlay.state.as_str(),
+                "EXISTING_PR_IDENTITY_DEFERRED",
+                serde_json::json!({}),
+                serde_json::json!({
+                    "reason": "incoming_pr_head_sha_absent",
+                    "repo": adopted.repo,
+                    "pr_number": adopted.pr_number,
+                    "branch": adopted.head_ref_name,
+                    "external_ref": adopted.external_ref,
+                }),
+            )?;
+            continue;
+        };
+        let claim = deps.store.claim_adopted_pr(
+            &AdoptedPrIdentity {
+                repo: adopted.repo.clone(),
+                default_repo: deps.cfg.target_repo.clone(),
+                pr_number: adopted.pr_number,
+                branch: adopted.head_ref_name.clone(),
+                head_sha: head_sha.to_string(),
+            },
+            &overlay,
+        )?;
+        match claim {
+            AdoptedPrClaim::Owned => {}
+            AdoptedPrClaim::ReplacedHumanHeld { owner_bead_id } => {
+                emit(
+                    deps.telemetry_log,
+                    &adopted.bead_id,
+                    attempt,
+                    OverlayState::Attested.as_str(),
+                    "EXISTING_PR_OWNER_REPLACED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "replaced_owner_bead_id": owner_bead_id,
+                        "repo": adopted.repo,
+                        "pr_number": adopted.pr_number,
+                        "branch": adopted.head_ref_name,
+                        "head_sha": adopted.head_sha,
+                    }),
+                )?;
+            }
+            AdoptedPrClaim::CoalescedActive { owner_bead_id } => {
+                pr_intake_bead_ids.insert(owner_bead_id.clone());
+                emit(
+                    deps.telemetry_log,
+                    &adopted.bead_id,
+                    attempt,
+                    OverlayState::Attested.as_str(),
+                    "EXISTING_PR_COALESCED",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "owner_bead_id": owner_bead_id,
+                        "repo": adopted.repo,
+                        "pr_number": adopted.pr_number,
+                        "branch": adopted.head_ref_name,
+                        "head_sha": adopted.head_sha,
+                    }),
+                )?;
+                continue;
+            }
+            AdoptedPrClaim::RefusedMismatch {
+                owner_bead_id: owner,
+                reason,
+            } => {
                 let owner_live = deps.store.load(&owner)?.is_some();
                 let comment_body = format!(
                     "🤖 **[dark-factory]** Escalation required: refusing factory PR adoption for branch `{}` because it is already registered to bead `{}`. Branch-key stealing is not allowed; please use a unique same-repo branch.",
@@ -1618,6 +1893,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     .comment_external(&adopted.external_ref, &comment_body);
                 let ctx = serde_json::json!({
                     "reason": "adoption_branch_collision",
+                    "identity_refusal": reason,
                     "repo": adopted.repo,
                     "pr_number": adopted.pr_number,
                     "branch": adopted.head_ref_name,
@@ -1658,59 +1934,15 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 continue;
             }
         }
-        deps.store
-            .register_branch(&adopted.bead_id, &adopted.head_ref_name)?;
-
-        let existing = deps.store.load(&adopted.bead_id)?;
-        let attempt = existing.as_ref().map(|o| o.attempt).unwrap_or(1);
-        // jleechan-mdun: capture the overlay state BEFORE the move into
-        // `should_adopt` (and the subsequent `unwrap_or` below) so the
-        // dedup check below can compare against the durable state of
-        // THIS tick's snapshot, not a stale or re-initialized copy.
-        let pre_adopt_state = existing.as_ref().map(|o| o.state);
-        let should_adopt = !matches!(
-            pre_adopt_state,
-            Some(OverlayState::Ready) | Some(OverlayState::HumanHeld)
-        );
-        if should_adopt {
-            // jleechan-35y4 Stage A: adopted PRs are always same-repo
-            // (fork/cross-repo PRs are rejected earlier by `same_repo_pr`
-            // in intake.rs), so this always resolves to `cfg.target_repo`'s
-            // owner/repo today. Still resolved from `external_ref` (not
-            // left `None`) so it stays correct once Stage C/D lift the
-            // same-repo-only restriction for adopted PRs.
-            let target_repo = intake::resolve_target_repo("", Some(adopted.external_ref.as_str()));
-            let mut overlay = existing.unwrap_or(BeadOverlay {
-                bead_id: adopted.bead_id.clone(),
-                state: OverlayState::Attested,
-                attempt: 1,
-                reroll_count: 0,
-                autonomy_secs: 0,
-                spend_usd: 0.0,
-                pr_number: Some(adopted.pr_number),
-                branch: Some(adopted.head_ref_name.clone()),
-                session_id: None,
-                is_adopted: true,
-                spawn_failure_count: 0,
-                pre_session_head_sha: None,
-                park_reason: None,
-                target_repo,
-                attempt_started_at: None,
-            });
-            overlay.state = OverlayState::Attested;
-            overlay.pr_number = Some(adopted.pr_number);
-            overlay.branch = Some(adopted.head_ref_name.clone());
-            // Explicit stored provenance flag (bead jleechan-tfs1), NOT a
-            // branch-name pattern match: every bead that reaches this block
-            // arrived via `intake::normalize_labeled_prs` adopting an
-            // external contributor's own head_ref_name, so it is always
-            // adopted — including on a re-adopt of a pre-migration row that
-            // predates this field. `reroll()` reads this flag to choose
-            // append-only remediation instead of fabricating a replacement
-            // branch and closing the contributor's PR.
-            overlay.is_adopted = true;
-            deps.store.save(&overlay)?;
-        }
+        // jleechan-r2dup: `claim_adopted_pr` above already persisted this
+        // tick's fully-configured `overlay` (state/pr_number/branch/
+        // is_adopted, plus branch_registry ownership) as a side effect of
+        // returning `Owned` -- reloading `existing` here and recomputing
+        // `pre_adopt_state`/`should_adopt` from the store would observe
+        // that just-written row instead of the pre-tick snapshot, making
+        // `should_skip_existing_pr_adoption_emit` see `Some(Attested)` and
+        // wrongly suppress the very first `EXISTING_PR_ADOPTED` emit. Reuse
+        // the `pre_adopt_state`/`attempt` captured above the claim call.
         // jleechan-mdun: skip re-emit on subsequent ticks. The durable
         // overlay row already records (pr_number, branch, external_ref,
         // is_adopted) — emitting `EXISTING_PR_ADOPTED` every tick for an
@@ -1746,7 +1978,16 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         }
     }
 
-    let (created, issue_skip_outcomes) = intake::normalize(deps.scm, deps.tracker, deps.cfg)?;
+    let (created, issue_skip_outcomes) = match intake::normalize(deps.scm, deps.tracker, deps.cfg) {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_gh_rate_limit() => {
+            eprintln!(
+                "auto-factory daemon: GitHub issue intake rate-limited; continuing with local bead routing and dispatch"
+            );
+            (Vec::new(), Vec::new())
+        }
+        Err(error) => return Err(error),
+    };
     // jleechan-eazj: same unconditional per-candidate guarantee as the PR
     // path above — every factory-labeled issue that did NOT result in a
     // newly-created bead still gets exactly one verdict event.
@@ -1754,6 +1995,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         emit_intake_outcome(deps.telemetry_log, outcome)?;
     }
     let tracker_candidates = deps.tracker.fetch_candidates()?;
+    let dependency_ready_ids = deps.tracker.fetch_ready_ids()?;
     let mut routing_candidates: Vec<Bead> = Vec::new();
     for bead_id in &created {
         let mut pr_number = None;
@@ -1832,6 +2074,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             pr_number,
             branch: None,
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -1950,6 +2193,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         pr_number: None,
                         branch: None,
                         session_id: None,
+                        session_ao_project: None,
                         is_adopted: false,
                         spawn_failure_count: 0,
                         pre_session_head_sha: None,
@@ -2127,6 +2371,7 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     pr_number: None,
                     branch: None,
                     session_id: None,
+                    session_ao_project: None,
                     is_adopted: false,
                     spawn_failure_count: 0,
                     pre_session_head_sha: None,
@@ -2148,6 +2393,42 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 o
             }
         };
+
+        if !dependency_ready_ids.contains(&bead.id) {
+            let context = serde_json::json!({
+                "reason": "absent_from_br_ready",
+                "admission_source": "br ready --label factory --json --limit 0",
+                "state": overlay.state.as_str(),
+                "attempt": overlay.attempt,
+            });
+            let now_epoch = now_epoch_secs();
+            let (should_emit, context_hash) = escalation_dedup_should_emit(
+                deps,
+                &bead.id,
+                "dependency_blocked",
+                &context,
+                now_epoch,
+            )?;
+            if should_emit {
+                emit(
+                    deps.telemetry_log,
+                    &bead.id,
+                    overlay.attempt,
+                    overlay.state.as_str(),
+                    "DEPENDENCY_BLOCKED",
+                    serde_json::json!({}),
+                    context,
+                )?;
+                record_escalation_emit_dedup(
+                    deps,
+                    &bead.id,
+                    "dependency_blocked",
+                    &context_hash,
+                    now_epoch,
+                )?;
+            }
+            continue;
+        }
 
         match router::route(deps.llm, bead) {
             Ok(verdict) => {
@@ -2209,7 +2490,41 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     let _ = deps.tracker.comment_external(ext_ref, &comment_body);
                 }
             }
-            Err(other) => return Err(other),
+            Err(other) => {
+                // jleechan (af-e2e-proof session, 2026-09-05): this used to
+                // `return Err(other)`, propagating via `?` out of
+                // `run_slow_tier` and aborting the ENTIRE tick's routing
+                // phase the instant any single candidate's `judge()` call
+                // failed with a non-`Parse` error — silently starving every
+                // candidate after it, for every repo, forever if the same
+                // candidate keeps failing first (the error is typically
+                // `is_transient()`, so the outer tick loop just retries next
+                // tick with no ERROR telemetry and no `consecutive_failures`
+                // bump). Park just this one bead — mirroring the `Parse` arm
+                // above — and let the loop continue.
+                let reason = other.to_string();
+                let mut held = overlay;
+                held.state = OverlayState::HumanHeld;
+                set_human_hold_reason(&mut held, HumanHoldReason::RouterError(reason.clone()));
+                deps.store.save(&held)?;
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &bead.id,
+                    held.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({"reason": reason}),
+                )?;
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Router error (human held): {}",
+                    reason
+                );
+                if let Some(ref ext_ref) = bead.external_ref {
+                    let _ = deps.tracker.comment_external(ext_ref, &comment_body);
+                }
+            }
         }
     }
 
@@ -2396,6 +2711,143 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                         deps,
                         &failure.bead_id,
                         "transient_spawn_retry_cap_exceeded",
+                        &ctx_hash,
+                        now_epoch,
+                    )?;
+                }
+                continue;
+            }
+
+            if failure.phase == "ao_orchestrator_not_running" {
+                // jleechan-vu3k: `dispatch::dispatch_ready` already parked
+                // this bead HUMAN_HELD on disk under the DISTINCT
+                // `ao_orchestrator_not_running` reason (not the generic
+                // `transient_spawn_retry_cap_exceeded` this used to fall
+                // into). Mirrors the `spawn_retry_cap_exceeded` idiom above
+                // exactly, but the escalation comment names the real,
+                // operator-actionable cause instead of a generic
+                // "check session capacity" message.
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": "ao_orchestrator_not_running",
+                        "branch": failure.branch.as_deref(),
+                        "error": failure.error.as_str(),
+                    }),
+                )?;
+                if escalation_already_recorded(deps, &failure.bead_id)? {
+                    continue;
+                }
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: bead `{}` failed to spawn a worker session because the Agent Orchestrator (AO) instance is running but is not polling this project. Retrying will not fix this — an operator must ensure a live AO instance has this project registered (e.g. `ao start`) before this bead can dispatch. Automation parked it HUMAN_HELD rather than burning retries against an infrastructure gap.\n\nUnderlying error: {}",
+                    failure.bead_id, failure.error
+                );
+                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
+                {
+                    if is_missing_scm_target_error(&err) {
+                        record_local_escalation_fallback(
+                            deps,
+                            &failure.bead_id,
+                            "ao_orchestrator_not_running",
+                        )?;
+                        summary.beads_escalated_locally += 1;
+                        emit(
+                            deps.telemetry_log,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "ESCALATED_LOCALLY",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": "ao_orchestrator_not_running",
+                                "branch": failure.branch.as_deref(),
+                                "scm_error": err.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
+                    if !err.is_transient() {
+                        mark_escalation_undeliverable_and_emit(
+                            deps,
+                            summary,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "ao_orchestrator_not_running",
+                            &err,
+                        )?;
+                        continue;
+                    }
+                    let ctx = serde_json::json!({
+                        "reason": "ao_orchestrator_not_running",
+                        "error": err.to_string(),
+                    });
+                    let now_epoch = now_epoch_secs();
+                    let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                        deps,
+                        &failure.bead_id,
+                        "ao_orchestrator_not_running",
+                        &ctx,
+                        now_epoch,
+                    )?;
+                    if !should_emit {
+                        summary.escalations_suppressed += 1;
+                        continue;
+                    }
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_NOTIFICATION_FAILED",
+                        serde_json::json!({}),
+                        ctx,
+                    )?;
+                    record_escalation_emit_dedup(
+                        deps,
+                        &failure.bead_id,
+                        "ao_orchestrator_not_running",
+                        &ctx_hash,
+                        now_epoch,
+                    )?;
+                    continue;
+                }
+                record_escalation(deps, &failure.bead_id, "ao_orchestrator_not_running")?;
+                summary.beads_escalated += 1;
+                let ctx = serde_json::json!({
+                    "reason": "ao_orchestrator_not_running",
+                    "branch": failure.branch.as_deref(),
+                });
+                let now_epoch = now_epoch_secs();
+                let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                    deps,
+                    &failure.bead_id,
+                    "ao_orchestrator_not_running",
+                    &ctx,
+                    now_epoch,
+                )?;
+                if !should_emit {
+                    summary.escalations_suppressed += 1;
+                } else {
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_REQUIRED",
+                        serde_json::json!({}),
+                        ctx,
+                    )?;
+                    record_escalation_emit_dedup(
+                        deps,
+                        &failure.bead_id,
+                        "ao_orchestrator_not_running",
                         &ctx_hash,
                         now_epoch,
                     )?;
@@ -3159,6 +3611,313 @@ fn build_skeptic_prompt(
     )
 }
 
+/// rev-gujs2 (ZFC-1, HIGH): anchored-marker scan for a
+/// `verdict:`/`overall:`/`normalized:` declaration line, or a `/skeptic
+/// pass|warn|fail` command line, within free-text GitHub PR comments. Unlike
+/// `verifier::find_marker_verdict` (which anchors the marker to a LINE via
+/// `str::find`, so `"the old verdict: fail was wrong"` still parses as Fail
+/// — traced by hand: after the `"verdict:"` substring the remainder is
+/// `" fail was wrong"`, and `token_to_verdict` takes the first
+/// whitespace-delimited token `"fail"`), this scan requires the marker to be
+/// the START of the TRIMMED line, case-insensitively — text that merely
+/// discusses or quotes a verdict phrase mid-sentence does not match at all.
+/// `find_marker_verdict` stays correct for its own callers (parsing a
+/// trusted LLM reviewer's own single structured completion, per
+/// gate_es/gate_er/gate_code_standards in CLAUDE.md), but is not anchored
+/// enough for arbitrary free-text authored by untrusted GitHub commenters.
+/// Returns the LAST matching line's canonical `"verdict: pass"` /
+/// `"verdict: fail"` string (an authoritative closing line overrides
+/// earlier progress chatter, mirroring `find_marker_verdict`'s "last marker
+/// wins"), or `None` if no anchored declaration line is present. `warn` has
+/// no independent state in this enrichment-signal grammar (matching the
+/// pre-fix behavior, which never set gha/sign-off to anything but
+/// pass/fail/absent), so only `pass`/`success` and `fail`/`failure` tokens
+/// are recognized.
+fn anchored_comment_verdict(body: &str) -> Option<&'static str> {
+    const MARKERS: [&str; 3] = ["verdict:", "overall:", "normalized:"];
+
+    let mut found = None;
+    for line in body.lines() {
+        let trimmed_lower = line.trim().to_ascii_lowercase();
+        let after = MARKERS
+            .iter()
+            .find_map(|m| trimmed_lower.strip_prefix(m))
+            .or_else(|| trimmed_lower.strip_prefix("/skeptic "));
+        if let Some(after) = after {
+            let token = after.split_whitespace().next().unwrap_or("");
+            match token {
+                "pass" | "success" => found = Some("verdict: pass"),
+                "fail" | "failure" => found = Some("verdict: fail"),
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+/// rev-gujs2 (ZFC-1, HIGH): derive the OPTIONAL `gha`/`sign-off` enrichment
+/// signals from `snapshot.comments`. Extracted out of `skeptic_evidence`
+/// (which is private and has subprocess side effects) so this is directly
+/// unit-testable, mirroring the `build_skeptic_prompt` /
+/// `second_family_candidates` extraction precedent in this file.
+///
+/// Previously this loop used unanchored `.contains(...)` substring scans
+/// over the lower-cased comment body — banned ZFC-style keyword matching
+/// over free-text authored by arbitrary GitHub commenters. A comment merely
+/// containing the bare word "signoff"/"sign-off" ANYWHERE, or one that
+/// discussed/quoted a prior "verdict: fail" mid-sentence, would flip a
+/// signal and could escalate the combined gate-7 verdict (Fail beats Warn
+/// beats Pass) on an otherwise healthy PR. Both signals now require
+/// `anchored_comment_verdict` to find a genuine declaration line. The bare
+/// "sign-off"/"signoff" word trigger is DROPPED entirely rather than
+/// hardened, per the bead's own FIX note: `gha`/`sign-off` are optional
+/// enrichment signals most target repos never emit, and the bare word has
+/// no anchorable grammar — only `verdict:`/`overall:`/`normalized:` marker
+/// lines and `/skeptic pass|fail` command lines can flip a signal now.
+///
+/// The author/topic gates (gha must be `github-actions`/`gha` AND mention
+/// "skeptic"; sign-off must NOT be `github-actions`/`coderabbit`/`bugbot`/
+/// `cursor`) are unchanged — those are legitimate coarse filters, not the
+/// ZFC violation. Iterates `comments` in order; the LAST matching comment
+/// for each signal wins, matching the original loop's behavior.
+fn derive_enrichment_verdicts(
+    comments: &[crate::tools::PrComment],
+) -> (&'static str, &'static str) {
+    let mut gha_verdict = "verdict: absent";
+    let mut signoff_verdict = "verdict: absent";
+
+    for comment in comments {
+        let author_lower = comment.author.to_ascii_lowercase();
+
+        if (author_lower.contains("github-actions") || author_lower.contains("gha"))
+            && comment.body.to_ascii_lowercase().contains("skeptic")
+        {
+            if let Some(v) = anchored_comment_verdict(&comment.body) {
+                gha_verdict = v;
+            }
+        }
+
+        if !author_lower.contains("github-actions")
+            && !author_lower.contains("coderabbit")
+            && !author_lower.contains("bugbot")
+            && !author_lower.contains("cursor")
+        {
+            if let Some(v) = anchored_comment_verdict(&comment.body) {
+                signoff_verdict = v;
+            }
+        }
+    }
+
+    (gha_verdict, signoff_verdict)
+}
+
+#[cfg(test)]
+mod anchored_comment_verdict_tests {
+    //! rev-gujs2 (ZFC-1, HIGH): pins the false-positive scenarios the
+    //! unanchored `.contains(...)` scan let through, plus the anchored
+    //! declaration-line grammar that replaces it.
+    use super::anchored_comment_verdict;
+
+    #[test]
+    fn bare_signoff_word_in_unrelated_prose_does_not_match() {
+        // Pre-fix behavior: `body_lower.contains("signoff")` alone flipped
+        // `signoff_verdict` to "verdict: pass" here — zero structured
+        // marker required. The anchored scan requires a declaration line,
+        // so a bare word in ordinary prose must not match.
+        assert_eq!(
+            anchored_comment_verdict("let's schedule the signoff meeting for Friday"),
+            None
+        );
+        assert_eq!(
+            anchored_comment_verdict("still need sign-off from the team lead"),
+            None
+        );
+    }
+
+    #[test]
+    fn quoted_verdict_phrase_mid_sentence_does_not_match() {
+        // Pre-fix `find_marker_verdict`-style unanchored `.find()` scan
+        // would parse this as Fail (marker found mid-line, remainder
+        // " fail was wrong" tokenizes to "fail"). The anchored scan
+        // requires "verdict:" at the START of the trimmed line.
+        assert_eq!(
+            anchored_comment_verdict(
+                "note: the old verdict: fail was wrong, this PR fixes it"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn anchored_verdict_pass_line_matches() {
+        assert_eq!(
+            anchored_comment_verdict(
+                "Ran the checks locally, all green.\nverdict: pass\nMerging shortly."
+            ),
+            Some("verdict: pass")
+        );
+    }
+
+    #[test]
+    fn anchored_verdict_fail_line_matches() {
+        assert_eq!(
+            anchored_comment_verdict("verdict: fail missing test coverage"),
+            Some("verdict: fail")
+        );
+    }
+
+    #[test]
+    fn anchored_skeptic_command_line_matches() {
+        assert_eq!(anchored_comment_verdict("/skeptic fail"), Some("verdict: fail"));
+        assert_eq!(anchored_comment_verdict("/skeptic pass"), Some("verdict: pass"));
+    }
+
+    #[test]
+    fn overall_and_normalized_markers_match_parity_with_verdict() {
+        assert_eq!(
+            anchored_comment_verdict("overall: pass"),
+            Some("verdict: pass")
+        );
+        assert_eq!(
+            anchored_comment_verdict("normalized: fail"),
+            Some("verdict: fail")
+        );
+    }
+
+    #[test]
+    fn last_anchored_line_wins_when_multiple_present() {
+        assert_eq!(
+            anchored_comment_verdict("verdict: fail\nfixed now\nverdict: pass"),
+            Some("verdict: pass")
+        );
+    }
+
+    #[test]
+    fn indented_marker_line_still_anchors() {
+        // `trim()` strips leading whitespace before the prefix check, so a
+        // marker line indented inside a quoted block still counts as
+        // line-start, not mid-sentence.
+        assert_eq!(
+            anchored_comment_verdict("  verdict: pass  "),
+            Some("verdict: pass")
+        );
+    }
+}
+
+#[cfg(test)]
+mod derive_enrichment_verdicts_tests {
+    //! rev-gujs2 (ZFC-1, HIGH): pins the author/topic gates plus the
+    //! "last matching comment wins" iteration order, now layered on top of
+    //! `anchored_comment_verdict` instead of bare substring scans.
+    use super::derive_enrichment_verdicts;
+    use crate::tools::PrComment;
+
+    fn comment(author: &str, body: &str) -> PrComment {
+        PrComment {
+            author: author.to_string(),
+            body: body.to_string(),
+            created_at_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn no_comments_yields_both_absent() {
+        assert_eq!(
+            derive_enrichment_verdicts(&[]),
+            ("verdict: absent", "verdict: absent")
+        );
+    }
+
+    #[test]
+    fn bare_signoff_word_from_human_reviewer_no_longer_flips_signoff() {
+        // Pre-fix: this exact body flipped signoff_verdict to
+        // "verdict: pass" via `body_lower.contains("signoff")`. Confirmed
+        // by hand against the removed loop in tick.rs prior to rev-gujs2 —
+        // there was no marker requirement at all.
+        let comments = [comment(
+            "some-reviewer",
+            "let's schedule the signoff meeting for Friday",
+        )];
+        let (_, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(signoff, "verdict: absent");
+    }
+
+    #[test]
+    fn quoted_verdict_phrase_from_human_reviewer_does_not_flip_signoff() {
+        let comments = [comment(
+            "some-reviewer",
+            "note: the old verdict: fail was wrong, this PR fixes it",
+        )];
+        let (_, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(signoff, "verdict: absent");
+    }
+
+    #[test]
+    fn anchored_signoff_pass_from_human_reviewer_flips_verdict() {
+        let comments = [comment("some-reviewer", "verdict: pass")];
+        let (_, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(signoff, "verdict: pass");
+    }
+
+    #[test]
+    fn anchored_skeptic_command_from_human_reviewer_flips_signoff() {
+        let comments = [comment("some-reviewer", "/skeptic fail")];
+        let (_, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(signoff, "verdict: fail");
+    }
+
+    #[test]
+    fn excluded_authors_never_contribute_to_signoff_even_when_anchored() {
+        for author in ["github-actions[bot]", "coderabbitai", "bugbot", "cursor-agent"] {
+            let comments = [comment(author, "verdict: pass")];
+            let (_, signoff) = derive_enrichment_verdicts(&comments);
+            assert_eq!(signoff, "verdict: absent", "author={author}");
+        }
+    }
+
+    #[test]
+    fn gha_requires_actions_author_skeptic_topic_and_anchored_marker() {
+        // Right author/topic, no anchored marker -> stays absent.
+        let comments = [comment(
+            "github-actions[bot]",
+            "skeptic run kicked off, results pending",
+        )];
+        let (gha, _) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: absent");
+
+        // Right author/topic AND anchored marker -> flips.
+        let comments = [comment(
+            "github-actions[bot]",
+            "skeptic run complete\nverdict: fail\nsee log for details",
+        )];
+        let (gha, _) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: fail");
+
+        // Anchored marker but body never mentions "skeptic" -> stays absent.
+        let comments = [comment("github-actions[bot]", "verdict: pass")];
+        let (gha, _) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: absent");
+
+        // Anchored marker + skeptic topic, but wrong author -> stays absent.
+        let comments = [comment("some-other-bot", "skeptic verdict: pass")];
+        let (gha, _) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: absent");
+    }
+
+    #[test]
+    fn last_matching_comment_wins_per_signal_independently() {
+        let comments = [
+            comment("github-actions[bot]", "skeptic run\nverdict: pass"),
+            comment("some-reviewer", "verdict: fail"),
+            comment("github-actions[bot]", "skeptic run\nverdict: fail"),
+            comment("some-reviewer", "verdict: pass"),
+        ];
+        let (gha, signoff) = derive_enrichment_verdicts(&comments);
+        assert_eq!(gha, "verdict: fail");
+        assert_eq!(signoff, "verdict: pass");
+    }
+}
+
 fn skeptic_evidence(
     deps: &TickDeps,
     bead_id: &str,
@@ -3181,18 +3940,14 @@ fn skeptic_evidence(
         .or_else(|_| std::env::var("DARK_FACTORY_REVIEWER_DEFAULT"))
         .unwrap_or_else(|_| "agy".to_string());
 
-    let coder_vendor = match coder_agent.to_ascii_lowercase().as_str() {
-        // `claudem` contains `claude` — check MiniMax aliases first so a
-        // claudem coder is excluded from the claudem reviewer slot, not
-        // from a phantom Anthropic `claude` slot that is not in the queue.
-        a if a.contains("claudem") || a.contains("minimax") => "claudem",
-        a if a.contains("claude") => "claude",
-        a if a.contains("agy") || a.contains("antigravity") => "agy",
-        a if a.contains("codex") => "codex",
-        a if a.contains("gemini") => "gemini",
-        a if a.contains("cursor") || a.contains("agentf") => "cursor-agent",
-        _ => "",
-    };
+    // rev-9zrgs: was a hand-written ordered `.contains()` chain (fragile —
+    // "claudem" contains "claude" as a substring, so arm order mattered and
+    // a reorder would silently misclassify). `vendor_aliases::canonical_vendor`
+    // does an exact-match lookup against `config/vendor_aliases.json`
+    // instead, so ordering can no longer matter. See
+    // `daemon/src/vendor_aliases.rs` module doc for the alias set and the
+    // investigation behind the exact-match (vs token-based) design choice.
+    let coder_vendor = crate::vendor_aliases::canonical_vendor(&coder_agent);
 
     // Operator 2026-08-18: reviewer queue is claudem → agy → cursor-agent.
     // Default coder is agy (fallback claudem), so production exclusion
@@ -3209,41 +3964,10 @@ fn skeptic_evidence(
     // correctly instead of by the daemon-global repo.
     let is_test_repo = crate::config::is_fixture_repo(repo);
 
-    let mut gha_verdict = "verdict: absent";
-    let mut signoff_verdict = "verdict: absent";
-
-    for comment in &snapshot.comments {
-        let body_lower = comment.body.to_ascii_lowercase();
-        let author_lower = comment.author.to_ascii_lowercase();
-
-        if (author_lower.contains("github-actions") || author_lower.contains("gha"))
-            && body_lower.contains("skeptic")
-        {
-            if body_lower.contains("verdict: pass") || body_lower.contains("verdict: success") {
-                gha_verdict = "verdict: pass";
-            } else if body_lower.contains("verdict: fail")
-                || body_lower.contains("verdict: failure")
-            {
-                gha_verdict = "verdict: fail";
-            }
-        }
-
-        if !author_lower.contains("github-actions")
-            && !author_lower.contains("coderabbit")
-            && !author_lower.contains("bugbot")
-            && !author_lower.contains("cursor")
-        {
-            if body_lower.contains("sign-off")
-                || body_lower.contains("signoff")
-                || body_lower.contains("verdict: pass")
-                || body_lower.contains("/skeptic pass")
-            {
-                signoff_verdict = "verdict: pass";
-            } else if body_lower.contains("verdict: fail") || body_lower.contains("/skeptic fail") {
-                signoff_verdict = "verdict: fail";
-            }
-        }
-    }
+    // rev-gujs2 (ZFC-1, HIGH): derivation now anchors to declaration lines
+    // instead of scanning for substrings anywhere in the comment body — see
+    // `derive_enrichment_verdicts` and `anchored_comment_verdict` above.
+    let (gha_verdict, signoff_verdict) = derive_enrichment_verdicts(&snapshot.comments);
 
     // jleechan-wzgl: track which reviewer vendor(s) actually contributed a
     // parseable verdict to `skeptic_verdict`, so GATE_ASSESSMENT telemetry
@@ -3509,11 +4233,46 @@ fn skeptic_evidence(
 ///
 /// This is the PRODUCTION-side wiring of the gate-8 path that the
 /// verifier side (`vacuous_red_green_gate`) consumes. It is intentionally
-/// minimal: the detector runs only when the daemon's own CWD is a checkout
-/// of a cargo project (the typical Stage-2 production-adjacent lane). For
+/// minimal: the detector runs only when the daemon has a configured target
+/// worktree with a supported Cargo or Python manifest (the typical Stage-2
+/// production-adjacent lane). For
 /// the Stage-1 test-repo lane (`is_test_repo`) the detector is not invoked
 /// and the status stays `NotProvided`, so the gate stays Green.
 ///
+/// Resolve the vacuous-test detector backend and its manifest in a target
+/// worktree. Cargo remains preferred when both manifests are present, which
+/// preserves the mixed-stack repository contract; Python-only targets route
+/// to pytest instead of being rejected as Cargo `ManifestMissing`.
+fn resolve_vacuous_red_green_manifest(
+    repo_root: &Path,
+) -> Result<(crate::vacuous_red_green::Backend, std::path::PathBuf), String> {
+    use crate::vacuous_red_green::{
+        find_cargo_manifest, find_cargo_manifest_recursive, find_pytest_manifest_recursive,
+        Backend,
+    };
+
+    let backend = Backend::detect(repo_root).ok_or_else(|| {
+        format!(
+            "no Cargo.toml or pyproject.toml/pytest.ini reachable from {} (walk-up + recursive depth-4 both failed)",
+            repo_root.display()
+        )
+    })?;
+    let manifest = match backend {
+        Backend::Cargo => find_cargo_manifest(repo_root)
+            .or_else(|| find_cargo_manifest_recursive(repo_root, 4)),
+        Backend::Pytest => find_pytest_manifest_recursive(repo_root, 4),
+    };
+    manifest
+        .map(|path| (backend, path))
+        .ok_or_else(|| {
+            format!(
+                "detected {} backend but its manifest disappeared under {}",
+                backend.as_str(),
+                repo_root.display()
+            )
+        })
+}
+
 /// The detector's verdict is translated verbatim — the r5 contract says
 /// the gate consumer is the source of truth on what each verdict means for
 /// merge eligibility (`Vacuous -> Red`, others -> Green/Unknown).
@@ -3578,29 +4337,15 @@ fn vacuous_red_green_for_pr(
             ));
         }
     };
-    let manifest = match crate::vacuous_red_green::find_cargo_manifest(&repo_root) {
-        Some(m) => m,
-        None => {
-            // jleechan-ni1k / issue #437 bonus: dark-factory's daemon
-            // crate lives at `<repo_root>/daemon/Cargo.toml`, not at the
-            // repo root. The walk-up `find_cargo_manifest` returns None
-            // on this nested-crate layout, surfacing `ManifestMissing`
-            // on the very repo the gate is supposed to vet. Fall back
-            // to a bounded recursive search (skips `target` /
-            // `node_modules` / `.git`, capped at depth 4) so a nested
-            // crate manifest is reachable. If both lookups fail, we
-            // keep the original error message so operators see both
-            // paths attempted.
-            match crate::vacuous_red_green::find_cargo_manifest_recursive(&repo_root, 4) {
-                Some(m) => m,
-                None => {
-                    return verifier::VacuousRedGreenStatus::ManifestMissing(format!(
-                        "no Cargo.toml reachable from {} (walk-up + recursive depth-4 both failed)",
-                        repo_root.display()
-                    ));
-                }
-            }
-        }
+    // Select the runner from the target worktree, preserving Cargo's
+    // precedence for mixed Rust/Python repositories while allowing a Python
+    // target with no Cargo manifest to reach the already-implemented pytest
+    // backend.  The old path unconditionally searched for Cargo.toml here,
+    // so every Python assessment stopped at ManifestMissing before
+    // Backend::detect could participate.
+    let (_backend, manifest) = match resolve_vacuous_red_green_manifest(&repo_root) {
+        Ok(resolved) => resolved,
+        Err(reason) => return verifier::VacuousRedGreenStatus::ManifestMissing(reason),
     };
 
     // Resolve the base ref from the PR's merge-base. Use `gh pr view`
@@ -3636,14 +4381,7 @@ fn vacuous_red_green_for_pr(
         .files
         .iter()
         .map(|f| {
-            let kind = if f.path.contains("/tests/")
-                || f.path.starts_with("tests/")
-                || f.path.ends_with("_test.rs")
-            {
-                crate::vacuous_red_green::FileClass::Test
-            } else {
-                crate::vacuous_red_green::FileClass::Production
-            };
+            let kind = classify_vacuous_changed_file(&f.path);
             Ok((repo_root.join(&f.path), kind))
         })
         .collect::<Result<Vec<_>, std::convert::Infallible>>()
@@ -3662,6 +4400,257 @@ fn vacuous_red_green_for_pr(
     ) {
         Ok(report) => translate_verdict(report.verdict, report.failed_on_revert),
         Err(e) => translate_error(e),
+    }
+}
+
+/// Classify a PR path for gate 8. Python production modules remain
+/// `Production`, while pytest's conventional root and nested test names are
+/// routed as `Test` so `compute_targeted_python_test_fns` can select the
+/// changed test functions.
+fn classify_vacuous_changed_file(path: &str) -> crate::vacuous_red_green::FileClass {
+    let basename = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    if path.contains("/tests/")
+        || path.starts_with("tests/")
+        || path.ends_with("_test.rs")
+        || basename.starts_with("test_")
+        || basename.ends_with("_test.py")
+    {
+        crate::vacuous_red_green::FileClass::Test
+    } else {
+        crate::vacuous_red_green::FileClass::Production
+    }
+}
+
+#[cfg(test)]
+mod vacuous_red_green_routing_tests {
+    use super::{classify_vacuous_changed_file, resolve_vacuous_red_green_manifest};
+    use crate::vacuous_red_green::{check_red_green_with_manifest, Backend, FileClass, Verdict};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn run(dir: &Path, args: &[&str]) {
+        let out = Command::new(args[0])
+            .current_dir(dir)
+            .args(&args[1..])
+            .output()
+            .expect("spawn fixture command");
+        assert!(
+            out.status.success(),
+            "fixture command {:?} failed: stdout={} stderr={}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn temp_fixture(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "dark_factory_tick_{name}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture");
+        root
+    }
+
+    fn build_nested_mvp_project(vacuous: bool) -> (PathBuf, String, PathBuf, Vec<(PathBuf, FileClass)>) {
+        let root = temp_fixture(if vacuous { "nested_mvp_vacuous" } else { "nested_mvp_genuine" });
+        let project = root.join("mvp_site");
+        std::fs::create_dir_all(project.join("pkg")).unwrap();
+        std::fs::create_dir_all(project.join("tests")).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname='mvp-site'\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(project.join("pkg/value.py"), "def value():\n    return 'old'\n").unwrap();
+        std::fs::write(project.join("tests/__init__.py"), "").unwrap();
+        std::fs::write(
+            project.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_value():\n    assert value() == 'old'\n",
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new(args[0])
+                .current_dir(&root)
+                .args(&args[1..])
+                .output()
+                .expect("spawn nested fixture command");
+            assert!(out.status.success(), "fixture command {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["git", "init", "-q", "-b", "main"]);
+        run(&["git", "config", "user.email", "nested@example.com"]);
+        run(&["git", "config", "user.name", "nested"]);
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        std::fs::write(project.join("pkg/value.py"), "def value():\n    return 'new'\n").unwrap();
+        std::fs::write(
+            project.join("tests/test_value.py"),
+            if vacuous {
+                "def test_value():\n    assert 2 + 2 == 4\n"
+            } else {
+                "from pkg.value import value\n\ndef test_value():\n    assert value() == 'new'\n"
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("tests/test_new.py"),
+            "def test_new():\n    assert 3 + 3 == 6\n",
+        )
+        .unwrap();
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "head"]);
+
+        let changed = vec![
+            (project.join("pkg/value.py"), FileClass::Production),
+            (project.join("tests/test_value.py"), FileClass::Test),
+            (project.join("tests/test_new.py"), FileClass::Test),
+        ];
+        (root, base, project.join("pyproject.toml"), changed)
+    }
+
+    #[test]
+    fn python_target_worktree_routes_to_pytest_and_runs_targeted_test() {
+        assert!(
+            Command::new("pytest")
+                .arg("--version")
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false),
+            "pytest is required for the routed Python gate regression"
+        );
+
+        let root = temp_fixture("python_gate8");
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname = 'gate8-fixture'\n").unwrap();
+        std::fs::write(root.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(root.join("tests/__init__.py"), "").unwrap();
+        std::fs::write(root.join("pkg/value.py"), "def value():\n    return 'old'\n").unwrap();
+        std::fs::write(
+            root.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_value():\n    assert value() == 'old'\n",
+        )
+        .unwrap();
+        run(&root, &["git", "init", "-q", "-b", "main"]);
+        run(&root, &["git", "config", "user.email", "gate8@example.com"]);
+        run(&root, &["git", "config", "user.name", "gate8"]);
+        run(&root, &["git", "add", "."]);
+        run(&root, &["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        std::fs::write(root.join("pkg/value.py"), "def value():\n    return 'new'\n").unwrap();
+        std::fs::write(
+            root.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_value():\n    assert value() == 'new'\n",
+        )
+        .unwrap();
+        run(&root, &["git", "add", "."]);
+        run(&root, &["git", "commit", "-q", "-m", "feat"]);
+
+        let (backend, manifest) = resolve_vacuous_red_green_manifest(&root).expect("route");
+        assert_eq!(backend, Backend::Pytest);
+        assert_eq!(manifest.file_name().and_then(|n| n.to_str()), Some("pyproject.toml"));
+        assert_eq!(classify_vacuous_changed_file("pkg/value.py"), FileClass::Production);
+        assert_eq!(classify_vacuous_changed_file("tests/test_value.py"), FileClass::Test);
+        assert_eq!(
+            classify_vacuous_changed_file("pkg/test_widget.py"),
+            FileClass::Test
+        );
+        assert_eq!(
+            classify_vacuous_changed_file("test_root.py"),
+            FileClass::Test
+        );
+        assert_eq!(
+            classify_vacuous_changed_file("pkg/widget.py"),
+            FileClass::Production
+        );
+
+        let changed = vec![
+            (root.join("pkg/value.py"), FileClass::Production),
+            (root.join("tests/test_value.py"), FileClass::Test),
+        ];
+        let report = check_red_green_with_manifest(&root, &base, &changed, Some(&manifest))
+            .expect("pytest backend should execute");
+        assert_eq!(report.verdict, Verdict::Genuine, "report={report:?}");
+
+        // Keep the same routed target and production diff, then replace the
+        // assertion with a tautology. The backend must still execute pytest,
+        // but now correctly classify the test as vacuous rather than
+        // weakening gate 8 to a mere "pytest exited zero" check.
+        std::fs::write(
+            root.join("tests/test_value.py"),
+            "def test_value():\n    assert 1 + 1 == 2\n",
+        )
+        .unwrap();
+        run(&root, &["git", "add", "."]);
+        run(&root, &["git", "commit", "-q", "-m", "test-vacuous"]);
+        let vacuous = check_red_green_with_manifest(&root, &base, &changed, Some(&manifest))
+            .expect("pytest backend should execute vacuous test");
+        assert_eq!(vacuous.verdict, Verdict::Vacuous, "report={vacuous:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_mvp_site_routes_genuine_pytest_with_new_test_file() {
+        let (root, base, manifest, changed) = build_nested_mvp_project(false);
+        let (backend, detected_manifest) =
+            resolve_vacuous_red_green_manifest(&root).expect("nested route");
+        assert_eq!(backend, Backend::Pytest);
+        assert_eq!(detected_manifest, manifest);
+        let report = check_red_green_with_manifest(&root, &base, &changed, Some(&manifest))
+            .expect("nested pytest backend should execute");
+        assert_eq!(report.verdict, Verdict::Genuine, "report={report:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_mvp_site_routes_vacuous_pytest_with_new_test_file() {
+        let (root, base, manifest, changed) = build_nested_mvp_project(true);
+        let report = check_red_green_with_manifest(&root, &base, &changed, Some(&manifest))
+            .expect("nested pytest backend should execute");
+        assert_eq!(report.verdict, Verdict::Vacuous, "report={report:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mixed_target_worktree_keeps_cargo_precedence() {
+        let root = temp_fixture("mixed_gate8");
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname='gate8'\nversion='0.1.0'\nedition='2021'\n").unwrap();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname='gate8'\n").unwrap();
+        let (backend, manifest) = resolve_vacuous_red_green_manifest(&root).expect("route");
+        assert_eq!(backend, Backend::Cargo);
+        assert_eq!(manifest.file_name().and_then(|n| n.to_str()), Some("Cargo.toml"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 
@@ -3947,6 +4936,24 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             if let Some(ref session_id_str) = overlay.session_id {
                 let sid = SessionId(session_id_str.clone());
                 if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
+                    // rev-4ou1z: a Gemini individual-quota exhaustion is
+                    // RECOVERABLE — the paused pane just needs an Enter
+                    // keypress once its quota window resets, not a
+                    // kill+respawn cycle. A fresh spawn would hit the same
+                    // quota wall immediately, burning
+                    // `MAX_TRANSIENT_SPAWN_RETRY` in minutes against a
+                    // window that can take hours to reset (live incident:
+                    // coder wa-3538 parked HUMAN_HELD well before its quota
+                    // actually cleared). Already-armed sessions skip
+                    // straight past the SESSION_HEALTH_FAILED emit + kill
+                    // path below so the pane is left untouched for the
+                    // slow-tier wake sweep (`run_quota_watchdog_wake`).
+                    if crate::health::quota_watchdog::parse_quota_reset_duration(&health_failure)
+                        .is_some()
+                        && crate::health::quota_watchdog::recorded_reset_at(bead_id).is_some()
+                    {
+                        continue;
+                    }
                     emit(
                         deps.telemetry_log,
                         bead_id,
@@ -3960,8 +4967,55 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             "branch": overlay.branch,
                         }),
                     )?;
-                    let _ = deps.sessions.stop(&sid);
+                    if let Some(reset_in) =
+                        crate::health::quota_watchdog::parse_quota_reset_duration(&health_failure)
+                    {
+                        let now_epoch = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let reset_at_epoch = now_epoch.saturating_add(reset_in.as_secs());
+                        crate::health::quota_watchdog::record_quota_reset(
+                            bead_id,
+                            session_id_str,
+                            reset_at_epoch,
+                        );
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Dispatched.as_str(),
+                            "QUOTA_WATCHDOG_ARMED",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "session_id": session_id_str,
+                                "reason": health_failure,
+                                "reset_at_epoch": reset_at_epoch,
+                            }),
+                        )?;
+                        continue;
+                    }
+                    if let Err(stop_err) = stop_overlay_session(deps, &overlay, &sid) {
+                        emit(
+                            deps.telemetry_log,
+                            bead_id,
+                            overlay.attempt,
+                            OverlayState::Dispatched.as_str(),
+                            "BEAD_SESSION_KILL_FAILED",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "session_id": session_id_str,
+                                "error": format!("{stop_err:?}"),
+                                "phase": "health_failure",
+                            }),
+                        )?;
+                        // Retain the durable handle: requeueing here could
+                        // overlap a still-live worker on the next dispatch.
+                        deps.store.save(&overlay)?;
+                        continue;
+                    }
                     overlay.session_id = None;
+                    overlay.session_ao_project = None;
                     if overlay.pr_number.is_none() {
                         overlay.spawn_failure_count += 1;
                         if overlay.spawn_failure_count >= MAX_TRANSIENT_SPAWN_RETRY {
@@ -3986,34 +5040,17 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             && overlay.pr_number.is_none()
             && !is_test_repo
         {
-            if let Some(ref session_id) = overlay.session_id {
-                    let mut project = repo.split('/').next_back().unwrap_or(&repo).to_string();
-                    if project == "worldarchitect.ai" {
-                        project = "worldarchitect".to_string();
-                    }
-
-                    let r = crate::tools::run_tool("ao", &["status", "-p", &project, "--json"], 30);
-                    if let Ok(out) = r {
-                        let json_start = out.find('[').unwrap_or(0);
-                        if let Ok(val) =
-                            serde_json::from_str::<serde_json::Value>(&out[json_start..])
-                        {
-                            if let Some(arr) = val.as_array() {
-                                if let Some(entry) = arr.iter().find(|e| {
-                                    e.get("name").and_then(|v| v.as_str())
-                                        == Some(session_id.as_str())
-                                }) {
-                                    if let Some(pr_num) =
-                                        entry.get("prNumber").and_then(|v| v.as_u64())
-                                    {
-                                        overlay.pr_number = Some(pr_num);
-                                        deps.store.save(&overlay)?;
-                                    }
-                                }
-                            }
-                        }
+            if let Some(ref session_id_str) = overlay.session_id {
+                let sid = SessionId(session_id_str.clone());
+                if let Ok(project) = overlay_session_project(deps, &overlay) {
+                    if let Ok(Some(pr_num)) =
+                        deps.sessions.session_pr_number_in_project(&sid, &project)
+                    {
+                        overlay.pr_number = Some(pr_num);
+                        deps.store.save(&overlay)?;
                     }
                 }
+            }
         }
 
         // Promote DISPATCHED -> ATTESTED once a PR is open (spec §4.2.7).
@@ -4149,8 +5186,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // verifier checks real landed work, not the stale pre-fix
                 // commit.
                 let ready_to_promote = if overlay.is_adopted {
-                    match &overlay.session_id {
-                        Some(session_id_str) => {
+                    match (&overlay.session_id, overlay_session_project(deps, &overlay)) {
+                        (Some(session_id_str), Ok(project)) => {
                             let sid = SessionId(session_id_str.clone());
                             if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
                                 emit(
@@ -4166,15 +5203,17 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                         "branch": overlay.branch,
                                     }),
                                 )?;
-                                let _ = deps.sessions.stop(&sid);
-                                true
-                            } else if deps.sessions.is_quiescent(&sid).unwrap_or(false) {
+                                stop_overlay_session(deps, &overlay, &sid).is_ok()
+                            } else if deps
+                                .sessions
+                                .is_quiescent_in_project(&sid, &project)
+                                .unwrap_or(false)
+                            {
                                 true
                             } else {
-                                match deps.sessions.session_activity(&sid) {
+                                match deps.sessions.session_activity_in_project(&sid, &project) {
                                     Ok(crate::tools::SessionActivity::Idle) => {
-                                        let _ = deps.sessions.stop(&sid);
-                                        true
+                                        stop_overlay_session(deps, &overlay, &sid).is_ok()
                                     }
                                     Ok(
                                         crate::tools::SessionActivity::Terminal
@@ -4184,7 +5223,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 }
                             }
                         }
-                        None => true,
+                        (Some(_), Err(_)) => false,
+                        (None, _) => true,
                     }
                 } else {
                     true
@@ -4192,9 +5232,68 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
 
                 if ready_to_promote {
                     // Reap completed worker session to immediately release AO worker slot
-                    if let Some(session_id_str) = overlay.session_id.take() {
-                        let sid = SessionId(session_id_str);
-                        let _ = deps.sessions.stop(&sid);
+                    if let Some(session_id_str) = overlay.session_id.clone() {
+                        let sid = SessionId(session_id_str.clone());
+                        if let Err(stop_err) = stop_overlay_session(deps, &overlay, &sid) {
+                            emit(
+                                deps.telemetry_log,
+                                bead_id,
+                                overlay.attempt,
+                                OverlayState::Dispatched.as_str(),
+                                "BEAD_SESSION_KILL_FAILED",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "session_id": session_id_str,
+                                    "error": format!("{stop_err:?}"),
+                                    "phase": "promotion",
+                                }),
+                            )?;
+                            deps.store.save(&overlay)?;
+                            continue;
+                        }
+                        overlay.session_id = None;
+                        overlay.session_ao_project = None;
+                        // Bead rev-3lm8k: the coder session has finished and
+                        // is being reaped right here — its AO-managed
+                        // worktree dir (if any) is stale immediately, so
+                        // clean it now rather than waiting on the next TTL
+                        // sweep (a no-op when `agent_worktree_root` is
+                        // unset). This is the exact "coder session exit"
+                        // moment the bead's incident describes: a leftover
+                        // worktree dir blocking every subsequent dispatch
+                        // hashing to the same orchestrator branch.
+                        match crate::worktree_reaper::clean_stale_worktree(
+                            deps.cfg,
+                            overlay.repo(deps.cfg),
+                            &session_id_str,
+                        ) {
+                            Ok(true) => {
+                                let _ = emit(
+                                    deps.telemetry_log,
+                                    bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Attested.as_str(),
+                                    "WORKTREE_CLEANED_ON_SESSION_EXIT",
+                                    serde_json::json!({}),
+                                    serde_json::json!({"session_id": session_id_str}),
+                                );
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                let _ = emit(
+                                    deps.telemetry_log,
+                                    bead_id,
+                                    overlay.attempt,
+                                    OverlayState::Attested.as_str(),
+                                    "WORKTREE_CLEAN_FAILED",
+                                    serde_json::json!({}),
+                                    serde_json::json!({
+                                        "session_id": session_id_str,
+                                        "error": format!("{e:?}"),
+                                    }),
+                                );
+                            }
+                        }
                     }
                     // A positive branch-to-open-PR binding is the durable
                     // boundary between the deferred old attempt and this
@@ -5225,6 +6324,11 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
             // `context.pr_number` before parsing `context.gates` — without
             // this key the guard's match path is permanently dormant no
             // matter how correct the `gates` shape is.
+            // Funnel metrics also use this immutable PR/head pair as an
+            // observation key.  Include the resolved target repository so
+            // identically numbered PRs pointing at the same commit in two
+            // configured repositories cannot overwrite one another.
+            obj.insert("repo".to_string(), serde_json::json!(repo));
             obj.insert("pr_number".to_string(), serde_json::json!(pr));
             // jleechan-328 P1 #1 (exact-head binding): record the PR's
             // current head SHA in the assessment context so the shell
@@ -5571,6 +6675,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // ATTESTED is reached only after positive worker quiescence;
                 // make that no-live-session proof durable in this same save.
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(&mut overlay, HumanHoldReason::Stage1GateNotGreen);
                 deps.store.save(&overlay)?;
                 summary.beads_parked_human_held += 1;
@@ -5659,9 +6764,8 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
                             continue;
                         }
-                        // Perform recovery validation: check if spec is valid TOML
-                        let spec_path = std::path::Path::new(&deps.cfg.spec_dir)
-                            .join(format!("{}.toml", overlay.bead_id));
+                        let bead_repo = overlay.repo(deps.cfg).to_string();
+                        let spec_path = deps.cfg.resolve_spec_path(&bead_repo, &overlay.bead_id);
                         let validation_pass = if spec_path.exists() {
                             if let Ok(c) = std::fs::read_to_string(&spec_path) {
                                 toml::from_str::<serde_json::Value>(&c).is_ok()

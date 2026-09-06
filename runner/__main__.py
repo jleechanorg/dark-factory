@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import pathlib
 import shutil
@@ -18,6 +19,25 @@ from .parser import Graph, parse, validate_pipeline
 from .paths import resolve_factory_path, resolve_pipeline_path
 
 _PANIC_DIR = pathlib.Path.home() / ".dark-factory" / "panics"
+
+# D2/D3/D8a fail-closed (external-review finding, rounds 3 & 5): the
+# review-target/intent integrity chain (minted locator, pin chain, base
+# SHA, mint-failure signal, mint opt-in gate, target/target-mode) is
+# runner-owned end to end — `--state` must never let a caller write any of
+# these keys directly. Deliberately scoped to this one integrity chain, not
+# every internal `_df_*` bookkeeping key elsewhere in the codebase (e.g.
+# shadow-review toggles, controller-lane fixtures): those are legitimate,
+# unrelated `--state`-seedable operator/test knobs.
+_RESERVED_STATE_KEYS = frozenset({
+    "intent",
+    "target",
+    "_target_base_sha",
+    "_target_pin_chain",
+    "_target_mint_failed",
+    "_df_mint_review_target",
+    "_df_target_mode",
+    "_pre_worker_head",
+})
 
 
 def _append_event(path: pathlib.Path, payload: dict[str, str]) -> None:
@@ -218,6 +238,30 @@ def _write_evidence_bundle(
     )
 
 
+def _write_dispatch_failure_stderr(*, history: list, ctx: Context) -> None:
+    """Print a clear one-line failure summary to stderr when the run's
+    final outcome is not `success` (bead rev-oswpo).
+
+    The stdout JSON summary already carries `final_outcome`, but an
+    operator or automation watching only the exit code + stderr (the
+    standard Unix contract) previously had no indication of *why* dispatch
+    failed or which run id to inspect — the CLI returned a non-zero exit
+    code silently. This makes the failure visible without requiring the
+    caller to parse JSON.
+    """
+    if not history:
+        sys.stderr.write("Dispatch failed: no steps executed.\n")
+        return
+    last = history[-1]
+    reason = (last.output_preview or "").strip().splitlines()[:1]
+    reason_text = reason[0] if reason else "no output"
+    run_id = ctx.run_id or "unknown"
+    sys.stderr.write(
+        f"Dispatch failed: node '{last.node}' ended in '{last.outcome}' "
+        f"({reason_text}). Check run id {run_id} for details.\n"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args_list = list(argv) if argv is not None else list(sys.argv[1:])
     if args_list and args_list[0] == "resume":
@@ -248,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
             default=pathlib.Path("two_node.dot"),
             help=(
                 "Pipeline `.dot` to run. Defaults to the slim two-node graph "
-                "(`two_node.dot`) — a generic worker + static Codex cold "
+                "(`two_node.dot`) — a generic worker + fresh Codex "
                 "reviewer — which is the standing rule for /f and /factory "
                 "invocations (set 2026-08-02). Pass a short name (e.g. "
                 "`gates`, `minimal_feature`, `bug_fix`) or an absolute path "
@@ -256,8 +300,61 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         p.add_argument("--goal")
+        p.add_argument(
+            "--target",
+            default=None,
+            help=(
+                "factory.review-target.v1 locator or freeform text (e.g. "
+                "'PR 811', '#811', an absolute path, a commit SHA) resolved "
+                "mechanically before the run starts (D3/D5 of the factory "
+                "two-node redesign). Refuses to start if it cannot be "
+                "resolved. Mutually exclusive with --goal (D5): a target-mode "
+                "verification run has no free-text goal. Entry-mode graph "
+                "wiring (reviewer-first routing) is "
+                "not yet consumed by the engine/two_node graph — --target "
+                "currently pre-resolves and pins the locator into "
+                "ctx.state['target']; see rev-xfy23 for the follow-up."
+            ),
+        )
+        p.add_argument(
+            "--target-intent",
+            default=None,
+            help=(
+                "Free-text task/intent statement for a --target run (e.g. "
+                "what a calling LLM changed and wants reviewed, used by "
+                "/factory-review). Requires --target. Sets "
+                "ctx.state['intent'] the same way a worker visit's --goal "
+                "does (D2's Base64-encoded task-record envelope) — this is "
+                "a dedicated CLI flag, not the generic --state escape "
+                "hatch that D2/D3/D8a refuse for the reserved 'intent' key."
+            ),
+        )
         p.add_argument("--workdir", type=pathlib.Path, default=pathlib.Path.cwd())
         p.add_argument("--preflight", action="store_true", help="Validate pipeline and emit diagnostics, then exit.")
+        p.add_argument(
+            "--allow-live-pr-target",
+            action="store_true",
+            help=(
+                "dark-factory#828: required to run against a workdir whose "
+                "current branch has an OPEN pull request. Without this flag "
+                "the run refuses to start (checked via `gh pr view`, fails "
+                "open on any detection uncertainty — e.g. gh not installed/"
+                "authed, or no PR for this branch). Real incident: a "
+                "review-only run silently wrote to and pushed a live PR "
+                "branch."
+            ),
+        )
+        p.add_argument(
+            "--allow-push",
+            action="store_true",
+            help=(
+                "dark-factory#828: allow codergen/fix nodes to push over "
+                "git. Defaults to OFF — a `git push` from any codergen node "
+                "is blocked (commits are still allowed locally) unless this "
+                "flag is set. Real incident: a fix node pushed to a live PR "
+                "branch with nothing actionable to act on."
+            ),
+        )
         p.add_argument(
             "--backend",
             choices=["echo", "claude", "codex", "ao", "agy"],
@@ -324,6 +421,11 @@ def main(argv: list[str] | None = None) -> int:
             metavar="KEY=VALUE",
             help="Pre-seed ctx.state; repeatable. E.g. --state slim.test_command=true",
         )
+        p.add_argument(
+            "--require-holdouts",
+            action="store_true",
+            help="Fail fast if holdout scenarios.yaml does not exist for the feature",
+        )
         args = p.parse_args(argv)
         if args.resume:
             val = str(args.resume)
@@ -366,6 +468,19 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.preflight:
             graph, diagnostics = validate_pipeline(pipeline_path)
+            if args.require_holdouts:
+                feat = args.feature
+                from .preflight import _check_holdout_scenarios
+                h_ok, h_err = _check_holdout_scenarios(feat)
+                if not h_ok:
+                    diagnostics.append(
+                        {
+                            "code": "DF_MISSING_HOLDOUTS",
+                            "severity": "error",
+                            "node": "<holdouts>",
+                            "message": h_err or "missing holdouts",
+                        }
+                    )
             payload = {
                 "pipeline": str(pipeline_path),
                 "pipeline_name": graph.name if graph else pipeline_path.stem,
@@ -376,18 +491,144 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload, sort_keys=True, indent=2))
             return 1 if payload["status"] == "fail" else 0
 
+        if args.target and args.goal:
+            p.error("--target and --goal are mutually exclusive (D5): pass one or the other")
+        if args.target_intent and not args.target:
+            p.error("--target-intent requires --target")
+
+        resolved_target_locator = None
+        if args.target:
+            from . import target_locator
+
+            try:
+                resolved_target_locator = target_locator.parse(args.target, repo_root=args.workdir)
+            except target_locator.DefinedNotResolvable as exc:
+                p.error(f"--target scheme is defined but not resolvable in v1: {exc}")
+            except target_locator.InvalidTarget:
+                # Finding 5 (external review, round 3): populate owner/repo
+                # from the local git remote (deterministic, no network/LLM)
+                # so freeform PR-shaped text ("PR 811") can actually
+                # resolve — an empty RepoContext made every such reference
+                # unconditionally fail with "requires repo context".
+                owner_repo = target_locator.owner_repo_from_git_remote(args.workdir)
+                owner, repo_name = owner_repo if owner_repo else ("", "")
+                repo_ctx = target_locator.RepoContext(
+                    repo_root=args.workdir, owner=owner, repo=repo_name,
+                )
+                try:
+                    resolved_target_locator = target_locator.resolve_freeform(args.target, repo_ctx)
+                except target_locator.TargetLocatorError as exc:
+                    p.error(f"--target could not be resolved: {exc}")
+
+        if not args.goal and not args.target:
+            p.error("--goal is required unless --preflight or --target is set")
         if not args.goal:
-            p.error("--goal is required unless --preflight is set")
+            args.goal = ""
 
         graph = parse(pipeline_path)
+
+        # dark-factory#828 item (c): --allow-push defaults to False. Set
+        # once, process-wide, before any node runs. Every subprocess
+        # launched through runner.handler_sandbox._sanitized_env() (all
+        # codergen/gate/holdout/healer backends) is ALWAYS blocked from
+        # pushing directly, regardless of this flag — this flag instead
+        # gates the runner's own single centralized push at run end (see
+        # runner/push_guard.maybe_push_at_run_end, invoked from
+        # runner/engine_run.py), which never fires unless final_outcome is
+        # a genuine success.
+        from .push_guard import set_allow_push
+
+        set_allow_push(args.allow_push)
+
+        # dark-factory#828 item (d): refuse to touch a live/open-PR target
+        # without an explicit ack. Checked here (after --preflight's early
+        # return, before any node executes) so `--preflight` itself never
+        # needs `gh` configured.
+        if not args.allow_live_pr_target:
+            from .live_pr_guard import detect_live_pr
+
+            live_pr = detect_live_pr(args.workdir)
+            if live_pr is not None:
+                p.error(
+                    f"refusing to run against a LIVE open PR target "
+                    f"(#{live_pr.get('number')} — {live_pr.get('url')}) "
+                    f"without --allow-live-pr-target. dark-factory#828: a "
+                    f"prior run silently wrote to and pushed a live PR "
+                    f"branch from this exact gap. Pass --allow-live-pr-"
+                    f"target if you intend to run against this PR."
+                )
+
+        def _is_verdict_gated_review_node(n) -> bool:
+            return (
+                str(n.attrs.get("class", "")).strip().lower() == "review"
+                and str(n.attrs.get("verdict_gate", "false")).strip().lower()
+                in {"true", "1", "yes", "on"}
+            )
+
         initial_state: dict[str, str] = {}
+        # Opt-in gate for the runner's post-worker target-mint/checkpoint
+        # side effect (D2/D3/D8a of the factory two-node redesign): minting
+        # can commit dirty workdir state, so it must only run for graphs
+        # that actually declare the fresh, verdict-gated cold-reviewer
+        # contract — never for arbitrary pipelines that never asked for it.
+        if any(_is_verdict_gated_review_node(n) for n in graph.nodes.values()):
+            initial_state["_df_mint_review_target"] = "true"
+        if resolved_target_locator is not None:
+            # Finding 5 (external review, round 3): target mode's whole
+            # point is "reviewer reviews the externally-resolved target
+            # first" (D "Architecture": start -> cold_reviewer). Entry-mode
+            # graph wiring that actually routes `start` to the reviewer is
+            # not implemented yet for any pipeline — if we let the run
+            # proceed anyway, `start` falls through to its literal edge
+            # (the worker), which runs on the LOCAL workdir (unrelated to
+            # the resolved target) and then the first post-worker mint
+            # silently overwrites `ctx.state["target"]` with a local pin,
+            # discarding the operator's resolved locator. Refuse honestly
+            # instead of silently morphing into task mode.
+            from .parser import is_start_node
+
+            start_name = next(
+                (n.name for n in graph.nodes.values() if is_start_node(n)), None
+            )
+            first_hops = graph.outgoing(start_name) if start_name else []
+            reviewer_first = bool(first_hops) and all(
+                e.dst in graph.nodes and _is_verdict_gated_review_node(graph.nodes[e.dst])
+                for e in first_hops
+            )
+            if not reviewer_first:
+                p.error(
+                    "--target requires a reviewer-first pipeline (the start "
+                    "node must lead directly to a verdict-gated review "
+                    f"node); {pipeline_path.name} starts at a worker node "
+                    "instead, so --target would silently run the worker on "
+                    "the local workdir and discard the resolved target "
+                    "rather than reviewing it — reviewer-first entry-mode "
+                    "graph wiring is not yet implemented for this pipeline"
+                )
         for kv in args.state:
             if "=" not in kv:
                 p.error(f"--state requires KEY=VALUE format, got: {kv!r}")
             k, v = kv.split("=", 1)
+            if k in _RESERVED_STATE_KEYS:
+                # D2/D3/D8a fail-closed (external-review finding, rounds 3 &
+                # 5): the whole review-target/intent integrity chain —
+                # minted pin, pin chain, mint-failure signal, mint opt-in
+                # gate, target/target-mode — is runner-owned end to end.
+                # `--state` is the only caller-controllable write path into
+                # `ctx.state` outside that chain, so every key it owns is
+                # refused outright rather than silently accepted and later
+                # raced, overwritten, or used to fabricate a fake-matching
+                # pin chain / mint result.
+                p.error(f"--state cannot set the reserved key {k!r} (runner-owned, D2/D3/D8a)")
             initial_state[k] = v
         if args.feature:
             initial_state["feature"] = args.feature
+        if args.require_holdouts:
+            feat = args.feature or initial_state.get("feature")
+            from .preflight import _check_holdout_scenarios
+            h_ok, h_err = _check_holdout_scenarios(feat)
+            if not h_ok:
+                p.error(f"--require-holdouts failed: {h_err}")
         missing_feature_nodes = _missing_holdout_feature_nodes(graph, initial_state)
         if missing_feature_nodes:
             p.error(
@@ -425,6 +666,13 @@ def main(argv: list[str] | None = None) -> int:
             perf_log_root=perf_log_root,
         )
         ctx.state.update(initial_state)
+        if resolved_target_locator is not None:
+            ctx.state["target"] = resolved_target_locator.canonical
+            ctx.state["_df_target_mode"] = "true"
+            if args.target_intent:
+                ctx.state["intent"] = base64.b64encode(
+                    args.target_intent.strip().encode("utf-8")
+                ).decode("ascii")
         if args.backend == "ao":
             if not args.ao_project:
                 p.error("--backend ao requires --ao-project")
@@ -435,7 +683,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.ao_session:
             ctx.state["ao.session"] = args.ao_session
         if args.ao_worktree:
-            ctx.state["ao.worktree"] = str(pathlib.Path(args.ao_worktree).expanduser().resolve())
+            ao_worktree = pathlib.Path(args.ao_worktree).expanduser()
+            if not ao_worktree.is_absolute():
+                ao_worktree = pathlib.Path.cwd() / ao_worktree
+            # Preserve lexical spelling so the engine's immutable workspace
+            # validation can reject symlinked parents and traversal aliases.
+            ctx.state["ao.worktree"] = str(ao_worktree)
 
         history = run(
             graph,
@@ -483,6 +736,15 @@ def main(argv: list[str] | None = None) -> int:
             "evidence_bundle": str(args.evidence_bundle) if args.evidence_bundle else None,
             "steps": len(history),
             "final_outcome": history[-1].outcome if history else "empty",
+            # dark-factory#828 item (e): the real incident's summary gave
+            # zero indication a write occurred. Empty string means
+            # undeterminable (not a git repo, or the base snapshot never
+            # captured) — never confused with a confirmed "0".
+            "commits_created": ctx.state.get("_df_run_commits_created", "") if ctx else "",
+            "refs_pushed": ctx.state.get("_df_run_refs_pushed", "") if ctx else "",
+            "push_attempted": ctx.state.get("_df_run_push_attempted", "0") if ctx else "0",
+            "push_succeeded": ctx.state.get("_df_run_push_succeeded", "0") if ctx else "0",
+            "push_skip_reason": ctx.state.get("_df_run_push_skip_reason", "") if ctx else "",
             "trace": [
                 {
                     "node": r.node,
@@ -516,10 +778,13 @@ def main(argv: list[str] | None = None) -> int:
                 "repo": ctx.git_ctx.repo_slug,
                 "branch": ctx.git_ctx.branch_slug,
             }
+        dispatch_ok = bool(history) and history[-1].outcome == "success"
+        if not dispatch_ok:
+            _write_dispatch_failure_stderr(history=history, ctx=ctx)
         print(json.dumps(summary, indent=2))
-        return 0 if history and history[-1].outcome == "success" else 1
-    except Exception:
-        payload = _handle_panic(sys.exc_info()[1], args=args, ctx=ctx)
+        return 0 if dispatch_ok else 1
+    except Exception as panic_exc:
+        payload = _handle_panic(panic_exc, args=args, ctx=ctx)
         if (
             args is not None
             and ctx is not None

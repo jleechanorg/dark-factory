@@ -121,7 +121,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 
 # Unique HTML marker used by the GitHub comment upsert logic. Any prior
@@ -139,10 +139,101 @@ ModelIdentity = Literal["claude", "codex", "gemini", "unknown"]
 # process claiming `gemini` (or vice-versa) is rejected outright. This
 # prevents a malicious PR-controlled reviewer invocation from
 # impersonating another reviewer.
-REVIEWER_CLI_TO_IDENTITY = {
-    "codex": "codex",
-    "gemini": "gemini",
+# PR #819 round-8: rounds 5, 6, and 7 each independently found and
+# fixed the SAME class of gap — an alias/prefix present in one of
+# REVIEWER_CLI_TO_IDENTITY / COMMIT_PREFIX_TO_IDENTITY but missing
+# from the other, because the two tables were hand-maintained
+# separately and kept drifting out of sync (round-5: minimax; round-7:
+# cursor/agentf). VENDOR_REGISTRY is now the single source of truth
+# both tables are derived from — a new vendor/alias is added in ONE
+# place and both the reviewer-CLI-dispatch side and the implementer-
+# commit-prefix side stay in sync automatically.
+@dataclass(frozen=True)
+class VendorIdentity:
+    """One reviewer/implementer identity and every name it is known by."""
+
+    identity: str
+    cli_names: Tuple[str, ...] = ()
+    commit_prefixes: Tuple[str, ...] = ()
+
+
+VENDOR_REGISTRY: Tuple[VendorIdentity, ...] = (
+    VendorIdentity("codex", cli_names=("codex",), commit_prefixes=("codex/", "codexm/")),
+    VendorIdentity("gemini", cli_names=("gemini",), commit_prefixes=("gemini/", "geminim/")),
+    VendorIdentity("claude", cli_names=("claude",), commit_prefixes=("claude/",)),
+    # PR #819 round-4: `claudem/` used to collapse into "claude", but
+    # round-3 made `claudem` independently reachable as a REVIEWER
+    # identity too. Collapsing the IMPLEMENTER side to "claude" while
+    # the REVIEWER side legitimately declares "claudem" made
+    # `verify_provenance` compare "claude" != "claudem" and silently
+    # accept self-review for any claudem-authored commit reviewed by a
+    # claudem reviewer. claudem is genuinely a different backend
+    # (Claude CLI routed through MiniMax's API) from real Claude, so
+    # keeping it distinct is also the more accurate provenance claim.
+    # round-5 additionally found `invoke_reviewer` treats "claudem" and
+    # "minimax" as the identical backend, so "minimax" joins both sides
+    # here too (cli alias + commit prefix, for symmetry with round-7's
+    # cursor-agent handling below).
+    VendorIdentity("claudem", cli_names=("claudem", "minimax"), commit_prefixes=("claudem/", "minimax/")),
+    # round-7 (Codex /advice): `cursor` and `agentf` are aliases that
+    # dispatch the identical `cursor-agent` executable, but were never
+    # canonicalized — a cursor-agent-authored commit reviewed via the
+    # `cursor`/`agentf` alias evaded both the self-review pre-filter
+    # and the post-hoc `verify_provenance` check. round-8: the same gap
+    # existed on the commit-prefix side (`cursor/` was never mapped at
+    # all — Codex found a real `cursor/composer-2.5-fast: ...` commit
+    # in this repo's history that resolved to "unknown").
+    VendorIdentity(
+        "cursor-agent",
+        cli_names=("cursor-agent", "cursor", "agentf"),
+        commit_prefixes=("cursor/", "cursor-agent/", "agentf/"),
+    ),
+    # `agy`/`antig`/`antigravity` route through a variable underlying
+    # model per invocation (repo history shows "agy/gemini-3.7-flash",
+    # "agy/gpt-5.6-sol" — the TOOL name is fixed, the MODEL varies).
+    # PR #289 (commit 7c67efbb, months before PR #819) deliberately
+    # mapped `antig/` to "unknown" rather than guess the model from the
+    # commit subject — ZFC forbids keyword/heuristic classification of
+    # free-form text, and parsing the model name out of the prefix
+    # would be exactly that. `agy/` is added here for the identical
+    # reason, matching that existing, deliberate, fail-closed
+    # precedent — this is NOT a new restriction PR #819 introduces. An
+    # agy/antig-authored commit failing `verify_provenance`'s
+    # unknown-implementer check is pre-existing repository behavior
+    # that predates and is out of scope for PR #819 (round-8 /advice
+    # asked to "fix" this; verified via `git blame` that the antig/
+    # precedent is unrelated prior art, not a PR819 regression — same
+    # category as the gemini/agy HOME-exemption code an earlier /wa
+    # round of this PR already correctly ruled out of scope).
+    VendorIdentity("unknown", commit_prefixes=("agy/", "antig/", "antigravity/")),
+)
+
+REVIEWER_CLI_TO_IDENTITY: Dict[str, str] = {
+    name: v.identity for v in VENDOR_REGISTRY for name in v.cli_names
 }
+
+# Placeholder substituted into the prompt's IDENTITY line with the
+# actual vendor's expected token (see ``expected_identity_for_vendor``)
+# just before that vendor is invoked. PR #819 round-2: the prompt used
+# to hardcode a fixed `<codex|gemini|claude|...>` enum, so a claudem/
+# agy/cursor-agent reviewer following the prompt literally could never
+# declare its own configured vendor name — ``bind_reviewer_identity``
+# then rejected every verdict from a non-codex/gemini vendor.
+IDENTITY_TOKEN_PLACEHOLDER = "<<REVIEWER_IDENTITY_TOKEN>>"
+
+
+def expected_identity_for_vendor(vendor: str) -> str:
+    """Return the exact IDENTITY token ``vendor`` must declare.
+
+    Single source of truth for both the prompt-building side (which
+    substitutes this into ``IDENTITY_TOKEN_PLACEHOLDER``) and the
+    verdict-checking side (``bind_reviewer_identity``, which reads
+    ``REVIEWER_CLI_TO_IDENTITY`` directly) — the two therefore can
+    never drift apart. Falls back to the vendor's own lowercased name
+    for anything not yet in the table (matches
+    ``_extend_bind_table_from_priority``'s own fallback).
+    """
+    return REVIEWER_CLI_TO_IDENTITY.get(vendor.strip().lower(), vendor.strip().lower())
 
 
 def _extend_bind_table_from_priority() -> None:
@@ -176,17 +267,14 @@ def _extend_bind_table_from_priority() -> None:
 # Adding a new prefix here IS an explicit PR-time decision — the
 # reviewer must review and merge the addition. Comment-only additions
 # (sed/keyword substitutions in commit messages) cannot change the
-# implementation identity.
-COMMIT_PREFIX_TO_IDENTITY = {
-    "claude/": "claude",
-    "claudem/": "claude",
-    "codex/": "codex",
-    "codexm/": "codex",
-    "gemini/": "gemini",
-    "geminim/": "gemini",
-    "human:": "human",
-    "antig/": "unknown",  # Antigravity is the IDE; identity is whatever it spawned
+# implementation identity. Derived from VENDOR_REGISTRY (see above) so
+# this table can never drift out of sync with REVIEWER_CLI_TO_IDENTITY
+# — plus one legacy entry (`human:`) that is not an AI vendor and so
+# is not part of the vendor registry.
+COMMIT_PREFIX_TO_IDENTITY: Dict[str, str] = {
+    prefix: v.identity for v in VENDOR_REGISTRY for prefix in v.commit_prefixes
 }
+COMMIT_PREFIX_TO_IDENTITY["human:"] = "human"
 
 
 @dataclass(frozen=True)
@@ -353,9 +441,27 @@ _REPO_RE = re.compile(
 _PR_RE = re.compile(r"^\s*PR_NUMBER\s*:\s*(\d+)\s*$", re.MULTILINE | re.IGNORECASE)
 _REASON_RE = re.compile(r"^\s*REASON\s*:\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE)
 _IDENTITY_RE = re.compile(
-    r"^\s*IDENTITY\s*:\s*(claude|codex|gemini|human|unknown)\s*$",
+    r"^\s*IDENTITY\s*:\s*([A-Za-z0-9_.\-]+)\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
+
+
+def _allowed_identity_tokens() -> frozenset:
+    """Identity tokens ``parse_verdict`` accepts on the ``IDENTITY`` line.
+
+    Always includes the legacy base set, extended with every value in
+    ``REVIEWER_CLI_TO_IDENTITY`` — which ``_extend_bind_table_from_priority()``
+    already broadens to include each vendor in
+    ``skeptic_reviewer_priority()`` (e.g. claudem/agy/cursor-agent). Without
+    this, a chain-walk vendor honestly declaring its own name (e.g.
+    ``IDENTITY: claudem``) was rejected by ``parse_verdict`` before
+    ``bind_reviewer_identity`` — which already supports it — ever ran
+    (PR #819 round-2 finding).
+    """
+    return frozenset(
+        {"claude", "codex", "gemini", "human", "unknown"}
+        | set(REVIEWER_CLI_TO_IDENTITY.values())
+    )
 
 # ---------------------------------------------------------------------------
 # Execution-evidence regexes (issue #384)
@@ -549,7 +655,7 @@ def parse_verdict(output: object) -> Optional[ParsedVerdict]:
         return None
 
     identity_token = identities[0].lower()
-    if identity_token not in ("claude", "codex", "gemini", "human", "unknown"):
+    if identity_token not in _allowed_identity_tokens():
         return None
 
     verdict_token = verdicts[0].upper()
@@ -697,7 +803,7 @@ def extract_implementation_identity_from_commit(commit_subject: str) -> str:
 
     Examples:
         >>> extract_implementation_identity_from_commit("claudem/minimax-M3: feat(x): ...")
-        'claude'
+        'claudem'
         >>> extract_implementation_identity_from_commit("codexm/o3: fix: ...")
         'codex'
         >>> extract_implementation_identity_from_commit("naked commit message")
@@ -940,7 +1046,27 @@ def evaluate(
       into the comment body so the read-back verifier can equality-
       check it.
     """
-    if review_error or not (review_output and review_output.strip()):
+    # round-10 /advice finding (Codex + Opus, independently converged):
+    # this used to short-circuit to "reviewer unavailable" whenever
+    # `review_error` was truthy, REGARDLESS of whether `review_output`
+    # contained a genuine, complete, parseable verdict — so round-9's
+    # fix to `_detect_vendor_unavailable` (making the chain-walk
+    # correctly NOT skip a vendor that produced a real verdict even
+    # alongside a nonzero exit code) was undermined: `evaluate()` itself
+    # still discarded that verdict here and reported "unavailable"
+    # instead of the real result. Both reviewers agreed this was
+    # fail-closed/non-exploitable (no security bypass — the gate still
+    # failed safely), but a functional blocker: a reviewer CLI with a
+    # flaky/nonzero exit on an otherwise-valid FAIL verdict always lost
+    # that verdict. Fix: only take the immediate "unavailable" path when
+    # there is truly no output content at all; when output exists,
+    # attempt the SAME parse (contract-echo stripped, same as
+    # `_detect_vendor_unavailable` now does) regardless of `review_error`
+    # — a genuine verdict is used if one is found. `review_error` is
+    # folded into the reason if parsing still fails, so the diagnostic
+    # information is not lost.
+    review_output_has_content = bool(review_output and review_output.strip())
+    if not review_output_has_content:
         reason = "reviewer unavailable"
         if review_error:
             reason = f"reviewer unavailable: {review_error.strip()[:200]}"
@@ -1009,6 +1135,13 @@ def evaluate(
                 "inconsistent with VERDICT, or extra prose/code-block "
                 "present — fail-closed)"
             )
+        if review_error:
+            # round-10: a genuine parse attempt was made despite
+            # `review_error` being set (see the note above), but it
+            # still failed — fold the error back in so the diagnostic
+            # information from the failed invocation is not silently
+            # dropped just because output happened to be non-empty.
+            reason = f"{reason}; reviewer also reported an error: {review_error.strip()[:200]}"
         body = format_comment(
             verdict="FAIL",
             head_sha=head_sha,
@@ -1463,7 +1596,7 @@ with no extra commentary or code blocks:
     REPO: {repo}
     PR_NUMBER: {pr_number}
     REASON: <one-sentence justification>
-    IDENTITY: <codex|gemini|claude|unknown>
+    IDENTITY: {identity_placeholder}
     TEST_RUN_EVIDENCE: passed=<N> failed=<N> skipped=<N> exit=<N>
     LINT_RUN_EVIDENCE: tool=<name> errors=<N> warnings=<N>
     GREP_CITES: <file:line;file:line;...>
@@ -1475,9 +1608,12 @@ Rules:
 - Use `VERDICT: PASS` only if the diff is small, well-scoped, and free
   of destructive operations, secret leakage, out-of-scope changes, or
   anything else a reviewer should refuse. Otherwise use `VERDICT: FAIL`.
-- `IDENTITY` MUST be one of `codex`, `gemini`, `claude`, `unknown`.
-  The gate rejects self-review: a verdict whose IDENTITY matches the
-  implementing model will fail closed regardless of the verdict.
+- `IDENTITY` has a placeholder token above — it is replaced with the
+  exact identity string you must declare before this prompt reaches
+  you. Emit that exact substituted value verbatim, with no other
+  value. The gate rejects self-review: a verdict whose IDENTITY
+  matches the implementing model will fail closed regardless of the
+  verdict.
 - `REPO` MUST equal the repository above.
 - `PR_NUMBER` MUST equal the PR number above.
 - Do not include any other text — no extra VERDICT lines, no code
@@ -1645,6 +1781,7 @@ def build_prompt(
     diff: str,
     implementation_identity: str = "unknown",
     contract: Optional[BeadContract] = None,
+    reviewer_identity: Optional[str] = None,
 ) -> str:
     """Assemble the prompt sent to the independent reviewer CLI.
 
@@ -1660,11 +1797,24 @@ def build_prompt(
     item is `ADDRESSED` (or `N-A` with a reason) via
     `evaluate_contract_echo`. Without a contract, the prompt is the
     legacy 10-field form (issue #384).
+
+    ``reviewer_identity``, when given, is the exact IDENTITY token
+    substituted into the template's IDENTITY line via ``.format()``
+    AT CONSTRUCTION TIME. This must never be done as a post-hoc
+    string search/replace over the assembled (diff-bearing) prompt —
+    ``.format()`` only fills its own named template slots and does
+    not re-scan already-substituted content (like ``diff``), so an
+    occurrence of the placeholder text inside the diff itself can
+    never be mistaken for the template's own IDENTITY slot. When
+    omitted, the raw ``IDENTITY_TOKEN_PLACEHOLDER`` is left in place.
     """
     if contract is not None:
         contract_block = _build_contract_block(contract)
     else:
         contract_block = ""
+    identity_value = (
+        reviewer_identity if reviewer_identity is not None else IDENTITY_TOKEN_PLACEHOLDER
+    )
     return _PROMPT_TEMPLATE.format(
         repo=repo,
         pr_number=pr_number,
@@ -1672,6 +1822,7 @@ def build_prompt(
         base_sha=base_sha,
         diff=diff,
         implementation_identity=implementation_identity,
+        identity_placeholder=identity_value,
         contract_block=contract_block,
     )
 

@@ -1,0 +1,537 @@
+"""Factory funnel, split by intake origin lane (bead rev-2vqpa follow-up).
+
+ROOT CAUSE this fixes: ``runner/funnel_report.py`` aggregates ALL lifecycles
+into one funnel regardless of how they entered the factory. That hides a
+real distinction operators care about — 2026-08-24 live analysis found the
+three entry points behave very differently:
+
+  - **bead_start**: a bead hand-created with no external reference
+    (``INTAKE_BEAD_CREATED`` with no ``context.external_ref``).
+  - **gh_issue_start**: a bead created by sweeping a GitHub issue
+    (``INTAKE_BEAD_CREATED`` with ``context.external_ref`` set).
+  - **pr_adopted_start**: a bead created by adopting an already-open PR
+    (``EXISTING_PR_ADOPTED`` with ``context.newly_created`` true — the PR
+    predates the bead, so ``PR_OPENED`` never fires for this lane; gate
+    assessment starts immediately instead).
+
+For each lane, this module reports the **furthest main-funnel stage
+reached** per lifecycle (not just aggregate counts) — "how far did each
+lane get" — plus the terminal divert breakdown (``PARKED_HUMAN_HELD``,
+``ESCALATION_REQUIRED``, or still active).
+
+Reuses ``runner.funnel_report``'s schema-tolerant timestamp parsing and
+stage vocabulary rather than duplicating it — see that module's docstring
+for the full schema-drift rationale (current vs legacy daemon.jsonl rows).
+
+Known caveat (documented 2026-08-24 live run, do not silently "fix" without
+re-verifying): ``TASK_DISPATCHED`` is not emitted on every dispatch code
+path (e.g. bead ``jleechan-wjm2`` was confirmed dispatched-and-merged via
+its own bead notes — "daemon routed SMALL_PATH -> AO spawn -> merged" — but
+shows no ``TASK_DISPATCHED`` event in daemon.jsonl). The "never dispatched"
+count in the ``INTAKE_ONLY`` bucket is therefore a directional signal, not
+an exact count; cross-check against bead notes before treating any single
+bead as proof of starvation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Optional
+
+from runner.funnel_report import (
+    MAIN_STAGES,
+    SIDE_STAGES,
+    _parse_ts,
+    default_daemon_log_path,
+    parse_since,
+)
+
+LANES = ["bead_start", "gh_issue_start", "pr_adopted_start"]
+
+_STAGE_RANK = {s: i for i, s in enumerate(MAIN_STAGES)}
+_SIDE_SET = set(SIDE_STAGES)
+_MAIN_SET = set(MAIN_STAGES)
+
+# These are deliberately observation buckets, not funnel stages.  A single
+# GATE_ASSESSMENT contributes exactly one bucket, including ``unobserved`` when
+# the daemon event predates the per-gate telemetry contract.
+CODERABBIT_BUCKETS = (
+    "direct_approved",
+    "waived_unavailable",
+    "unknown",
+    "fail",
+    "unobserved",
+)
+_CODERABBIT_WAIVER_TOKEN = "coderabbit:waived_vendor_unavailable"
+_REPOSITORY_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def _contains_waiver_token(value) -> bool:
+    """Return whether an evidence value contains the canonical waiver token."""
+    if isinstance(value, str):
+        return _CODERABBIT_WAIVER_TOKEN in value
+    if isinstance(value, dict):
+        return any(_contains_waiver_token(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_waiver_token(item) for item in value)
+    return False
+
+
+def classify_coderabbit(context: object) -> str:
+    """Classify one GATE_ASSESSMENT's CodeRabbit observation.
+
+    ``unobserved`` means the assessment has no usable ``gates.coderabbit``
+    field at all.  A present but malformed/unknown verdict is ``unknown``.
+    The waiver token is checked before the verdict so a green-equivalent
+    vendor outage cannot inflate direct approval metrics.  This is telemetry
+    reporting only and does not alter gate or merge semantics.
+    """
+    if not isinstance(context, dict):
+        return "unobserved"
+    gates = context.get("gates")
+    if not isinstance(gates, dict) or "coderabbit" not in gates:
+        return "unobserved"
+    raw = gates["coderabbit"]
+    if isinstance(raw, str):
+        verdict = raw.strip().lower()
+        evidence = None
+    elif isinstance(raw, dict):
+        verdict = raw.get("verdict")
+        verdict = verdict.strip().lower() if isinstance(verdict, str) else None
+        evidence = raw.get("evidence")
+    else:
+        return "unknown"
+
+    if verdict in {"fail", "red"}:
+        return "fail"
+    # A waiver is only a green-equivalent observation when the underlying
+    # verdict is explicitly pass/green.  Contradictory fail/waiver and
+    # unknown/waiver payloads remain conservative.
+    if verdict in {"pass", "green"}:
+        if _contains_waiver_token(evidence):
+            return "waived_unavailable"
+        return "direct_approved"
+    return "unknown"
+
+
+def _resolved_repository(event: dict) -> Optional[str]:
+    """Return the canonical repository identity carried by gate telemetry.
+
+    New daemon assessments emit ``context.repo`` from the resolved routing
+    entry.  The aliases below keep the reader compatible with fixtures and
+    older producers that used ``target_repo`` or ``repository``.  Values are
+    validated as an owner/name pair and normalized because GitHub repository
+    names are case-insensitive.
+    """
+    context = event.get("context")
+    if not isinstance(context, dict):
+        return None
+    for field in ("repo", "target_repo", "repository", "repository_full_name"):
+        value = context.get(field)
+        if isinstance(value, dict):
+            value = value.get("full_name") or value.get("name")
+        if not isinstance(value, str):
+            continue
+        value = value.strip().rstrip("/")
+        if _REPOSITORY_ID_RE.fullmatch(value):
+            return value.lower()
+    return None
+
+
+def coderabbit_observation_key(event: dict, sequence: object = None) -> tuple:
+    """Return the deduplication key for a CodeRabbit gate observation.
+
+    Recent daemon telemetry carries ``(repo, pr_number, head_sha)``.  Repeated
+    assessments for that immutable PR head are one observation for funnel
+    metrics; the latest event wins because a vendor can move from unknown to
+    approved (or vice versa) without a new head.  Legacy rows without the
+    repository field retain the historical ``(pr_number, head_sha)`` key so
+    existing logs remain comparable; the daemon now emits ``repo`` for new
+    rows, preventing cross-repository collisions going forward.
+    """
+    context = event.get("context")
+    if isinstance(context, dict):
+        pr_number = context.get("pr_number")
+        head_sha = context.get("head_sha")
+        if (
+            isinstance(pr_number, (int, str))
+            and not isinstance(pr_number, bool)
+            and str(pr_number)
+            and isinstance(head_sha, str)
+            and head_sha
+        ):
+            repo = _resolved_repository(event)
+            if repo is not None:
+                return ("pr_head", repo, str(pr_number), head_sha)
+            return ("pr_head_legacy", str(pr_number), head_sha)
+    # ``sequence`` is supplied by the streaming loader/compute loop.  It is
+    # required for legacy rows where multiple assessments share bead, attempt,
+    # and timestamp; using those fields alone silently collapses observations.
+    if sequence is None:
+        sequence = event.get("_seq")
+    if sequence is None:
+        sequence = id(event)
+    return ("event", sequence)
+
+
+def _normalize_full(raw: dict) -> Optional[dict]:
+    """Like ``funnel_report._normalize`` but keeps ``context`` — lane
+    classification needs ``context.external_ref`` / ``context.newly_created``,
+    which the base module intentionally drops (it doesn't need them)."""
+    event_type = raw.get("eventType")
+    bead_id = raw.get("beadId")
+    if not isinstance(event_type, str) or not event_type:
+        return None
+    if not isinstance(bead_id, str) or not bead_id:
+        return None
+
+    # Keep the current ``timestamp`` / legacy ``ts`` fallback, but reject a
+    # malformed non-string primary field before calling ``_parse_ts``.  The
+    # helper intentionally accepts strings only; passing a list/dict through
+    # would raise AttributeError before it can fail-soft.
+    timestamp = raw.get("timestamp")
+    if timestamp is None or timestamp == "":
+        timestamp = raw.get("ts")
+    if not isinstance(timestamp, str) or not timestamp:
+        return None
+    ts = _parse_ts(timestamp)
+    if ts is None:
+        return None
+    attempt = raw.get("attemptId")
+    if attempt is None:
+        attempt = raw.get("attempt")
+    try:
+        attempt_id = int(attempt) if attempt is not None else 0
+    except (TypeError, ValueError):
+        attempt_id = 0
+    context_present = "context" in raw
+    context_raw = raw.get("context")
+    context_valid = isinstance(context_raw, dict) or not context_present
+    context = context_raw if isinstance(context_raw, dict) else {}
+    if not context_valid:
+        # Keep the normalized shape stable for callers, but retain validity so
+        # classification cannot mistake malformed list/scalar context for an
+        # omitted context object.
+        context = {}
+    return {
+        "event_type": event_type,
+        "bead_id": bead_id,
+        "attempt_id": attempt_id,
+        "ts": ts,
+        "context": context,
+        "context_valid": context_valid,
+    }
+
+
+def load_events_full(path: pathlib.Path, since=None, now=None) -> list[dict]:
+    """Stream-read + normalize daemon.jsonl, keeping ``context`` for lane
+    classification. Malformed rows are skipped, never fatal — see
+    ``funnel_report.load_events`` for the same contract."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    cutoff = (now - since) if since is not None else None
+    events: list[dict] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            evt = _normalize_full(raw)
+            if evt is None:
+                continue
+            if cutoff is not None and evt["ts"] < cutoff:
+                continue
+            evt["_seq"] = len(events)
+            events.append(evt)
+    return events
+
+
+@dataclass
+class LaneStat:
+    lane: str
+    total: int
+    furthest: dict = field(default_factory=dict)  # {"INTAKE_ONLY"|stage: count}
+    terminal: dict = field(default_factory=dict)  # {"none"|side_stage: count}
+    coderabbit: dict = field(default_factory=dict)  # observation bucket -> count
+    coderabbit_total: int = 0
+
+
+@dataclass
+class LaneReport:
+    since_label: str
+    lanes: list  # list[LaneStat]
+    # Global CodeRabbit observations include assessments whose intake origin
+    # is outside the window and therefore cannot be assigned to a lane.
+    coderabbit: dict = field(default_factory=dict)
+    coderabbit_total: int = 0
+
+
+def classify_origin(events: list[dict]) -> dict[str, str]:
+    """First INTAKE_BEAD_CREATED / EXISTING_PR_ADOPTED event per **bead_id**
+    (NOT per (bead_id, attempt_id)) determines that bead's lane. Origin is a
+    property of the bead itself, not of an individual reroll attempt.
+
+    BUG FIXED 2026-08-24 (found live, before this was true the numbers were
+    silently wrong): keying by (bead_id, attempt_id) here caused every
+    lifecycle whose origin event fired on one attempt but whose downstream
+    stage events (GATE_ASSESSMENT, READY_FOR_MERGE, ...) fired on a LATER
+    reroll attempt to be silently excluded from every lane — the join key
+    never matched. Confirmed on real data: bead ``dark-factory-4sey`` had
+    ``EXISTING_PR_ADOPTED`` only at attempts 1-2, but its ``READY_FOR_MERGE``
+    fired at attempt 3; bead ``jleechan-l3r6`` had ``INTAKE_BEAD_CREATED``
+    only at attempt 1, but ``READY_FOR_MERGE`` fired at attempts 2 AND 4.
+    Both were invisibly dropped from the 2026-08-24 initial 30d report,
+    which claimed 0 READY_FOR_MERGE across all lanes when the correct
+    number (keying by bead_id) is non-zero. Events are assumed roughly
+    time-ordered as read from the log (daemon.jsonl is append-only); the
+    first classifying event wins."""
+    origin: dict[str, str] = {}
+    for evt in events:
+        bead_id = evt["bead_id"]
+        if bead_id in origin:
+            continue
+        et = evt["event_type"]
+        if not evt.get("context_valid", True):
+            continue
+        ctx = evt.get("context")
+        if not isinstance(ctx, dict):
+            continue
+        if et == "INTAKE_BEAD_CREATED":
+            external_ref = ctx.get("external_ref")
+            if external_ref is None or external_ref == "":
+                origin[bead_id] = "bead_start"
+            elif isinstance(external_ref, str):
+                origin[bead_id] = "gh_issue_start"
+        elif et == "EXISTING_PR_ADOPTED" and ctx.get("newly_created") is True:
+            origin[bead_id] = "pr_adopted_start"
+    return origin
+
+
+def compute_lane_report(events: list[dict], since_label: str = "") -> LaneReport:
+    """Reports are aggregated at the **bead level** — across ALL reroll
+    attempts of a bead, not per-(bead_id, attempt_id) lifecycle. A bead's
+    lane origin is fixed once (first classifying event); "furthest
+    milestone reached" is the max stage that bead EVER reached on any
+    attempt; "terminal divert" reflects the bead's LATEST (highest
+    attempt_id) attempt only, so a bead that parked on attempt 2 but was
+    successfully rerolled and reached READY_FOR_MERGE on attempt 3 is NOT
+    misreported as still-parked."""
+    origin = classify_origin(events)  # bead_id -> lane
+
+    # Keep a report-level exact-head metric in addition to per-lane values.
+    # This prevents the lane-origin join from dropping legitimate PR/head
+    # observations when the intake event predates the reporting window.
+    global_coderabbit_latest: dict[tuple, dict] = {}
+    for sequence, evt in enumerate(events):
+        if evt["event_type"] != "GATE_ASSESSMENT":
+            continue
+        key = coderabbit_observation_key(evt, sequence)
+        previous = global_coderabbit_latest.get(key)
+        if previous is None or evt["ts"] >= previous["ts"]:
+            global_coderabbit_latest[key] = evt
+
+    bead_events: dict[str, list[tuple[int, str]]] = {}
+    coderabbit_events: dict[str, list[dict]] = {}
+    latest_attempt_by_bead: dict[str, int] = {}
+    for evt in events:
+        bead_id = evt["bead_id"]
+        if bead_id not in origin:
+            continue
+        latest_attempt_by_bead[bead_id] = max(
+            latest_attempt_by_bead.get(bead_id, evt["attempt_id"]),
+            evt["attempt_id"],
+        )
+        et = evt["event_type"]
+        if et in _MAIN_SET or et in _SIDE_SET:
+            bead_events.setdefault(bead_id, []).append((evt["attempt_id"], et))
+        if et == "GATE_ASSESSMENT":
+            coderabbit_events.setdefault(bead_id, []).append(evt)
+
+    lane_stats: dict[str, LaneStat] = {
+        lane: LaneStat(
+            lane=lane,
+            total=0,
+            coderabbit={bucket: 0 for bucket in CODERABBIT_BUCKETS},
+        )
+        for lane in LANES
+    }
+
+    for bead_id, lane in origin.items():
+        stat = lane_stats[lane]
+        stat.total += 1
+        evs = bead_events.get(bead_id, [])
+
+        # Count one latest observation per PR/head.  Older daemon rows do not
+        # carry a head SHA and intentionally use their event identity key.
+        latest_coderabbit: dict[tuple, dict] = {}
+        for sequence, evt in enumerate(coderabbit_events.get(bead_id, [])):
+            key = coderabbit_observation_key(evt, sequence)
+            previous = latest_coderabbit.get(key)
+            if previous is None or evt["ts"] >= previous["ts"]:
+                latest_coderabbit[key] = evt
+        for evt in latest_coderabbit.values():
+            bucket = classify_coderabbit(evt.get("context"))
+            stat.coderabbit[bucket] = stat.coderabbit.get(bucket, 0) + 1
+            stat.coderabbit_total += 1
+
+        main_hit = [et for (_a, et) in evs if et in _MAIN_SET]
+        furthest = max(main_hit, key=lambda x: _STAGE_RANK[x]) if main_hit else "INTAKE_ONLY"
+        stat.furthest[furthest] = stat.furthest.get(furthest, 0) + 1
+
+        latest_attempt = latest_attempt_by_bead.get(bead_id)
+        if latest_attempt is not None:
+            latest_side = [et for (a, et) in evs if a == latest_attempt and et in _SIDE_SET]
+            terminal = latest_side[-1] if latest_side else "none"
+        else:
+            terminal = "none"
+        stat.terminal[terminal] = stat.terminal.get(terminal, 0) + 1
+
+    global_coderabbit = {bucket: 0 for bucket in CODERABBIT_BUCKETS}
+    for evt in global_coderabbit_latest.values():
+        global_coderabbit[classify_coderabbit(evt.get("context"))] += 1
+    return LaneReport(
+        since_label=since_label,
+        lanes=[lane_stats[lane] for lane in LANES],
+        coderabbit=global_coderabbit,
+        coderabbit_total=sum(global_coderabbit.values()),
+    )
+
+
+def _fmt_pct(n: int, total: int) -> str:
+    if total == 0:
+        return "—"
+    return f"{100.0 * n / total:.0f}%"
+
+
+def render_markdown(report: LaneReport) -> str:
+    lines = [
+        f"# df-funnel-lanes report (since {report.since_label or 'start of log'})",
+        "",
+        "Lanes: bead_start (hand-created bead) | gh_issue_start (swept GH issue) | "
+        "pr_adopted_start (adopted an already-open PR)",
+        "",
+    ]
+    lines.append("## CodeRabbit exact-head observations (all classified events)")
+    lines.append("")
+    lines.append(f"Assessments observed: {report.coderabbit_total}")
+    lines.append("")
+    lines.append("| Outcome | Count | % of assessments |")
+    lines.append("|---|---|---|")
+    for bucket in CODERABBIT_BUCKETS:
+        n = report.coderabbit.get(bucket, 0)
+        lines.append(f"| {bucket} | {n} | {_fmt_pct(n, report.coderabbit_total)} |")
+    lines.append("")
+    stage_order = ["INTAKE_ONLY"] + MAIN_STAGES
+    for stat in report.lanes:
+        lines.append(f"## {stat.lane} (n={stat.total})")
+        lines.append("")
+        lines.append("### Furthest milestone reached")
+        lines.append("")
+        lines.append("| Milestone | Count | % |")
+        lines.append("|---|---|---|")
+        for s in stage_order:
+            n = stat.furthest.get(s, 0)
+            lines.append(f"| {s} | {n} | {_fmt_pct(n, stat.total)} |")
+        lines.append("")
+        lines.append("### Terminal divert")
+        lines.append("")
+        lines.append("| Divert | Count | % |")
+        lines.append("|---|---|---|")
+        for s, n in sorted(stat.terminal.items(), key=lambda kv: -kv[1]):
+            lines.append(f"| {s} | {n} | {_fmt_pct(n, stat.total)} |")
+        lines.append("")
+        lines.append("### CodeRabbit gate observations")
+        lines.append("")
+        assessment_total = sum(stat.coderabbit.values())
+        lines.append(f"Assessments observed: {assessment_total}")
+        lines.append("")
+        lines.append("| Outcome | Count | % of assessments |")
+        lines.append("|---|---|---|")
+        for bucket in CODERABBIT_BUCKETS:
+            n = stat.coderabbit.get(bucket, 0)
+            lines.append(f"| {bucket} | {n} | {_fmt_pct(n, assessment_total)} |")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def render_json(report: LaneReport) -> dict:
+    return {
+        "since": report.since_label,
+        "coderabbit": {
+            bucket: report.coderabbit.get(bucket, 0)
+            for bucket in CODERABBIT_BUCKETS
+        },
+        "coderabbit_total": report.coderabbit_total,
+        "lanes": [
+            {
+                "lane": stat.lane,
+                "total": stat.total,
+                "furthest_stage": dict(stat.furthest),
+                "terminal_divert": dict(stat.terminal),
+                "coderabbit": {
+                    bucket: stat.coderabbit.get(bucket, 0)
+                    for bucket in CODERABBIT_BUCKETS
+                },
+                "coderabbit_total": stat.coderabbit_total,
+            }
+            for stat in report.lanes
+        ],
+    }
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    p = argparse.ArgumentParser(prog="dark-factory-funnel-lanes")
+    p.add_argument(
+        "--daemon-log",
+        type=pathlib.Path,
+        default=None,
+        help="Path to daemon.jsonl (default: ~/Library/Logs/dark-factory/daemon.jsonl)",
+    )
+    p.add_argument(
+        "--since",
+        default="30d",
+        help="Time window, e.g. '30d', '7d', '48h' (default: 30d — intake events are "
+        "sparse; a short window under-samples the bead_start/gh_issue_start lanes)",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-parseable JSON instead of a Markdown table",
+    )
+    args = p.parse_args(argv)
+
+    log_path = args.daemon_log or default_daemon_log_path()
+    if not log_path.exists():
+        print(f"daemon log not found: {log_path}", file=sys.stderr)
+        return 1
+
+    try:
+        window = parse_since(args.since)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    events = load_events_full(log_path, since=window)
+    report = compute_lane_report(events, since_label=args.since)
+
+    if args.json:
+        print(json.dumps(render_json(report), indent=2))
+    else:
+        print(render_markdown(report))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

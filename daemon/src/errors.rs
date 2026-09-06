@@ -108,6 +108,14 @@ pub enum DaemonError {
         spawn_error: Box<DaemonError>,
         cleanup_errors: Vec<SpawnBatchCleanupFailure>,
     },
+    /// The initial AO spawn indicated that the daemon was unavailable, but
+    /// restarting the AO project failed. Preserve both failures so operators
+    /// can diagnose the original spawn trigger and the recovery failure.
+    #[error("ao spawn failed: {spawn_error}; AO recovery failed: {recovery_error}")]
+    SpawnRecoveryFailed {
+        spawn_error: Box<DaemonError>,
+        recovery_error: Box<DaemonError>,
+    },
 }
 
 /// Renders every `(vendor, error)` pair collected by
@@ -141,6 +149,12 @@ fn format_cleanup_errors(errors: &[SpawnBatchCleanupFailure]) -> String {
 
 impl DaemonError {
     pub fn is_transient(&self) -> bool {
+        // A failed AO recovery is terminal for this dispatch attempt. The
+        // caller must inspect both preserved errors before deciding whether
+        // external intervention is safe; do not silently retry the spawn.
+        if matches!(self, DaemonError::SpawnRecoveryFailed { .. }) {
+            return false;
+        }
         matches!(
             self,
             DaemonError::Tool { .. }
@@ -203,6 +217,7 @@ impl DaemonError {
             DaemonError::SpawnFallbackExhausted(_) => "spawn_fallback_exhausted",
             DaemonError::SpawnCleanupFailed { .. } => "spawn_cleanup_failed",
             DaemonError::SpawnBatchCleanupFailed { .. } => "spawn_batch_cleanup_failed",
+            DaemonError::SpawnRecoveryFailed { .. } => "spawn_recovery_failed",
             DaemonError::WorktreeCwdMismatch { .. } => "worktree_cwd_mismatch",
         }
     }
@@ -219,16 +234,85 @@ impl DaemonError {
     /// transient failures, 300s backoff each, starving every other bead's
     /// fast-tier dispatch.
     pub fn is_gh_rate_limit(&self) -> bool {
-        let DaemonError::Tool { tool, stderr, .. } = self else {
+        let DaemonError::Tool { tool, stderr, rc } = self else {
             return false;
         };
         if tool != "gh" {
             return false;
         }
-        let lower = stderr.to_ascii_lowercase();
-        lower.contains("api rate limit exceeded")
-            || lower.contains("rate limit hit")
-            || (lower.contains("403") && lower.contains("rate limit"))
+        crate::gh_circuit_breaker::parse_rate_limit_error(stderr, *rc).is_some()
+            || stderr.to_ascii_lowercase().contains("circuit breaker")
+    }
+
+    /// True iff this error indicates that GitHub commenting has hit the comment
+    /// count limit (e.g. 2,500 comments per issue/PR limit on GitHub) or
+    /// commenting has been disabled on the target issue/PR.
+    pub fn is_github_comment_limit(&self) -> bool {
+        match self {
+            DaemonError::Tool { stderr, .. } => {
+                let lower = stderr.to_ascii_lowercase();
+                (lower.contains("2500") && lower.contains("comment"))
+                    || lower.contains("comment limit")
+                    || lower.contains("commenting is disabled")
+                    || lower.contains("commenting disabled")
+                    || lower.contains("comments are disabled")
+                    || lower.contains("comments disabled")
+                    || lower.contains("commenting has been disabled")
+                    || lower.contains("maximum limit of 2500 comments")
+                    || lower.contains("maximum limit of 2,500 comments")
+            }
+            DaemonError::Config(msg) => {
+                let lower = msg.to_ascii_lowercase();
+                lower.contains("commenting is disabled")
+                    || lower.contains("commenting disabled")
+                    || lower.contains("comments are disabled")
+                    || lower.contains("comments disabled")
+                    || lower.contains("commenting has been disabled")
+                    || lower.contains("comment limit")
+            }
+            _ => false,
+        }
+    }
+
+    /// True iff this error indicates AO itself is up and running, but the
+    /// specific project this daemon dispatches for is not registered in
+    /// AO's active project membership — the `ao-spawn-v013-bridge.mjs`
+    /// bridge script's distinct "running but not polling" rejection, e.g.
+    /// `[dark-factory AO bridge] running AO instance is not polling
+    /// project dark-factory`.
+    ///
+    /// Deliberately DISTINCT from `is_ao_not_running_error` (which detects
+    /// AO not being up at all, and drives an automatic bounded recovery
+    /// attempt via `ensure_ao_project_recovered`). This predicate's real
+    /// signature ("not polling project") was previously unrecognized by
+    /// that check's phrase list, so every occurrence fell through to the
+    /// generic `is_transient()` retry path — bare retry composes the
+    /// identical spawn request against the identical non-polling AO
+    /// instance every time, so it can never succeed. jleechan-vu3k: this is
+    /// exactly what happened live — attempt=10, spawn_failure_count=25,
+    /// parked `transient_spawn_retry_cap_exceeded` (a generic, operator-
+    /// opaque reason) with no signal that the real fix is an operator
+    /// action on AO itself, not a bead-level retry.
+    ///
+    /// This predicate intentionally does NOT trigger auto-recovery (unlike
+    /// `is_ao_not_running_error`) — a bounded auto-start action here could
+    /// pick between two currently-conflicting `agent-orchestrator.yaml`
+    /// configs (port 3000 vs 3020, different agent/worktree settings) and
+    /// make things worse. That decision stays with a human; this predicate
+    /// only exists so the daemon can escalate distinctly instead of
+    /// silently burning the retry cap.
+    pub fn is_ao_not_polling_project(&self) -> bool {
+        let msg = match self {
+            DaemonError::Tool { stderr, .. } => stderr.as_str(),
+            DaemonError::Config(msg) => msg.as_str(),
+            DaemonError::Parse(msg) => msg.as_str(),
+            DaemonError::SpawnFallbackExhausted(list) => {
+                return list.iter().any(|(_, e)| e.is_ao_not_polling_project());
+            }
+            _ => return false,
+        };
+        let lower = msg.to_lowercase();
+        lower.contains("not polling project") || lower.contains("lifecycle polling is inactive")
     }
 
     /// Detects `br create --external-ref ...` failing because the ref is
@@ -266,6 +350,87 @@ impl DaemonError {
     }
 }
 
+/// In-memory dedup cache mapping `(bead_id, original_ext_ref)` to
+/// the spawned `overflow_ref` (e.g. an overflow issue on GitHub), preventing
+/// repeated transient retries from spawning multiple overflow issues for the
+/// same bead and target ref.
+#[derive(Debug, Default, Clone)]
+pub struct OverflowDedupCache {
+    entries: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<(String, String), String>>>,
+}
+
+pub type CommentOverflowDedupCache = OverflowDedupCache;
+
+impl OverflowDedupCache {
+    pub fn new() -> Self {
+        Self {
+            entries: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Look up an existing overflow ref for `(bead_id, original_ext_ref)`.
+    pub fn get(&self, bead_id: &str, original_ext_ref: &str) -> Option<String> {
+        let read = self.entries.read().ok()?;
+        read.get(&(bead_id.to_string(), original_ext_ref.to_string()))
+            .cloned()
+    }
+
+    /// Record an overflow ref for `(bead_id, original_ext_ref)`.
+    pub fn insert(&self, bead_id: &str, original_ext_ref: &str, overflow_ref: &str) {
+        if let Ok(mut write) = self.entries.write() {
+            write.insert(
+                (bead_id.to_string(), original_ext_ref.to_string()),
+                overflow_ref.to_string(),
+            );
+        }
+    }
+
+    /// Returns true if an overflow ref is already cached for `(bead_id, original_ext_ref)`.
+    pub fn contains(&self, bead_id: &str, original_ext_ref: &str) -> bool {
+        self.get(bead_id, original_ext_ref).is_some()
+    }
+
+    /// Remove a cached overflow ref for `(bead_id, original_ext_ref)`.
+    pub fn remove(&self, bead_id: &str, original_ext_ref: &str) -> Option<String> {
+        let mut write = self.entries.write().ok()?;
+        write.remove(&(bead_id.to_string(), original_ext_ref.to_string()))
+    }
+
+    /// Clear all cached entries.
+    pub fn clear(&self) {
+        if let Ok(mut write) = self.entries.write() {
+            write.clear();
+        }
+    }
+
+    /// Return the number of cached entries.
+    pub fn len(&self) -> usize {
+        self.entries.read().map(|r| r.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Retrieves an existing cached overflow ref or computes it via `f` and inserts it.
+    pub fn get_or_insert_with<F, E>(
+        &self,
+        bead_id: &str,
+        original_ext_ref: &str,
+        f: F,
+    ) -> Result<String, E>
+    where
+        F: FnOnce() -> Result<String, E>,
+    {
+        if let Some(existing) = self.get(bead_id, original_ext_ref) {
+            return Ok(existing);
+        }
+        let created = f()?;
+        self.insert(bead_id, original_ext_ref, &created);
+        Ok(created)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +452,23 @@ mod tests {
     fn classifies_config_and_parse_as_fatal() {
         assert!(!DaemonError::Config("missing config".to_string()).is_transient());
         assert!(!DaemonError::Parse("bad json".to_string()).is_transient());
+    }
+
+    #[test]
+    fn classifies_spawn_recovery_failure_as_fatal_and_names_its_class() {
+        let err = DaemonError::SpawnRecoveryFailed {
+            spawn_error: Box::new(DaemonError::Tool {
+                tool: "ao spawn --agent minimax".to_string(),
+                rc: 1,
+                stderr: "daemon is not running".to_string(),
+            }),
+            recovery_error: Box::new(DaemonError::Config(
+                "ao start failed for project dark-factory".to_string(),
+            )),
+        };
+
+        assert_eq!(err.error_class(), "spawn_recovery_failed");
+        assert!(!err.is_transient());
     }
 
     /// jleechan-5ia2: AO's own internal spawn queue (hit at its active-session
@@ -536,5 +718,178 @@ mod tests {
     fn is_gh_rate_limit_returns_false_for_non_tool_error() {
         let err = DaemonError::Parse("unparseable gh response".to_string());
         assert!(!err.is_gh_rate_limit());
+    }
+
+    #[test]
+    fn is_github_comment_limit_detects_tool_stderr_2500_comments() {
+        let err = DaemonError::Tool {
+            tool: "gh".to_string(),
+            rc: 1,
+            stderr: "GraphQL: This issue has reached the maximum limit of 2500 comments (createIssueComment)".to_string(),
+        };
+        assert!(err.is_github_comment_limit());
+    }
+
+    #[test]
+    fn is_github_comment_limit_detects_config_commenting_disabled() {
+        let err = DaemonError::Config("commenting disabled for repository".to_string());
+        assert!(err.is_github_comment_limit());
+    }
+
+    #[test]
+    fn is_github_comment_limit_returns_false_for_rate_limit() {
+        let err = DaemonError::Tool {
+            tool: "gh".to_string(),
+            rc: 1,
+            stderr: "gh: API rate limit exceeded for installation ID 12345".to_string(),
+        };
+        assert!(!err.is_github_comment_limit());
+    }
+
+    #[test]
+    fn is_ao_not_polling_project_detects_bridge_signature() {
+        // jleechan-vu3k live signature: `ao-spawn-v013-bridge.mjs`'s
+        // "running but not registered" rejection.
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "[dark-factory AO bridge] running AO instance is not polling project dark-factory"
+                .to_string(),
+        };
+        assert!(err.is_ao_not_polling_project());
+    }
+
+    #[test]
+    fn is_ao_not_polling_project_detects_lifecycle_polling_inactive_phrase() {
+        let err = DaemonError::Tool {
+            tool: "ao".to_string(),
+            rc: 1,
+            stderr: "AO is not running — lifecycle polling is inactive. Run `ao start` before spawning sessions.".to_string(),
+        };
+        assert!(err.is_ao_not_polling_project());
+    }
+
+    #[test]
+    fn is_ao_not_polling_project_recurses_into_spawn_fallback_exhausted() {
+        let err = DaemonError::SpawnFallbackExhausted(vec![
+            (
+                "minimax".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent minimax".to_string(),
+                    rc: 1,
+                    stderr: "[dark-factory AO bridge] running AO instance is not polling project dark-factory".to_string(),
+                },
+            ),
+            (
+                "antigravity".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent antigravity".to_string(),
+                    rc: 1,
+                    stderr: "[dark-factory AO bridge] running AO instance is not polling project dark-factory".to_string(),
+                },
+            ),
+        ]);
+        assert!(err.is_ao_not_polling_project());
+    }
+
+    #[test]
+    fn is_ao_not_polling_project_returns_false_for_unrelated_tool_error() {
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "some unrelated ao CLI validation error".to_string(),
+        };
+        assert!(!err.is_ao_not_polling_project());
+    }
+
+    #[test]
+    fn is_ao_not_polling_project_returns_false_for_generic_ao_not_running() {
+        // Must stay distinct from `is_ao_not_running_error` -- this phrase
+        // is that predicate's territory (drives auto-recovery), not this
+        // one's (drives immediate distinct escalation, no auto-recovery).
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "[dark-factory AO bridge] AO is not running; run `ao start` before factory dispatch".to_string(),
+        };
+        assert!(!err.is_ao_not_polling_project());
+    }
+
+    #[test]
+    fn overflow_dedup_cache_insert_and_get() {
+        let cache = OverflowDedupCache::new();
+        assert_eq!(cache.get("bead-1", "owner/repo#100"), None);
+        assert!(!cache.contains("bead-1", "owner/repo#100"));
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+
+        cache.insert("bead-1", "owner/repo#100", "owner/repo#200");
+        assert_eq!(
+            cache.get("bead-1", "owner/repo#100"),
+            Some("owner/repo#200".to_string())
+        );
+        assert!(cache.contains("bead-1", "owner/repo#100"));
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.is_empty());
+    }
+
+    #[test]
+    fn overflow_dedup_cache_dedups_repeated_lookups_for_same_bead_and_ref() {
+        let cache = OverflowDedupCache::new();
+        cache.insert("bead-42", "org/repo#500", "org/repo#999");
+
+        // Subsequent queries return the exact same cached overflow ref
+        assert_eq!(cache.get("bead-42", "org/repo#500").as_deref(), Some("org/repo#999"));
+        assert_eq!(cache.get("bead-42", "org/repo#500").as_deref(), Some("org/repo#999"));
+    }
+
+    #[test]
+    fn overflow_dedup_cache_isolates_different_beads_and_refs() {
+        let cache = OverflowDedupCache::new();
+        cache.insert("bead-1", "org/repo#100", "org/repo#101");
+        cache.insert("bead-2", "org/repo#100", "org/repo#102");
+        cache.insert("bead-1", "org/repo#200", "org/repo#201");
+
+        assert_eq!(cache.get("bead-1", "org/repo#100").as_deref(), Some("org/repo#101"));
+        assert_eq!(cache.get("bead-2", "org/repo#100").as_deref(), Some("org/repo#102"));
+        assert_eq!(cache.get("bead-1", "org/repo#200").as_deref(), Some("org/repo#201"));
+        assert_eq!(cache.get("bead-2", "org/repo#200"), None);
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn overflow_dedup_cache_get_or_insert_with() {
+        let cache = OverflowDedupCache::new();
+        let mut calls = 0;
+
+        let result1 = cache.get_or_insert_with("bead-1", "org/repo#1", || {
+            calls += 1;
+            Ok::<_, DaemonError>("org/repo#overflow-1".to_string())
+        }).unwrap();
+        assert_eq!(result1, "org/repo#overflow-1");
+        assert_eq!(calls, 1);
+
+        // Second call should return cached ref without invoking generator closure
+        let result2 = cache.get_or_insert_with("bead-1", "org/repo#1", || {
+            calls += 1;
+            Ok::<_, DaemonError>("org/repo#overflow-duplicate".to_string())
+        }).unwrap();
+        assert_eq!(result2, "org/repo#overflow-1");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn overflow_dedup_cache_clear_and_remove() {
+        let cache = OverflowDedupCache::new();
+        cache.insert("bead-1", "org/repo#1", "org/repo#2");
+        assert_eq!(cache.remove("bead-1", "org/repo#1"), Some("org/repo#2".to_string()));
+        assert_eq!(cache.get("bead-1", "org/repo#1"), None);
+
+        cache.insert("bead-1", "org/repo#1", "org/repo#2");
+        cache.insert("bead-2", "org/repo#3", "org/repo#4");
+        assert_eq!(cache.len(), 2);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
     }
 }

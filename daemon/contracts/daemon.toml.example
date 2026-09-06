@@ -9,7 +9,7 @@ target_repo = "jleechanorg/dark-factory"  # exactly one repo (pilot scope)
 ao_project = "dark-factory"       # Agent Orchestrator project key; may differ from repo slug
 base_branch = "main"
 stage = 1                    # 1 = verifier plane only (re-roll verdicts recorded, never executed)
-max_workers = 30             # spec §4.2.8 / ao-spawn-safety
+max_workers = 40             # spec §4.2.8 / ao-spawn-safety
 max_batch = 15
 fast_tick_secs = 60          # beads with an open PR (ATTESTED)
 slow_tick_secs = 600         # intake scan

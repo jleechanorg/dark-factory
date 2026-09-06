@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Dark Factory Funnel Report — incoming task -> /ready-PR throughput metric
+# from daemon.jsonl (bead rev-2vqpa).
+#
+# Mirror of `bin/dark-factory` / `bin/df-validate`: no LLM backend preflight
+# gate — this is a pure log-aggregation report, no coder/reviewer backend
+# involved.
+
+set -euo pipefail
+
+_SCRIPT_REAL="$([ -L "${BASH_SOURCE[0]}" ] && readlink -f "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${_SCRIPT_REAL}")" && pwd)"
+RESOLVED_HOME="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PINNED_HOME=""
+if [[ -f "${RESOLVED_HOME}/.dark-factory-runtime-root" ]]; then
+  IFS= read -r PINNED_HOME < "${RESOLVED_HOME}/.dark-factory-runtime-root"
+fi
+if [[ "${PINNED_HOME}" == "${RESOLVED_HOME}" ]]; then
+  export DARK_FACTORY_HOME="${RESOLVED_HOME}"
+else
+  export DARK_FACTORY_HOME="${DARK_FACTORY_HOME:-${RESOLVED_HOME}}"
+fi
+VENV_PYTHON="${DARK_FACTORY_HOME}/.venv/bin/python"
+
+if [[ ! -x "${VENV_PYTHON}" ]]; then
+  echo "ERROR: Dark Factory venv missing at ${DARK_FACTORY_HOME}/.venv" >&2
+  echo "Run: ${DARK_FACTORY_HOME}/install.sh" >&2
+  exit 1
+fi
+
+exec env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
+  "${VENV_PYTHON}" -m runner.funnel_report "$@"

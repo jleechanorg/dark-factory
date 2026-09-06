@@ -42,7 +42,7 @@ pub struct Bead {
     pub id: String,
     pub title: String,
     pub description: String, // full body/description from `br list --json`; "" if absent
-    pub notes: String, // operator-authored `br update --notes` text; "" if absent
+    pub notes: String,       // operator-authored `br update --notes` text; "" if absent
     pub file_tree_summary: String, // pre-rendered file-tree text; "" if unavailable
     pub external_ref: Option<String>, // "<owner>/<repo>#<issue_number>", None = manual bead
 }
@@ -80,7 +80,11 @@ pub fn summarize_file_tree(root: &std::path::Path, max_entries: usize) -> String
                 continue; // skip .git, .venv, dotfiles — noise for a router prompt
             }
             let path = entry.path();
-            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
 
             if path.is_dir() {
                 entries.push(format!("{rel}/"));
@@ -478,6 +482,16 @@ mod claude_project_slug_tests {
 /// `br` CLI. `fetch_candidates` == `br list --status open --label factory --json`.
 pub trait Tracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError>;
+    /// Authoritative dependency admission snapshot. Production uses
+    /// `br ready`; the default preserves existing fake adapters by treating
+    /// all broad candidates as ready unless a test explicitly overrides it.
+    fn fetch_ready_ids(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
+        Ok(self
+            .fetch_candidates()?
+            .into_iter()
+            .map(|bead| bead.id)
+            .collect())
+    }
     fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError>;
     fn create_bead(
         &self,
@@ -654,11 +668,7 @@ pub trait Scm {
     /// unconditionally so existing test fakes and any impl that predates
     /// this method keep their original behavior; `CliScm` overrides it to
     /// actually call `gh pr list --head <branch>`.
-    fn pr_number_for_branch(
-        &self,
-        repo: &str,
-        branch: &str,
-    ) -> Result<Option<u64>, DaemonError> {
+    fn pr_number_for_branch(&self, repo: &str, branch: &str) -> Result<Option<u64>, DaemonError> {
         let _ = (repo, branch);
         Ok(None)
     }
@@ -755,8 +765,34 @@ pub trait Sessions {
     fn active_count(&self) -> Result<usize, DaemonError>;
     fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError>;
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError>;
+    fn attach_in_project(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        project: &str,
+    ) -> Result<SessionId, DaemonError> {
+        let _ = project;
+        self.attach(branch, bead_id)
+    }
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError>;
+    /// Stop a session using the AO project resolved by its durable owner.
+    ///
+    /// The default preserves existing fakes and single-project adapters. The
+    /// production adapter overrides it so restart recovery never guesses from
+    /// a process-local spawn map.
+    fn stop_in_project(&self, id: &SessionId, project: &str) -> Result<(), DaemonError> {
+        let _ = project;
+        self.stop(id)
+    }
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError>;
+    fn is_quiescent_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<bool, DaemonError> {
+        let _ = project;
+        self.is_quiescent(id)
+    }
     /// Budget-bounded `attach` (bead jleechan-zeij / issue #322 r4 P2). The
     /// re-roll proceed poll caps each probe at the time remaining until its
     /// window deadline so a single poll cannot block for multiples of the
@@ -773,6 +809,16 @@ pub trait Sessions {
         let _ = timeout_secs;
         self.attach(branch, bead_id)
     }
+    fn attach_within_in_project(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        project: &str,
+        timeout_secs: u64,
+    ) -> Result<SessionId, DaemonError> {
+        let _ = project;
+        self.attach_within(branch, bead_id, timeout_secs)
+    }
     /// Budget-bounded [`session_activity`](Sessions::session_activity) (bead
     /// jleechan-zeij / issue #322 r4 P2). Default delegates to the unbounded
     /// method; `CliSessions` overrides to pass `timeout_secs` to `ao status`.
@@ -783,6 +829,15 @@ pub trait Sessions {
     ) -> Result<SessionActivity, DaemonError> {
         let _ = timeout_secs;
         self.session_activity(id)
+    }
+    fn session_activity_within_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+        timeout_secs: u64,
+    ) -> Result<SessionActivity, DaemonError> {
+        let _ = project;
+        self.session_activity_within(id, timeout_secs)
     }
     /// Activity probe distinguishing idle vs running vs terminal (bead
     /// jleechan-zeij / issue #322 r2 — see [`SessionActivity`]). The default
@@ -799,11 +854,29 @@ pub trait Sessions {
             Ok(SessionActivity::Running)
         }
     }
+    fn session_activity_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<SessionActivity, DaemonError> {
+        let _ = project;
+        self.session_activity(id)
+    }
     /// Post-spawn session health monitor: checks if an active session died,
     /// failed authentication, hit quota limits, or suffered terminal errors in its terminal.
     fn check_session_health(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
         let _ = id;
         Ok(None)
+    }
+    /// Bead rev-4ou1z: wakes a session paused at a benign prompt (e.g. a
+    /// Gemini "Individual quota reached" message whose reset time has
+    /// passed) by sending an Enter keypress to its tmux pane. Returns
+    /// `Ok(true)` when a pane was found and poked. Default no-op — fakes
+    /// and tests that don't model tmux panes are unaffected; `CliSessions`
+    /// overrides this with the real tmux `send-keys` call.
+    fn wake_pane(&self, id: &SessionId) -> Result<bool, DaemonError> {
+        let _ = id;
+        Ok(false)
     }
     /// Returns the live branch AO reports for a given session, if known.
     ///
@@ -830,6 +903,23 @@ pub trait Sessions {
     /// absence of information.
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
         let _ = id;
+        Ok(None)
+    }
+    fn session_branch_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<Option<String>, DaemonError> {
+        let _ = project;
+        self.session_branch(id)
+    }
+    /// Returns the PR number AO reports for a given session in a project, if known.
+    fn session_pr_number_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let _ = (id, project);
         Ok(None)
     }
     /// Returns the git remote URL configured for `remote_name` inside the
@@ -959,7 +1049,12 @@ pub trait Vcs {
     /// POST a `refs/heads/<name>` ref via `gh api repos/<repo>/git/refs`
     /// (cross-repo ref creation that does NOT depend on the daemon's
     /// local checkout at all).
-    fn create_branch_at_for_repo(&self, repo: &str, name: &str, sha: &str) -> Result<(), DaemonError> {
+    fn create_branch_at_for_repo(
+        &self,
+        repo: &str,
+        name: &str,
+        sha: &str,
+    ) -> Result<(), DaemonError> {
         let _ = repo;
         self.create_branch_at(name, sha)
     }
@@ -975,11 +1070,7 @@ pub trait Vcs {
     /// shape as #349). Default impl is a no-op so existing single-repo
     /// test fakes keep their original behaviour transparently; `CliVcs`
     /// overrides it to `DELETE repos/<repo>/git/refs/heads/<name>`.
-    fn delete_branch_at_for_repo(
-        &self,
-        repo: &str,
-        name: &str,
-    ) -> Result<(), DaemonError> {
+    fn delete_branch_at_for_repo(&self, repo: &str, name: &str) -> Result<(), DaemonError> {
         let _ = (repo, name);
         Ok(())
     }
@@ -1152,114 +1243,123 @@ fn run_tool_with_cwd(
     extra_env: &[(&str, &str)],
     timeout_secs: u64,
 ) -> Result<String, DaemonError> {
-    let mut command = Command::new(cmd);
-    if cmd == "br" && !args.contains(&"--db") {
-        if let Some(db) = resolve_beads_db() {
-            command.args(["--db", db.to_str().unwrap_or_default()]);
+    // Centralized GitHub rate-limit circuit-breaker admission check.
+    crate::gh_circuit_breaker::admit_or_suppress(cmd, args)?;
+
+    let res = (|| {
+        let mut command = Command::new(cmd);
+        if cmd == "br" && !args.contains(&"--db") {
+            if let Some(db) = resolve_beads_db() {
+                command.args(["--db", db.to_str().unwrap_or_default()]);
+            }
         }
-    }
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Reviewer CLIs such as Codex spawn helper processes. Give every tool
-    // invocation a dedicated process group so a timeout cannot leave those
-    // helpers running after their direct parent has been killed.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    if let Some(dir) = cwd {
-        command.current_dir(dir);
-    }
-    for (key, value) in extra_env {
-        command.env(key, value);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|e| DaemonError::Tool {
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Reviewer CLIs such as Codex spawn helper processes. Give every tool
+        // invocation a dedicated process group so a timeout cannot leave those
+        // helpers running after their direct parent has been killed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        if let Some(dir) = cwd {
+            command.current_dir(dir);
+        }
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().map_err(|e| DaemonError::Tool {
             tool: cmd.to_string(),
             rc: -1,
             stderr: format!("spawn failed: {e}"),
         })?;
 
-    // Take the pipes and hand them to dedicated reader threads immediately so
-    // they drain concurrently with the wait/poll loop below. Readers run to
-    // EOF, which naturally occurs once the child exits (or is killed) and its
-    // pipe ends close — they never block the timeout path.
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
+        // Take the pipes and hand them to dedicated reader threads immediately so
+        // they drain concurrently with the wait/poll loop below. Readers run to
+        // EOF, which naturally occurs once the child exits (or is killed) and its
+        // pipe ends close — they never block the timeout path.
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
 
-    let stdout_reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stdout_pipe {
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stderr_pipe {
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        buf
-    });
+        let stdout_reader = thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stdout_pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stderr_pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        });
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let poll_interval = Duration::from_millis(100);
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let poll_interval = Duration::from_millis(100);
 
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    #[cfg(unix)]
-                    {
-                        // POSIX kill accepts a negative PID to signal the
-                        // process group created above. This leaves the
-                        // daemon's own group untouched.
-                        unsafe {
-                            unix_signals::kill(-(child.id() as unix_signals::Pid), unix_signals::SIGKILL);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        #[cfg(unix)]
+                        {
+                            // POSIX kill accepts a negative PID to signal the
+                            // process group created above. This leaves the
+                            // daemon's own group untouched.
+                            unsafe {
+                                unix_signals::kill(
+                                    -(child.id() as unix_signals::Pid),
+                                    unix_signals::SIGKILL,
+                                );
+                            }
                         }
+                        #[cfg(not(unix))]
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break Err(DaemonError::Timeout(format!(
+                            "{cmd} exceeded {timeout_secs}s timeout"
+                        )));
                     }
-                    #[cfg(not(unix))]
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(DaemonError::Timeout(format!(
-                        "{cmd} exceeded {timeout_secs}s timeout"
-                    )));
+                    std::thread::sleep(poll_interval);
                 }
-                std::thread::sleep(poll_interval);
+                Err(e) => {
+                    break Err(DaemonError::Tool {
+                        tool: cmd.to_string(),
+                        rc: -1,
+                        stderr: format!("try_wait failed: {e}"),
+                    });
+                }
             }
-            Err(e) => {
-                break Err(DaemonError::Tool {
-                    tool: cmd.to_string(),
-                    rc: -1,
-                    stderr: format!("try_wait failed: {e}"),
-                });
-            }
+        };
+
+        // Join the readers regardless of outcome: once the child has exited (or
+        // been killed) its pipe fds close, so `read_to_end` returns promptly.
+        let stdout_buf = stdout_reader.join().unwrap_or_default();
+        let stderr_buf = stderr_reader.join().unwrap_or_default();
+
+        let status = status?;
+
+        let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+        if status.success() {
+            return Ok(stdout);
         }
-    };
+        let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+        Err(DaemonError::Tool {
+            tool: cmd.to_string(),
+            rc: status.code().unwrap_or(-1),
+            stderr,
+        })
+    })();
 
-    // Join the readers regardless of outcome: once the child has exited (or
-    // been killed) its pipe fds close, so `read_to_end` returns promptly.
-    let stdout_buf = stdout_reader.join().unwrap_or_default();
-    let stderr_buf = stderr_reader.join().unwrap_or_default();
-
-    let status = status?;
-
-    let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
-    if status.success() {
-        return Ok(stdout);
-    }
-    let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
-    Err(DaemonError::Tool {
-        tool: cmd.to_string(),
-        rc: status.code().unwrap_or(-1),
-        stderr,
-    })
+    crate::gh_circuit_breaker::record_result(cmd, args, &res);
+    res
 }
 
 #[cfg(test)]
@@ -1488,7 +1588,14 @@ mod tests {
             .trim()
             .to_owned();
         let pid: unix_signals::Pid = pid.parse().expect("descendant PID must be numeric");
-        let is_alive = process_is_live(pid);
+        let mut is_alive = true;
+        for _ in 0..10 {
+            is_alive = process_is_live(pid);
+            if !is_alive {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         if is_alive {
             unsafe {
                 unix_signals::kill(pid, unix_signals::SIGKILL);
@@ -1619,19 +1726,14 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_tool_in_dir_sets_child_cwd() {
-        let tmp = std::env::temp_dir().join(format!(
-            "afd_run_tool_in_dir_{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("afd_run_tool_in_dir_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         // Run `pwd` in the tmp dir — if `current_dir` is honored, the output
         // is the canonicalized tmp path; if it is dropped, we get the daemon's
         // cwd which is something else under `cargo test`.
         let out = run_tool_in_dir("pwd", &[], tmp.to_str().unwrap(), 5).unwrap();
         assert!(
-            std::path::Path::new(out.trim())
-                .canonicalize()
-                .unwrap()
+            std::path::Path::new(out.trim()).canonicalize().unwrap()
                 == std::path::Path::new(tmp.to_str().unwrap())
                     .canonicalize()
                     .unwrap(),
@@ -1681,7 +1783,8 @@ mod tests {
 
     #[test]
     fn cwd_guard_fails_closed_when_paths_differ() {
-        let expected = std::env::temp_dir().join(format!("afd_cwd_expected_{}", std::process::id()));
+        let expected =
+            std::env::temp_dir().join(format!("afd_cwd_expected_{}", std::process::id()));
         let actual = std::env::temp_dir().join(format!("afd_cwd_actual_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&expected);
         let _ = std::fs::remove_dir_all(&actual);
@@ -1689,7 +1792,10 @@ mod tests {
         std::fs::create_dir_all(&actual).unwrap();
         let err = check_cwd_guard(Some(&expected), &actual).unwrap_err();
         match err {
-            DaemonError::WorktreeCwdMismatch { expected: e, actual: a } => {
+            DaemonError::WorktreeCwdMismatch {
+                expected: e,
+                actual: a,
+            } => {
                 assert!(e.contains("afd_cwd_expected"));
                 assert!(a.contains("afd_cwd_actual"));
             }

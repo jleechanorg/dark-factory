@@ -7,6 +7,8 @@ from __future__ import annotations
 import pathlib
 import sys
 
+import pytest
+
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -18,6 +20,19 @@ from runner.engine import run  # noqa: E402
 from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.healer import report  # noqa: E402
 from runner.parser import parse  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _stub_fail_open_web_advice(monkeypatch):
+    """Keep engine smoke tests independent of live advisory transports."""
+    def fake_web_advice(node, ctx):
+        return Result(
+            outcome="success",
+            output="web_advice fixture: fail-open advisory skipped",
+            metadata={"web_advice_outcome": "fixture_skipped"},
+        )
+
+    monkeypatch.setitem(TYPE_REGISTRY, "web_advice", fake_web_advice)
 
 
 def test_holdout_missing_feature_handoff_reaches_fix_prompt(tmp_path):
@@ -53,12 +68,18 @@ def test_gate_echo_seeded_outcome(monkeypatch):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("gates.dot"))
+    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
-    ctx.state["gate_skeptic.outcome"] = "success"
-    ctx.state["adversarial_reviewer.outcome"] = "success"
-    ctx.state["gate_es.outcome"] = "success"
-    ctx.state["gate_er.outcome"] = "success"
-    ctx.state["gate_cs.outcome"] = "success"
+    ctx.state.update(
+        {
+            "_df_controller_fixture": "cold-review-v1",
+            "gate_skeptic.outcome": "success",
+            "adversarial_reviewer.outcome": "success",
+            "gate_es.outcome": "success",
+            "gate_er.outcome": "success",
+            "gate_cs.outcome": "success",
+        }
+    )
 
     history = run(g, ctx, max_steps=20)
     nodes = [r.node for r in history]
@@ -73,6 +94,7 @@ def test_gate_echo_seeded_outcome(monkeypatch):
         "gate_es",
         "gate_er",
         "gate_cs",
+        "web_advice",
         "exit",
     ]
     assert history[-1].outcome == "success"
@@ -84,9 +106,11 @@ def test_cxdb_records_steps(tmp_path, monkeypatch):
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
+    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)
     ctx.state.update(
         {
+            "_df_controller_fixture": "cold-review-v1",
             "gate_skeptic.outcome": "success",
             "adversarial_reviewer.outcome": "success",
             "gate_es.outcome": "success",
@@ -111,6 +135,7 @@ def test_cxdb_records_steps(tmp_path, monkeypatch):
         "gate_es",
         "gate_er",
         "gate_cs",
+        "web_advice",
         "exit",
         "__run_end__",
     ]
@@ -138,7 +163,9 @@ def test_healer_reports_gate_infra_errors(tmp_path, monkeypatch):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("gates.dot"))
+    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=tmp_path / "cxdb.sqlite")
+    ctx.state["_df_controller_fixture"] = "cold-review-v1"
     ctx.state["gate_skeptic.outcome"] = "success"
     ctx.state["adversarial_reviewer.outcome"] = "success"
     ctx.state["gate_es.outcome"] = "success"
@@ -158,9 +185,11 @@ def test_healer_no_failures(tmp_path, monkeypatch):
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     db_path = tmp_path / "cxdb.sqlite"
     g = parse(_pipeline("gates.dot"))
+    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
     ctx = Context(goal="t", workdir=ROOT, backend="echo", cxdb_path=db_path)
     ctx.state.update(
         {
+            "_df_controller_fixture": "cold-review-v1",
             "gate_skeptic.outcome": "success",
             "adversarial_reviewer.outcome": "success",
             "gate_es.outcome": "success",

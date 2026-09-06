@@ -63,12 +63,14 @@ the full empirical distribution and the citation.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import pathlib
 import re
-import signal
 import shutil
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -77,7 +79,9 @@ from typing import TYPE_CHECKING
 
 import runner.handlers as _handlers_shim
 
+from . import review_snapshot, target_locator
 from .handler_core import Result
+from .handler_render import ReviewPromptRenderError
 
 if TYPE_CHECKING:
     from .parser import Node
@@ -122,13 +126,21 @@ class _ShadowCodexReview:
 
 
 def _shadow_review_enabled(node: "Node", ctx: "Context", backend: str) -> bool:
-    """True when a review node should get a parallel plain-Codex check."""
+    """True when a review node should get a parallel plain-Codex check.
+
+    Disabled for verdict-gated (fresh, D1) reviewer nodes: `_shadow_review_prompt`
+    embeds `ctx.goal` directly and has not been migrated to the static-prompt
+    + runner-minted-envelope contract, so it is disabled for fresh reviewers
+    rather than risk a goal-authority leak (design "Goal excision" item 5).
+    """
     raw = node.attrs.get("shadow_codex_review", ctx.state.get("_df_shadow_codex_review", "false"))
     if isinstance(raw, str) and raw.strip().lower() in {"false", "0", "no", "off"}:
         return False
     if raw is False:
         return False
     if backend in {"echo", "mock_llm"}:
+        return False
+    if str(node.attrs.get("verdict_gate", "false")).strip().lower() in {"true", "1", "yes", "on"}:
         return False
     return str(node.attrs.get("class", "")).strip().lower() == "review"
 
@@ -486,11 +498,176 @@ def _capture_changed_files(workdir: "Path | str | None") -> str:
     return "\n".join(f"- {f}" for f in sorted(files))
 
 
-def _stash_diff(node: "Node", ctx: "Context") -> None:
+def _checkpoint_dirty_state(workdir: pathlib.Path) -> bool:
+    """Commit any dirty tracked/untracked worker state as a factory checkpoint
+    commit before minting (design "Runner changes" item 1): a
+    ``git-range://base..HEAD`` pin would otherwise omit uncommitted worker
+    edits and the reviewer would review pre-worker bytes. Returns True if the
+    workdir ends up clean (either already clean, or successfully committed).
+    """
+    status = subprocess.run(
+        ["git", "-C", str(workdir), "status", "--porcelain"],
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    if status.returncode != 0:
+        return False
+    if not status.stdout.strip():
+        return True
+    add = subprocess.run(
+        ["git", "-C", str(workdir), "add", "-A"],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    if add.returncode != 0:
+        return False
+    commit = subprocess.run(
+        ["git", "-C", str(workdir), "commit", "-q", "-m", "factory: checkpoint worker state for review pin"],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    return commit.returncode == 0
+
+
+_MINT_REVIEW_TARGET_STATE_KEY = "_df_mint_review_target"
+
+
+def _mint_review_target_enabled(ctx: "Context") -> bool:
+    """Opt-in gate (safety, not spec): minting mutates the workdir (checkpoint
+    commit) whenever it runs, so it must never fire for pipelines that never
+    asked for the fresh-reviewer contract — that would silently auto-commit
+    an operator's or a test's unrelated dirty tree. ``__main__.py`` sets
+    ``ctx.state[_MINT_REVIEW_TARGET_STATE_KEY] = "true"`` only when the
+    executing graph actually contains a verdict-gated review-class node.
+    """
+    raw = ctx.state.get(_MINT_REVIEW_TARGET_STATE_KEY, "false")
+    return str(raw).strip().lower() in {"true", "1", "yes", "on"}
+
+
+def _mint_post_worker_target(node: "Node", ctx: "Context", workdir: "Path | str | None") -> bool:
+    """Checkpoint dirty worker state, then mint/re-mint the review target
+    locator and intent envelope into ``ctx.state`` (D2/D3/D8a).
+
+    Returns ``True`` when minting was not required (disabled) or succeeded;
+    ``False`` when minting was required (the opt-in gate is active) but
+    could not produce a fresh target for this workdir state — the caller
+    (``_stash_diff`` -> ``_codergen``'s ``_finalize``) must fail that visit
+    closed rather than let ``ctx.state["target"]`` stay unset/stale and let
+    a fresh reviewer either render the "(no target minted)" placeholder or
+    review a superseded prior pin (D3/D8a: every reviewer visit must see the
+    pin minted after the immediately preceding worker visit, never a stale
+    one).
+    """
+    if not _mint_review_target_enabled(ctx):
+        return True
+    if not workdir:
+        return False
+    wd_path = pathlib.Path(str(workdir))
+    if not wd_path.is_absolute() or ".." in wd_path.parts or not wd_path.is_dir():
+        return False
+    # Captured BEFORE `_checkpoint_dirty_state` moves HEAD forward, so the
+    # first mint's base freezes the pre-checkpoint HEAD (external-review
+    # CRITICAL-1 fix): calling `mint_from_workdir(wd_path)` with no
+    # `base_sha` after the checkpoint would compute HEAD a second time —
+    # now POST-checkpoint — making base == head an ALWAYS-EMPTY range that
+    # excludes the very commit the checkpoint just created for the worker's
+    # dirty edits.
+    pre_checkpoint_head = target_locator._git_head_sha(wd_path)
+    if pre_checkpoint_head is None:
+        return False  # not a git repo (or git unavailable) — v1 auto-mint is git-only
+    if not _checkpoint_dirty_state(wd_path):
+        return False
+
+    base_sha = ctx.state.get("_target_base_sha")
+    try:
+        if not base_sha:
+            # `pre_checkpoint_head` above is read AFTER the worker backend
+            # has already returned — a self-committing coder (every real
+            # codex/claude worker) moves HEAD forward as part of finishing
+            # its own task, so by the time this function runs it is already
+            # the worker's own commit, not the true pre-worker base. Prefer
+            # `_pre_worker_head`, captured by `_codergen` immediately before
+            # dispatching to the backend (the only point in the flow that
+            # runs before ANY worker action, committed or not).
+            pre_worker_head = ctx.state.pop("_pre_worker_head", None)
+            base_sha = (pre_worker_head or pre_checkpoint_head).lower()
+            locator = target_locator.mint_from_workdir(wd_path, base_sha=base_sha)
+            ctx.state["_target_base_sha"] = base_sha
+        else:
+            prior = ctx.state.get("target")
+            if prior:
+                try:
+                    prior_locator = target_locator.parse(prior)
+                    locator = target_locator.remint(prior_locator, wd_path)
+                except target_locator.TargetLocatorError:
+                    locator = target_locator.mint_from_workdir(wd_path, base_sha=base_sha)
+            else:
+                locator = target_locator.mint_from_workdir(wd_path, base_sha=base_sha)
+    except target_locator.TargetLocatorError:
+        return False
+
+    ctx.state["target"] = locator.canonical
+    chain_raw = ctx.state.get("_target_pin_chain")
+    try:
+        chain = json.loads(chain_raw) if chain_raw else []
+    except (TypeError, ValueError):
+        chain = []
+    chain.append(locator.canonical)
+    ctx.state["_target_pin_chain"] = json.dumps(chain)
+
+    if "intent" not in ctx.state:
+        intent_text = ctx.goal.strip() if ctx.goal and ctx.goal.strip() else "(none — target-mode verification run)"
+        ctx.state["intent"] = base64.b64encode(intent_text.encode("utf-8")).decode("ascii")
+    return True
+
+
+_TARGET_MODE_STATE_KEY = "_df_target_mode"
+
+
+def _current_target_pin_chain_error(ctx: "Context") -> "str | None":
+    """D3/D8a defense-in-depth (external-review finding): before a
+    verdict-gated reviewer visit launches, verify ``ctx.state["target"]`` is
+    actually the pin minted for the CURRENT worker visit, not a stale one
+    left behind by a failed re-mint. Returns ``None`` when the target is
+    current, else a human-readable reason to fail the visit closed.
+
+    Task mode always mints through ``_mint_post_worker_target``, which sets
+    ``target`` and appends to ``_target_pin_chain`` atomically — so the last
+    chain entry must equal the current target. Target mode (``--target``,
+    reviewer-first entry) sets ``target`` directly from CLI resolution and
+    never touches the pin chain, so it is exempt from the chain check but
+    still requires a non-empty target.
+    """
+    target_raw = str(ctx.state.get("target") or "").strip()
+    target_mode = str(ctx.state.get(_TARGET_MODE_STATE_KEY, "false")).strip().lower() in {
+        "true", "1", "yes", "on",
+    }
+    if target_mode:
+        if not target_raw:
+            return "target-mode run has no resolved review target"
+        return None
+    if not target_raw:
+        return "no review target has been minted for this worker visit"
+    chain_raw = ctx.state.get("_target_pin_chain")
+    try:
+        chain = json.loads(chain_raw) if chain_raw else []
+    except (TypeError, ValueError):
+        chain = []
+    if not chain or chain[-1] != target_raw:
+        return "review target is stale: it does not match the last minted pin-chain entry"
+    return None
+
+
+def _stash_diff(node: "Node", ctx: "Context") -> bool:
     """Stash the captured diff and changed files into ``ctx.state`` for reviewer prompts.
 
     Writes both ``ctx.state["<node.name>.diff"]`` and ``ctx.state["_last_diff"]``,
     as well as ``ctx.state["<node.name>.changed_files"]`` and ``ctx.state["_last_changed_files"]``.
+
+    Also mints/re-mints the review target locator + intent envelope (D2/D3/
+    D8a) — this runs exactly on worker-success paths (never for the
+    verdict-gated reviewer node, which does not call ``_stash_diff``).
+
+    Returns the mint result (``_mint_post_worker_target``'s return value) so
+    callers can fail this visit closed on a mint failure rather than
+    silently reporting success with a stale/missing target.
     """
     workdir = _codergen_workdir(ctx)
     diff = _capture_diff(workdir)
@@ -500,6 +677,15 @@ def _stash_diff(node: "Node", ctx: "Context") -> None:
     changed_files = _capture_changed_files(workdir)
     ctx.state[f"{node.name}.changed_files"] = changed_files
     ctx.state["_last_changed_files"] = changed_files
+
+    mint_ok = _mint_post_worker_target(node, ctx, workdir)
+    if not mint_ok:
+        # Consumed and cleared by `_codergen`'s `_finalize` closure for this
+        # same visit (fail closed: a mint failure downgrades this "success"
+        # visit to "failure" rather than leaving a stale/missing target for
+        # the next reviewer visit to silently run against).
+        ctx.state["_target_mint_failed"] = "true"
+    return mint_ok
 
 
 def _codergen_workdir(ctx: "Context") -> "Path | str | None":
@@ -517,6 +703,159 @@ def _codergen_workdir(ctx: "Context") -> "Path | str | None":
         except AttributeError:
             return None
 
+
+def _tracked_state(workdir: "Path | str | None") -> str | None:
+    """Hash HEAD plus staged and unstaged tracked changes, ignoring untracked files."""
+    if not workdir:
+        return None
+    path = pathlib.Path(str(workdir))
+    if not path.is_absolute() or ".." in path.parts or not path.is_dir():
+        return None
+    outputs: list[str] = []
+    commands = (
+        ("rev-parse", "HEAD"),
+        ("diff", "--binary"),
+        ("diff", "--cached", "--binary"),
+    )
+    for tail in commands:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(path), *tail],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0:
+            return None
+        outputs.append(proc.stdout)
+    return hashlib.sha256("\0".join(outputs).encode("utf-8")).hexdigest()
+
+
+_TYPED_FINDINGS_KEYS = frozenset({"path", "claim", "required_fix"})
+_TYPED_FINDINGS_FENCE_RE = re.compile(r"```(?:json)?\s*(\[.*?\])\s*```", re.DOTALL)
+_TYPED_FINDINGS_BARE_RE = re.compile(r"\[\s*\{.*?\}\s*\]", re.DOTALL)
+
+
+def parse_typed_findings(text: str) -> list[dict] | None:
+    """Extract + schema-validate a JSON findings list from reviewer output
+    (design D8: ``{path, claim, required_fix}``). Returns ``None`` when no
+    valid findings list is present — the caller must degrade to the
+    "review did not produce valid findings" message, never relay raw prose.
+    """
+    if not text:
+        return None
+    fenced = _TYPED_FINDINGS_FENCE_RE.findall(text)
+    raw = fenced[-1] if fenced else None
+    if raw is None:
+        m = _TYPED_FINDINGS_BARE_RE.search(text)
+        raw = m.group(0) if m else None
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    findings: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            return None
+        if not _TYPED_FINDINGS_KEYS.issubset(item.keys()):
+            return None
+        values = {k: item.get(k) for k in _TYPED_FINDINGS_KEYS}
+        if not all(isinstance(v, str) and v.strip() for v in values.values()):
+            return None
+        findings.append(values)
+    return findings or None
+
+
+_COMPLETENESS_RE = re.compile(r"^Review completeness:\s*(COMPLETE|UNFINISHED)\s*$", re.MULTILINE)
+
+
+def parse_review_completeness(text: str) -> str:
+    """Parse the machine-checked ``Review completeness: COMPLETE|UNFINISHED``
+    marker (design D7, v3.1 delta). Returns ``"complete"``, ``"unfinished"``,
+    or ``"unknown"`` (marker missing/malformed) — the caller treats anything
+    but ``"complete"`` as failing a PASS verdict (fail closed: an UNFINISHED
+    review or a missing marker never counts as a validated PASS).
+    """
+    matches = _COMPLETENESS_RE.findall(text or "")
+    if not matches:
+        return "unknown"
+    return matches[-1].lower()
+
+
+_TERMINAL_VERDICT_LINE_RE = re.compile(r"^Verdict: (?:PASS|FAIL)$", re.MULTILINE)
+_COMPLETENESS_LINE_RE = re.compile(r"^Review completeness: (?:COMPLETE|UNFINISHED)$", re.MULTILINE)
+
+
+def _verify_terminal_review_report(text: str) -> tuple[bool, str]:
+    """D1/D7 fail-closed (external-review CRITICAL-4, round 3): the reviewer
+    contract requires the transcript to END with exactly one valid
+    ``Verdict: PASS`` or ``Verdict: FAIL`` line (design item 7:
+    "the transcript ends with exactly one valid Verdict: PASS|FAIL line").
+    A verdict token appearing only mid-output — buried under later prose,
+    or duplicated — is not a terminal verdict, even though the permissive
+    last-marker-wins ``_parse_verdict`` scan (used broadly by other gate
+    node types) would still extract it. Same strictness for the
+    completeness marker: at most one occurrence, and it must appear
+    strictly before the verdict line when present.
+
+    Returns ``(True, "")`` when the transcript satisfies the terminal
+    contract; ``(False, <reason>)`` otherwise. Callers must treat a False
+    result as an untrusted/unparseable verdict (fail closed) regardless of
+    what ``_parse_verdict``/``parse_review_completeness`` found.
+    """
+    body = text or ""
+    lines = body.splitlines()
+    last_nonblank = ""
+    for line in reversed(lines):
+        if line.strip():
+            last_nonblank = line.strip()
+            break
+    if not last_nonblank:
+        return False, "empty output"
+    # Completeness count/order is checked first so a report that gets the
+    # ordering wrong (e.g. the marker emitted after the verdict, itself
+    # already a terminal-line violation) surfaces the more specific reason.
+    verdict_matches = list(_TERMINAL_VERDICT_LINE_RE.finditer(body))
+    completeness_matches = list(_COMPLETENESS_LINE_RE.finditer(body))
+    if len(completeness_matches) > 1:
+        return False, "Review completeness marker appears more than once"
+    if completeness_matches and verdict_matches and (
+        completeness_matches[0].start() > verdict_matches[0].start()
+    ):
+        return False, "Review completeness marker must appear before the verdict line"
+    if not _TERMINAL_VERDICT_LINE_RE.fullmatch(last_nonblank):
+        return False, "last non-empty line is not an exact 'Verdict: PASS' or 'Verdict: FAIL' line"
+    if len(verdict_matches) != 1:
+        return False, f"expected exactly one Verdict: PASS|FAIL line, found {len(verdict_matches)}"
+    return True, ""
+
+
+def format_typed_findings_relay(raw_output: str) -> str:
+    """Build the worker-facing reviewer-failure relay (design D8): a
+    Base64-fenced typed-findings block marked as untrusted requirements to
+    independently verify, or a re-run-against-current-pin message when the
+    reviewer output does not contain a parseable findings list. Raw reviewer
+    prose never enters this return value.
+    """
+    findings = parse_typed_findings(raw_output)
+    if findings is None:
+        return "review did not produce valid findings; re-run against current pin"
+    encoded = base64.b64encode(
+        json.dumps(findings, sort_keys=True).encode("utf-8")
+    ).decode("ascii")
+    return (
+        "--- BEGIN REVIEWER FINDINGS (runner-relayed; Base64-encoded untrusted "
+        "requirements to verify before acting on) ---\n"
+        f"{encoded}\n"
+        "--- END REVIEWER FINDINGS ---"
+    )
 
 
 def _parse_commands_run_md(text: str) -> list[tuple[str, int]]:
@@ -590,7 +929,13 @@ def _stash_codergen_receipt(node: "Node", ctx: "Context") -> None:
         }
         for cmd, ec in parsed
     ]
-    ctx.state[f"{node.name}.structured_receipt"] = records
+    # `Context.state` is declared `dict[str, str]`, but `*.structured_receipt`
+    # keys intentionally store a `list[dict]` — an established, tested
+    # pattern consumed directly as a list by `handler_dispatch.py`'s
+    # `isinstance(v, list)` gate collector and `_check_structured_receipt`.
+    # Widening `Context.state`'s declared type is a repo-wide change outside
+    # this fix's scope; suppress the narrow, intentional mismatch here.
+    ctx.state[f"{node.name}.structured_receipt"] = records  # pyright: ignore[reportArgumentType]
 
 
 def _codergen(node: "Node", ctx: "Context") -> "Result":
@@ -600,15 +945,69 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
     runner workdir), substitutes `${goal}` and `${state.<key>}` placeholders,
     and dispatches to the configured backend.
     """
-    prompt_text = _handlers_shim._render_prompt(node, ctx)
+    try:
+        prompt_text = _handlers_shim._render_prompt(node, ctx)
+    except ReviewPromptRenderError as exc:
+        return Result(
+            outcome="failure",
+            output=f"reviewer prompt render aborted (fail closed): {exc}",
+            metadata={"review_render_aborted": "true"},
+        )
     backend = node.attrs.get("backend", node.attrs.get("model", ctx.backend))
     if isinstance(backend, bool):
         backend = ctx.backend
     backend = str(backend)
+    verdict_gate = str(node.attrs.get("verdict_gate", "false")).strip().lower() in {
+        "true", "1", "yes", "on",
+    }
+    # D3/D8a self-commit fix (external review, live-observed): capture the
+    # TRUE pre-worker HEAD here, before ANY backend dispatch — the only
+    # point in this function that runs before the worker has taken any
+    # action, committed or not. `_mint_post_worker_target` (called later,
+    # from `_stash_diff`, only after the backend call has returned) prefers
+    # this over recomputing HEAD at mint time, which would already reflect
+    # a self-committing coder's own commit and produce an always-empty
+    # base==head range. Only the FIRST mint of a run needs this (later
+    # visits reuse the frozen `_target_base_sha`), and only worker nodes
+    # ever mint, so skip the extra git call otherwise.
+    if (
+        not verdict_gate
+        and _mint_review_target_enabled(ctx)
+        and not ctx.state.get("_target_base_sha")
+    ):
+        _pre_dispatch_workdir = _codergen_workdir(ctx)
+        if _pre_dispatch_workdir:
+            _pre_head = target_locator._git_head_sha(
+                pathlib.Path(str(_pre_dispatch_workdir))
+            )
+            if _pre_head is not None:
+                ctx.state["_pre_worker_head"] = _pre_head
     _start_ts = time.monotonic()
     shadow_review = _start_shadow_codex_review(node, ctx, backend, prompt_text)
+    # Holder for a fresh-reviewer snapshot cleanup callback (design item 6):
+    # set by the verdict-gated codex branch below, popped and run exactly
+    # once here regardless of which return path is taken. Best-effort —
+    # cleanup failure is recorded in the result metadata, never raised.
+    _snapshot_cleanup_holder: list = [None]
 
     def _finalize(result: "Result") -> "Result":
+        # D3/D8a fail-closed (external-review finding): `_stash_diff` ->
+        # `_mint_post_worker_target` is best-effort and cannot raise from
+        # deep inside a success path, so it signals failure via this state
+        # flag instead. Consume it here — the single choke point for every
+        # return path in this function — so a mint failure downgrades an
+        # otherwise-"success" worker visit to "failure" rather than leaving
+        # `ctx.state["target"]` stale/missing for the next reviewer visit.
+        if ctx.state.pop("_target_mint_failed", None) == "true" and result.outcome == "success":
+            result.outcome = "failure"
+            result.metadata["target_mint_failed"] = "true"
+            note = "review target mint failed after a successful worker visit (fail closed)"
+            result.output = f"{result.output}\n\n{note}" if result.output else note
+        cleanup = _snapshot_cleanup_holder[0]
+        if cleanup is not None:
+            _snapshot_cleanup_holder[0] = None
+            if not cleanup():
+                result.metadata["snapshot_cleanup_failed"] = "true"
         return _finish_shadow_codex_review(result, shadow_review, node, ctx)
 
     if backend == "echo":
@@ -875,8 +1274,11 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
         args = _handlers_shim._sandboxed_args_for_workdir(claude_cmd, ctx.workdir)
         if args is None:
             return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
+        # Bound before the try so the `except Exception` handler below (which
+        # reports `timeout_s` in its metadata) can never hit an
+        # UnboundLocalError if `_coerce_timeout` itself were to raise.
+        timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
         try:
-            timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
             proc = subprocess.run(
                 args,
                 cwd=ctx.workdir,
@@ -921,27 +1323,92 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
             _stash_codergen_receipt(node, ctx)
         return _finalize(Result(outcome=outcome, output=output, metadata=meta))
     elif backend == "codex":
+        review_snap: "review_snapshot.ReviewSnapshot | None" = None
+        if verdict_gate:
+            pin_chain_error = _current_target_pin_chain_error(ctx)
+            if pin_chain_error is not None:
+                return _finalize(Result(
+                    outcome="error",
+                    output=f"fresh reviewer target rejected (fail closed): {pin_chain_error}",
+                    metadata={
+                        "verdict": "unknown",
+                        "fresh_session": "true",
+                        "target_pin_chain_mismatch": "true",
+                    },
+                ))
+            try:
+                review_snap = review_snapshot.create_review_snapshot(ctx.state.get("target", ""))
+            except review_snapshot.ReviewSnapshotError as exc:
+                return _finalize(Result(
+                    outcome="error",
+                    output=f"fresh reviewer snapshot could not be materialized: {exc}",
+                    metadata={"verdict": "unknown", "fresh_session": "true"},
+                ))
+            codex_workdir = review_snap.path
+            _snapshot_cleanup_holder[0] = lambda: review_snapshot.cleanup_review_snapshot(review_snap)
+        else:
+            codex_workdir = ctx.workdir
+        if codex_workdir is None:
+            return _finalize(Result(
+                outcome="error",
+                output="fresh reviewer target must be a real, non-symlinked directory",
+                metadata={"verdict": "unknown", "fresh_session": "true"},
+            ))
+        tracked_before = _tracked_state(codex_workdir) if verdict_gate else None
+        if verdict_gate and tracked_before is None:
+            return _finalize(Result(
+                outcome="error",
+                output="fresh reviewer could not fingerprint the tracked repository state",
+                metadata={"verdict": "unknown", "fresh_session": "true"},
+            ))
+        codex_command = ["codex", "exec"]
+        if str(node.attrs.get("fresh_session", "false")).strip().lower() in {
+            "true", "1", "yes", "on",
+        }:
+            codex_command.append("--ephemeral")
+        codex_command.extend(["--yolo", "--skip-git-repo-check", prompt_text])
         args = _handlers_shim._sandboxed_args_for_workdir(
-            ["codex", "exec", "--yolo", "--skip-git-repo-check", prompt_text],
-            ctx.workdir,
+            codex_command,
+            codex_workdir,
         )
         if args is None:
-            return _finalize(Result(outcome="failure", output="sandbox-exec unavailable"))
+            return _finalize(Result(
+                outcome="error" if verdict_gate else "failure",
+                output="sandbox-exec unavailable",
+            ))
+        if review_snap is not None and not review_snapshot.verify_review_snapshot_pin(review_snap):
+            # TOCTOU (design item 6): re-check the snapshot's pinned commit
+            # immediately before launching the reviewer, not only at
+            # creation time. A mismatch aborts the visit as a failure —
+            # cleanup still runs via the `_finalize` holder above.
+            return _finalize(Result(
+                outcome="failure",
+                output="fresh reviewer snapshot pin mismatch detected before launch (TOCTOU)",
+                metadata={"verdict": "unknown", "fresh_session": "true", "snapshot_pin_mismatch": "true"},
+            ))
         timeout_s = _handlers_shim._coerce_timeout(node.attrs.get("timeout", "1800"), 1800)
         try:
             proc = subprocess.run(
                 args,
-                cwd=ctx.workdir,
+                cwd=codex_workdir,
                 capture_output=True,
                 text=True,
                 timeout=timeout_s,
                 check=False,
-                input="",
+                # Issue #827 Defect 2: `input=""` still attaches a PIPE for
+                # stdin that Python must close via `communicate()`; codex
+                # v0.147.0 printed "Reading additional input from stdin..."
+                # and blocked on it until this node's own timeout fired.
+                # `stdin=subprocess.DEVNULL` is the same unambiguous,
+                # pipe-free sentinel already used by the `claude` backend
+                # branch above — mirror it here instead of relying on an
+                # empty-string PIPE close.
+                stdin=subprocess.DEVNULL,
                 env=_handlers_shim._sanitized_env(),
             )
         except subprocess.TimeoutExpired as exc:
             return _finalize(Result(
-                outcome="failure",
+                outcome="error" if verdict_gate else "failure",
                 output=_subprocess_output(exc.stdout, exc.stderr)
                 or f"codex backend timed out after {timeout_s} seconds",
                 metadata={
@@ -1066,7 +1533,78 @@ def _codergen(node: "Node", ctx: "Context") -> "Result":
     metrics = _handlers_shim._codergen_metrics(proc.stdout, proc.stderr, wall_ms)
     meta = {"returncode": str(proc.returncode)}
     meta.update({k: ("" if v is None else str(v)) for k, v in metrics.items()})
-    if outcome == "success":
+    if verdict_gate:
+        # Round-4 finding: `output` is stdout+stderr combined, and codex
+        # routinely writes to stderr (progress/warnings) even on a clean
+        # PASS. Feeding the combined text to the terminal-line-exact check
+        # made the appended "STDERR:" block permanently the last line,
+        # so a real terminal `Verdict: PASS` in stdout could never pass —
+        # fail-closed became fail-always. Verdict/terminal-report parsing
+        # must read the reviewer's actual transcript (stdout) only; `output`
+        # (combined) stays the Result/transcript value used everywhere else
+        # (relay, receipts, mutation notice).
+        stdout_only = proc.stdout
+        terminal_ok, terminal_reason = _verify_terminal_review_report(stdout_only)
+        verdict, parsed_outcome = _handlers_shim._parse_verdict(stdout_only, gate_strict=True)
+        if not terminal_ok:
+            # CRITICAL-4 (external review, round 3): the shared `_parse_verdict`
+            # scan is permissive by design (last marker anywhere wins, for
+            # gate node types that legitimately emit progress lines) — the
+            # fresh-reviewer contract is stricter (design item 7) and
+            # overrides that result to "unknown" whenever the transcript
+            # doesn't end in exactly one valid terminal verdict line.
+            verdict = "unknown"
+        tracked_after = _tracked_state(codex_workdir)
+        mutated = tracked_before is None or tracked_after is None or tracked_before != tracked_after
+        if proc.returncode != 0 or verdict == "unknown":
+            outcome = "error"
+        else:
+            outcome = parsed_outcome
+        completeness = "n/a"
+        if outcome == "success":
+            # D7 (v3.1 delta): PASS additionally requires the machine-checked
+            # `Review completeness: COMPLETE` line. UNFINISHED, or a missing/
+            # malformed marker, normalizes a PASS to failure (fail closed) —
+            # a reviewer that ran out of time cannot report a clean bill of
+            # health just by emitting `Verdict: PASS`.
+            # Round-5 finding: mirror the stdout-only fix for the verdict
+            # itself — the combined `output` (stdout+stderr) could let a
+            # stray "Review completeness: COMPLETE"-shaped string in stderr
+            # satisfy this check even though the reviewer's real stdout
+            # transcript never emitted it.
+            completeness = parse_review_completeness(stdout_only)
+            if completeness != "complete":
+                outcome = "failure"
+        meta.update(
+            {
+                "verdict": verdict,
+                "fresh_session": "true",
+                "review_workdir": str(codex_workdir),
+                "reviewer_mutated_tracked_files": str(mutated).lower(),
+                "review_completeness": completeness,
+                "terminal_report_valid": str(terminal_ok).lower(),
+            }
+        )
+        if not terminal_ok:
+            meta["terminal_report_invalid_reason"] = terminal_reason
+        if mutated:
+            outcome = "error"
+            output = output.rstrip() + "\n\nReviewer changed tracked files; changes must be made by the coder.\n"
+        if outcome != "success":
+            # D8: raw reviewer prose never crosses to the worker prompt.
+            # `_last_review_feedback = attempt.output` (engine_run.py) reads
+            # this same `output`, so replacing it here is the single choke
+            # point that keeps the worker-facing relay typed and fenced.
+            meta["reviewer_raw_output_relayed"] = "false"
+            # Only relay findings for a genuinely valid, terminal FAIL from
+            # a clean, unmutated run — nonzero exit or tracked-file mutation
+            # forces outcome="error" without clearing verdict, so outcome
+            # must be checked too, not just terminal_ok/verdict.
+            if outcome == "failure" and terminal_ok and verdict == "fail":
+                output = format_typed_findings_relay(output)
+            else:
+                output = "review did not produce valid findings; re-run against current pin"
+    elif outcome == "success":
         _stash_diff(node, ctx)
         _stash_codergen_receipt(node, ctx)
     return _finalize(Result(

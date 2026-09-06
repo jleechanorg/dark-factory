@@ -85,9 +85,8 @@ fn feedback_hash(text: &str) -> String {
 ///     rotate), so the breaker should still emit
 ///     `CIRCUIT_BREAKER_ESCALATED` and return
 ///     `RerollOutcome::Held(CIRCUIT_BREAKER_PARK_REASON)`.
-///
-/// `expect_spec_fire` is the independently assigned semantic ground truth
-/// (matches the spec §4.2.6 "same semantic rejection reason" language).
+///   - `expect_spec_fire`: the independently assigned semantic ground truth
+///     (matches the spec §4.2.6 "same semantic rejection reason" language).
 struct CbCase {
     id: &'static str,
     group: &'static str,
@@ -350,6 +349,7 @@ fn run_cb_case(case: &CbCase, spec_dir: &std::path::Path, llm: &dyn Llm) -> CbRe
         pr_number: Some(900),
         branch: Some(branch),
         session_id: None,
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
             pre_session_head_sha: None,

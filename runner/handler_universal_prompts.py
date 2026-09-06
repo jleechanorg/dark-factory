@@ -458,31 +458,6 @@ chance to find a hidden failure, not a checkbox to tick off:
      or default behavior compared to the existing code or the spec it claims to fulfill?
    - Does the diff remove, rename, or repurpose a function/symbol that other files in the
      repo reference (grep before accepting)?
-
-Provide a detailed review report listing:
-- A brief summary of scope.
-- A bulleted list of any BLOCKING findings — each with file path, line number, what is
-  claimed, what you actually observed, and why it fails adversarial scrutiny.
-- A bulleted list of non-blocking concerns (still useful but not merge-blocking).
-- Explicit statement of whether the implementer's claim of completeness is supported by
-  the evidence in the repo.
-
-Before the final verdict, include a section titled `## Coder Handoff` with:
-- Summary: one or two sentences describing what you actually verified.
-- Blocking findings: each blocker with file/path, line or artifact reference, and why it fails.
-- Evidence checked: exact commands, logs, screenshots, videos, URLs, or files you inspected.
-- Required fix: concrete implementation steps the coder should take next.
-- Verification to rerun: exact commands or artifacts that should prove the fix.
-
-If there are no blockers, still include the section and state `Blocking findings: none`.
-Do NOT default to pass. Pass only when you have actively probed and confirmed.
-
-CRITICAL FORMATTING INSTRUCTIONS:
-1. You MUST include a binding verification line:
-   head_sha: {expected_sha}
-
-2. You MUST conclude your review with:
-   verdict: <pass|fail>
 """
 
 
@@ -490,10 +465,16 @@ def _gate_skeptic(node: "Node", ctx: "Context") -> "Result":
     # 1. Handle echo/mock_llm backend
     if ctx.backend in ("echo", "mock_llm"):
         hint = ctx.state.get(f"{node.name}.outcome", "success")
+        echo_metadata = {"slash_command": "skeptic", "verdict": "echo:" + hint}
+        if hint == "inconclusive":
+            # Mirror the real handler's issue #827 Defect 1 contract so
+            # echo-backend graph tests can exercise gates.dot's
+            # `no_verdict`-keyed routing without a real reviewer call.
+            echo_metadata["no_verdict"] = "true"
         return Result(
             outcome=hint,
             output=f"echo gate skeptic: pre-seeded {hint}",
-            metadata={"slash_command": "skeptic", "verdict": "echo:" + hint},
+            metadata=echo_metadata,
         )
 
     # 2. Get expected SHA
@@ -507,6 +488,8 @@ def _gate_skeptic(node: "Node", ctx: "Context") -> "Result":
 
     # 3. Load rules using RuleLoader
     import os
+    import re
+    import subprocess
     from pathlib import Path
     
     df_home = Path(os.environ.get("DARK_FACTORY_HOME", "/home/jleechan/projects/dark-factory"))
@@ -518,6 +501,7 @@ def _gate_skeptic(node: "Node", ctx: "Context") -> "Result":
     from runner.dispatcher import VerifierDispatcher
     from runner.consensus import ConsensusAggregator
     from runner.skeptic_gate_cli import get_implementation_identity
+    from runner.skeptic_gate import extract_implementation_identity_from_commit
     
     loader = RuleLoader(global_dir, local_dir)
     rules = loader.load_rules()
@@ -535,8 +519,7 @@ def _gate_skeptic(node: "Node", ctx: "Context") -> "Result":
             )
         ]
     
-    # 4. Resolve diff and changed files using ScmProvider
-    scm = LocalGitScm(ctx.workdir)
+    # 4. Resolve PR number
     pr_num = 0
     if ctx.git_ctx and ctx.git_ctx.branch_slug.startswith("pr-"):
         try:
@@ -550,7 +533,55 @@ def _gate_skeptic(node: "Node", ctx: "Context") -> "Result":
                 pr_num = int(pr_env)
             except Exception:
                 pass
-                
+    if not pr_num:
+        for k in ("pr_number", "pr"):
+            val = ctx.state.get(k)
+            if val is not None:
+                try:
+                    pr_num = int(val)
+                    if pr_num:
+                        break
+                except Exception:
+                    pass
+    if not pr_num:
+        try:
+            gh_proc = subprocess.run(
+                ["gh", "pr", "view", "--json", "number", "-q", ".number"],
+                cwd=str(ctx.workdir),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if gh_proc.returncode == 0 and gh_proc.stdout.strip().isdigit():
+                pr_num = int(gh_proc.stdout.strip())
+        except Exception:
+            pass
+
+    # 5. Resolve repo
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not repo:
+        try:
+            url_proc = subprocess.run(
+                ["git", "config", "--get", "remote.origin.url"],
+                cwd=str(ctx.workdir),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if url_proc.returncode == 0 and url_proc.stdout.strip():
+                url = url_proc.stdout.strip()
+                m = re.search(r"github\.com[:/]([^/]+/[^/.]+?)(?:\.git)?$", url)
+                if m:
+                    repo = m.group(1)
+        except Exception:
+            pass
+    if not repo:
+        repo = "jleechanorg/dark-factory"
+
+    # 6. Resolve diff and changed files using ScmProvider
+    scm = LocalGitScm(ctx.workdir)
     target = f"PR:{pr_num}" if pr_num else "HEAD"
     
     try:
@@ -563,9 +594,28 @@ def _gate_skeptic(node: "Node", ctx: "Context") -> "Result":
             metadata={"slash_command": "skeptic", "verdict": "unknown", "scm_status": "failed"},
         )
 
-    # Determine implementation identity
-    repo = os.environ.get("GITHUB_REPOSITORY", "jleechanorg/dark-factory")
-    implementation_identity = get_implementation_identity(repo, pr_num, expected_sha) if pr_num else "unknown"
+    # 7. Determine implementation identity
+    implementation_identity = "unknown"
+    if pr_num:
+        try:
+            implementation_identity = get_implementation_identity(repo, pr_num, expected_sha)
+        except Exception:
+            implementation_identity = "unknown"
+
+    if not implementation_identity or implementation_identity == "unknown":
+        try:
+            subj_proc = subprocess.run(
+                ["git", "log", "-1", "--format=%s", expected_sha],
+                cwd=str(ctx.workdir),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if subj_proc.returncode == 0 and subj_proc.stdout.strip():
+                implementation_identity = extract_implementation_identity_from_commit(subj_proc.stdout.strip())
+        except Exception:
+            pass
 
     # Dispatch rules
     dispatcher = VerifierDispatcher()
@@ -579,10 +629,34 @@ def _gate_skeptic(node: "Node", ctx: "Context") -> "Result":
         results, repo, pr_num, expected_sha, expected_sha, implementation_identity
     )
     
-    outcome = "success" if verdict == "PASS" else "failure"
+    # Issue #827 Defect 1: a `None` verdict means no reviewer produced a
+    # parseable structured verdict (ConsensusAggregator.aggregate's
+    # `has_invalid` branch) — a distinct event from a reviewer having
+    # actually rejected the diff (verdict == "FAIL"). Conflating the two
+    # as `outcome="failure"` routed an absent verdict to the `fix` node,
+    # which has no real finding to act on. `outcome="inconclusive"` is
+    # already a first-class engine outcome token (see runner/_classify.py
+    # and runner/handler_verdict.py's `_VERDICT_NORMALIZE`) — reuse it here
+    # instead of inventing a new one.
+    #
+    # `runner.engine_run._run_single_node` normalizes every Result's
+    # `.outcome` through `_classify_outcome` before the graph ever sees it
+    # for edge routing (`_classify_outcome("inconclusive") == "failure"`,
+    # same bucket as a real rejection), so a `.dot` edge condition on the
+    # literal `outcome` value cannot distinguish the two. `metadata` is
+    # never touched by that normalization, so `no_verdict="true"` is the
+    # signal `pipelines/factory/gates.dot` actually routes on.
+    if verdict == "PASS":
+        outcome = "success"
+    elif verdict is None:
+        outcome = "inconclusive"
+    else:
+        outcome = "failure"
+    metadata = {"slash_command": "skeptic", "verdict": verdict}
+    if verdict is None:
+        metadata["no_verdict"] = "true"
     return Result(
         outcome=outcome,
         output=body,
-        metadata={"slash_command": "skeptic", "verdict": verdict},
+        metadata=metadata,
     )
-

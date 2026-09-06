@@ -237,3 +237,37 @@ def test_subprocess_fail_exit_code(tmp_path):
     assert proc.returncode == 2, f"returncode={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
     payload = json.loads(proc.stdout)
     assert payload["status"] == "fail"
+
+
+def test_require_holdouts_missing_feature():
+    result = preflight.preflight_check("echo", require_holdouts=True, feature=None)
+    assert result["status"] == "fail"
+    assert result["holdouts"]["ok"] is False
+    assert "feature name is required" in result["holdouts"]["error"]
+    assert preflight.main(["--backend", "echo", "--require-holdouts", "--json"]) == 2
+
+
+def test_require_holdouts_missing_scenarios(tmp_path, monkeypatch):
+    holdouts_dir = tmp_path / "holdouts_repo"
+    holdouts_dir.mkdir(parents=True)
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts_dir))
+
+    result = preflight.preflight_check("echo", require_holdouts=True, feature="missing_feature")
+    assert result["status"] == "fail"
+    assert result["holdouts"]["ok"] is False
+    assert "no holdout scenarios found" in result["holdouts"]["error"]
+    assert preflight.main(["--backend", "echo", "--require-holdouts", "--feature", "missing_feature", "--json"]) == 2
+
+
+def test_require_holdouts_present_scenarios(tmp_path, monkeypatch):
+    holdouts_dir = tmp_path / "holdouts_repo"
+    feature_dir = holdouts_dir / "holdouts" / "sample_feat"
+    feature_dir.mkdir(parents=True)
+    (feature_dir / "scenarios.yaml").write_text("scenarios:\n  - id: 1\n")
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts_dir))
+
+    result = preflight.preflight_check("echo", require_holdouts=True, feature="sample_feat")
+    assert result["status"] == "pass"
+    assert result["holdouts"]["ok"] is True
+    assert result["holdouts"]["error"] is None
+    assert preflight.main(["--backend", "echo", "--require-holdouts", "--feature", "sample_feat", "--json"]) == 0

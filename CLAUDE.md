@@ -6,11 +6,11 @@ execution_mode: none
 
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repository.
 
 ## Source material — read these to understand WHY this repo looks the way it does
 
-This repo is a working implementation of the **Attractor pattern** described by these three primary sources. If you're new to the repo, skim them first; the architecture choices below are downstream of them, not invented here.
+This repo is a working implementation of the **Attractor pattern** described by these primary sources (architecture choices are downstream of them, not invented here):
 
 - **StrongDM, AttractorBench** — <https://github.com/strongdm/attractorbench> — defines the benchmark: agents read a public natural-language spec; the conformance tests, mock LLM server, and scoring harness are generated locally and **intentionally excluded from the public repo to prevent training-data contamination**. We mirror that "spec in, evaluator out" split.
 - **jleechanorg AttractorBench fork** — <https://github.com/jleechanorg/attractorbench> — public fork used for local spec-validation experiments. The spec-validation benchmark copied into this repo lives at `benchmarks/attractor-spec-review/`.
@@ -23,7 +23,7 @@ The defining constraint is about **who** in the LLM DAG can read **what**, not a
 
 | Role | Sees | Does NOT see |
 |---|---|---|
-| **Implementing agent** — the *spawned coding agent under test* (the `codergen` worker spawned by a pipeline node: a Claude Code session, an AO worker, a `codex exec` invocation, etc.) | `specs/<feature>.md`, `prompts/`, the relevant `.dot` graph, its own worktree | `holdouts/`, `runner/evaluator.py`, the contents of any `_holdout/` test source. Reading these collapses the adversarial guarantee (the impl can pass tests by reading them, identical to AttractorBench's "don't ship the conformance tests" rule). |
+| **Implementing agent** — the *spawned coding agent under test* (e.g. Claude Code session, AO worker, `codex exec` invocation) | `specs/<feature>.md`, `prompts/`, the relevant `.dot` graph, its own worktree | `holdouts/`, `runner/evaluator.py`, `_holdout/` test sources (reading these collapses the adversarial guarantee, mirroring AttractorBench's "don't ship conformance tests" rule). |
 | **Evaluator agent** — runs the sealed evaluator at `$DARK_FACTORY_HOLDOUTS/evaluator/run.py` against the implementing agent's diff | `holdouts/`, `specs/`, the implementation diff | The implementing agent's chain-of-thought, prompt template internals, anything that would let it grade by inspecting the prompt rather than the artifact |
 | **Operator / human (you, the engineer using this repo)** | Everything — runner code, holdouts, evaluator, tests, CXDB logs, this file | Nothing structurally hidden; the discipline is to not paste holdout content into prompts that ship to the implementing agent |
 
@@ -90,39 +90,14 @@ to Linux for telemetry and operational control.
 # One-time install (uv-managed Python + venv + binaries on PATH)
 ./install.sh
 
-export DARK_FACTORY_HOME=~/projects/dark-factory   # set automatically by install.sh / bin/dark-factory
+export DARK_FACTORY_HOME=~/projects/dark-factory
 export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ## Common commands
 
-```bash
-# Smoke pipeline — echo backend, no LLM calls
-dark-factory --pipeline pipelines/factory/hello.dot --goal "smoke test" --backend echo
-
-# Full gated pipeline with CXDB recording (run from target repo cwd)
-dark-factory \
-  --pipeline pipelines/factory/gates.dot \
-  --goal "<feature description>" \
-  --backend ao \
-  --ao-agent antigravity \
-  --feature <feature_name> \
-  --cxdb ~/.dark-factory/cxdb.sqlite
-
-# Cluster CXDB failures into a Healer diagnosis
-df-healer --cxdb ~/.dark-factory/cxdb.sqlite
-
-# Visualize a pipeline graph
-dot -Tpng pipelines/factory/gates.dot -o gates.png
-
-# Tests (full suite, single file, single test)
-.venv/bin/python -m pytest tests/
-.venv/bin/python -m pytest tests/test_engine.py -k green
-.venv/bin/python -m pytest tests/test_gates.py::test_parse_verdict_pass_warn_fail
-```
-
-Legacy dev-only: `.venv/bin/python -m runner ...` from `$DARK_FACTORY_HOME`.
+See [.claude/skills/dark-factory-commands/SKILL.md](.claude/skills/dark-factory-commands/SKILL.md).
 
 ## Pipeline selection
 
@@ -145,44 +120,13 @@ pipeline before invoking `dark-factory`, unless the user passed `--pipeline`.
 
 ## Architecture
 
-### Three-layer convergence
-1. **Pipeline engine** (`runner/`) — DOT parser, graph runner, checkpointing, human gates, CXDB.
-2. **Agent loop** (external) — AO / Claude Code / Codex CLIs, invoked per node.
-3. **LLM client** (external) — OpenClaw gateway / thinclaw MCP.
-
-This repo is layer 1 only.
-
 ### Agent Orchestrator (AO) Repository Policy
 - The canonical AO engine used by dark-factory is upstream **Golang `agent-orchestrator`** (`https://github.com/strongdm/agent-orchestrator` / `jleechanorg/agent-orchestrator`). We do NOT use `agent-orchestrator-ts`.
 - The AO repository is **read-only / reference only**. We almost never want to modify or open PRs against AO; all session liveness interpretation, reaping triggers, timeout logic, and promotion handling must live within `dark-factory` itself (e.g. in `daemon/src/adapters.rs` and `daemon/src/tick.rs`).
 - **Hard Safety Gate**: Agents must **NEVER** write or modify `agent-orchestrator` code unless the human operator explicitly provides the verbatim authorization: `AO CODE APPROVED`.
 
-
 ### Durable artifacts vs. dorodango
 The `.dot` files under `pipelines/` are the artifact worth versioning — they encode the development process. The Python under `runner/` is treated as throwaway code: polish, discard, rebuild from spec. Learning accumulates in the **CXDB** event log, not in the runner code.
-
-### Pipeline execution model
-- `runner/parser.py` reads `.dot` via pydot into `Graph(nodes, edges)`. Every pipeline must contain both `start` and `exit` — `parse` raises if either is missing.
-- `runner/engine.py:run` walks from `start`, calls the handler resolved per node, then picks the next edge via `_edge_matches` (supports `condition="key=value"` and `key!=value`). Conditional edges win over unconditional ones.
-- Loop bounds come from a node's `max_visits` attribute (e.g. `fix [max_visits="3"]`). Exceeding it emits a synthetic `exhausted` step and terminates.
-- Each step is appended to `history` and, when `--cxdb` is set, to the SQLite event log. The CXDB sequence (`seq`) is tracked independently of `len(history)` so refactors can't desync.
-
-### Handlers (`runner/handlers.py`)
-Lookup order in `resolve(node)`:
-1. Explicit `type="..."` → `TYPE_REGISTRY`
-2. Node name `start` / `exit` → built-ins
-3. Node `shape` (Mdiamond/Msquare/hexagon) → `REGISTRY`
-4. Default → `_codergen`
-
-Handler types:
-- `codergen` — render `prompt="@path"` (with `${goal}` and `${state.*}` substitution) and dispatch to the node's `backend`/`model` attribute or `ctx.backend`. The runner CLI accepts `echo` | `ao` | `claude` | `codex` | `agy`; per-node/model-stylesheet routing also supports `mock_llm` for test/conformance lanes. The default is `ao` (running `antigravity` agent under the hood via Agent Orchestrator).
-- `agy` backend — run Antigravity CLI directly and headlessly with `agy --print --dangerously-skip-permissions`; node `timeout="..."` maps to `agy --print-timeout`.
-- Reviewer/evaluator lanes are separate nodes: `tool` nodes can invoke `codex exec --yolo`, AO workers, or another reviewer CLI; `holdout_eval` runs the sealed Python evaluator from `$DARK_FACTORY_HOLDOUTS`.
-- `tool` — shell out to a `command="..."` attribute with optional `timeout`.
-- `human_gate` — block on stdin, or accept pre-seeded `ctx.state["<node>.outcome"]` for tests.
-- `conditional` — hexagon decision node; outcome comes from `ctx.state[decision_key]`.
-- `holdout_eval` — run the sealed evaluator at `$DARK_FACTORY_HOLDOUTS/evaluator/run.py`. Parses the last JSON line of stdout for `{verdict: pass|...}`.
-- `gate_es` / `gate_er` / `gate_code_standards` — shell out to `claude --print /<slash>`. Verdicts are normalized by `_parse_verdict`: the anchored marker regex (`verdict:`/`overall:`/`normalized:` + token) takes priority; the standalone-line fallback only fires when no marker is present; `pass|warn → success`, `fail|partial|inconclusive → failure`. Unknown verdict combined with `rc!=0` becomes `error` (distinct from real failures so the Healer can group infra crashes separately).
 
 ### Spec validation benchmark
 
@@ -198,10 +142,6 @@ visible:
 The full graph validates every reviewable spec line, runs a full-stack smoke
 node, then invokes an independent reviewer through `codex exec --yolo`.
 Use this benchmark as the template for general spec-validation lanes.
-
-### CXDB + Healer feedback loop
-- `runner/cxdb.py` records `(run_id, seq, node, outcome, ts, output_hash, output_head, metadata)` per step. WAL mode + 5s busy_timeout so concurrent pipelines into one CXDB don't collide on `database is locked`.
-- `runner/healer.py` reads CXDB, clusters terminal failures (`failure | fail | exhausted | stuck | partial | inconclusive`) by `(node, outcome, output_hash)`, and emits a Markdown report with a per-cluster prescription. The Healer's prefix logic (`gate_*`, `plan|implement|fix`, `holdout`) is internal data routing over its own node namespace — not user input — so it is not a ZFC violation.
 
 ### Performance logging (`~/Library/Logs/dark-factory`)
 
@@ -232,10 +172,8 @@ tail -f ~/Library/Logs/dark-factory/worldarchitect.ai/feat_my-feature/runs.index
 Each node emits `ENTER` on visit and `EXIT` with classified outcome (`success`, `failure`, `error`, `partial`) plus engine-level `duration_ms`. Parallel branch nodes are included.
 
 ### Adding a new node type
-1. Implement `_my_handler(node, ctx) -> Result` in `runner/handlers.py`.
-2. Register in `TYPE_REGISTRY` (preferred — keyed by `type="..."`) or `REGISTRY` (keyed by DOT shape).
-3. Reference from a `.dot` file with `mynode [type="my_handler", ...]`.
-4. Echo-backend tests should drive paths via `ctx.state["<node>.outcome"]` — see `tests/test_gates.py`.
+
+See [.claude/skills/dark-factory-node-type/SKILL.md](.claude/skills/dark-factory-node-type/SKILL.md).
 
 ## Dispatch-health triage (when beads queue but nothing dispatches)
 
@@ -247,6 +185,18 @@ Check in THIS order — each layer can silently starve the ones below (2026-07-0
 4. **Error classification trap**: "Spawn queue is full" arrives as rc=1 Tool error (counter-incrementing), NOT the `REQUEST=` Deferred shape — until jleechan-la67 lands, sustained queue-full burns `spawn_failure_count` toward mass HumanHeld park.
 
 Design rule: any queue between the daemon and AO must have dedup (one pending request per bead+attempt), TTL, depth telemetry, and a flush command. A queue with an unbounded producer and a stallable consumer is an outage timer.
+
+## Automation script config convention (empty-by-default, fail closed)
+
+Any new `daemon/scripts/auto-*.sh` or `daemon/scripts/*-merge-*.sh` script
+that performs an irreversible/outward-facing action (merge, push, delete,
+publish) must ship a matching `config/*_allowlist.json` with an **empty**
+default list — fail closed, not fail open. See
+[docs/automation-config-convention.md](docs/automation-config-convention.md)
+for the full rule (canonical example: `config/auto_merge_repo_allowlist.json`,
+from the 2026-08-23 PR-merge-storm incident). CI enforces it via
+`scripts/check_auto_script_configs.sh` (run locally with no args to dry-run
+against the real `daemon/scripts/`).
 
 ## Pipeline authoring rules
 
@@ -264,3 +214,33 @@ Design rule: any queue between the daemon and AO must have dedup (one pending re
    prompts that need the implementing agent's diff should reference `${diff}` in their
    template; `_codergen` captures it automatically and stashes in
    `ctx.state['<node>.diff']` and `ctx.state['_last_diff']`.
+
+## CLI account scoping — mandatory policy for every AI CLI launch
+
+This is a mandatory launch policy, not a claim that every current runtime path
+already enforces it. `Command::new` inherits the daemon environment unless the
+launch code explicitly removes inherited variables and builds a scoped child
+environment. A launch is compliant only when its account/provider scope is
+validated before the process starts.
+
+Every direct Claude launch (`claude` or `claude-sonnet`) MUST validate
+`DARK_FACTORY_CLAUDE_CONFIG_DIR` as an existing project-scoped directory, pass
+that directory to the child as `CLAUDE_CONFIG_DIR`, and scrub inherited Claude
+and provider authentication variables. Keep this environment construction and
+provider scrubbing centralized; do not rely on a bare host `~/.claude` account.
+
+MiniMax is a separate provider lane. It MUST require a nonblank
+`MINIMAX_API_KEY`, pin `ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic` and
+`ANTHROPIC_MODEL=MiniMax-M3`, and remove Claude account state/configuration from
+the child environment. A MiniMax launch must never inherit `CLAUDE_CONFIG_DIR`
+or another host Claude login as an implicit credential.
+
+Every Codex launch, including `codex exec`, MUST use an intended existing
+`CODEX_HOME` or an explicitly supported provider credential/configuration such
+as `OPENAI_API_KEY` or `CODEX_ACCESS_TOKEN` where that launch mode supports it.
+Do not let Codex silently fall back to the operator's default `~/.codex`
+account.
+
+Unscoped or unsupported dispatch MUST fail closed. Fallback is allowed only to
+another lane that has its own explicit, validated scope; never fall back to an
+unscoped Claude, MiniMax, or Codex process.

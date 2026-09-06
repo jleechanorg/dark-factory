@@ -23,6 +23,41 @@ LOG="${AFD_LOG:-$HOME/Library/Logs/dark-factory/daemon.jsonl}"
 H="daemon/factory-overlay.sh"
 MAX_PER_HOUR="${1:-8}"
 
+# --- Repo auto-merge policy gate (2026-08-23 PR-merge-storm incident) ---
+# Config-only, not code: which repos this script may auto-merge in is
+# controlled ENTIRELY by config/auto_merge_repo_allowlist.json (or the
+# AMG_REPO_POLICY_FILE override) -- no repo name is ever hardcoded here.
+# Incident: 2026-08-23, a burst of unattended worldai merges (42 PRs in 12h,
+# most with no literal human MERGE APPROVED at time of merge) produced real
+# production regressions (PATCH /api/campaigns/<id> whitelist stripped,
+# context-compression pruning wiped). This script -- the one dark-factory
+# component whose literal job is "merge-authority policy gate" -- had zero
+# human-approval step or repo scoping for any repo it might run against.
+# Operator directive: keep the factory dispatch daemon running, stop only
+# the merges, and control the stop/resume purely via config so re-enabling
+# a repo never requires a code change or redeploy -- just an edit to the
+# allowlist file. Absence of the config file, an empty list, or $REPO not
+# present in it all mean "no merges this pass" -- the safe default is off.
+AMG_REPO_POLICY_FILE="${AMG_REPO_POLICY_FILE:-$(git rev-parse --show-toplevel 2>/dev/null)/config/auto_merge_repo_allowlist.json}"
+if [ ! -f "$AMG_REPO_POLICY_FILE" ]; then
+  echo "auto-merge-guard: no repo allowlist config at $AMG_REPO_POLICY_FILE — refusing to merge anything this pass (fail-closed default)" >&2
+  exit 0
+fi
+_repo_allowed="$(python3 -c "
+import json, sys
+try:
+    with open('$AMG_REPO_POLICY_FILE') as f:
+        cfg = json.load(f)
+    allowed = cfg.get('allowed_repos', [])
+    print('true' if '$REPO' in allowed else 'false')
+except Exception as e:
+    print('false')
+" 2>/dev/null)"
+if [ "$_repo_allowed" != "true" ]; then
+  echo "auto-merge-guard: $REPO is not in the allowed_repos list at $AMG_REPO_POLICY_FILE — refusing to merge anything this pass (fail-closed default)" >&2
+  exit 0
+fi
+
 # --- API quota preflight (bead rev-1uno): gh pr list/view/checks all call
 # GitHub's GraphQL API internally. A GraphQL-only sweep here previously
 # drove the shared org graphql quota (user 13840161) to 0/5000, starving
@@ -292,6 +327,172 @@ except Exception:
   echo "GREEN:REST"; return 0
 }
 
+# --- Human-approval marker gate (bead rev-iwywa, 2026-08-23 incident
+# follow-up): PR #735 added a fail-closed repo allowlist, but CLAUDE.md's
+# own "MERGE APPROVED" policy was, until now, enforced by session-prompt
+# convention ONLY — zero code-level check existed anywhere in this script
+# or gh-pr-merge-wrapper.sh. The moment a repo is re-added to
+# config/auto_merge_repo_allowlist.json (a one-line JSON edit -- that's
+# the whole point of PR #735's design), the exact unattended-merge gap
+# that caused the incident reopens with zero additional protection,
+# because the allowlist alone doesn't prove a human approved THIS PR.
+# This is a SECOND, INDEPENDENT gate — it augments, not replaces, the
+# repo-allowlist gate above and the no-red gate checks in
+# latest_assessment_no_red(). A PR is approved when EITHER:
+#   (a) a PR comment containing a standalone line that is exactly
+#       "MERGE APPROVED" (case-sensitive, anchored -- not merely a
+#       substring anywhere in the body, so a negation like "does NOT say
+#       MERGE APPROVED" or a quoted/code-block mention never satisfies
+#       this) was posted by a non-bot account that is NOT the PR's own
+#       author (an author commenting on their own PR must never satisfy
+#       the gate -- that would make the marker trivially self-spoofable), OR
+#   (b) the $AMG_APPROVAL_LABEL label ("auto-merge-approved" by default)
+#       was applied by a non-bot GitHub actor (checked via the issue
+#       events/timeline, not just current label presence, so we know WHO
+#       applied it).
+# Fail-closed throughout: any lookup failure, empty response, or
+# unparseable JSON means NOT approved.
+AMG_APPROVAL_LABEL="${AMG_APPROVAL_LABEL:-auto-merge-approved}"
+human_approval_marker_present() { # <pr_number> -> exit 0 iff a valid human approval marker is present
+  local pr="$1" author_login comments_json events_json
+  author_login="$(gh api "repos/$REPO/pulls/$pr" --jq '.user.login // ""' 2>/dev/null)"
+  # --slurp wraps each page's array as its own element (so multi-page
+  # results parse as valid JSON) -- without it, gh api --paginate prints
+  # each page as a SEPARATE, back-to-back JSON array/object for any
+  # endpoint with more than one page of results, which is not valid JSON
+  # on its own and made json.loads() silently fail (caught by a bare
+  # except, comments/events treated as empty) on any PR with a long
+  # comment or event history.
+  comments_json="$(gh api "repos/$REPO/issues/$pr/comments" --paginate --slurp 2>/dev/null)"
+  if [ -n "$comments_json" ]; then
+    if PR_AUTHOR="$author_login" python3 -c '
+import json, os, re, sys
+
+AUTHOR = os.environ.get("PR_AUTHOR", "")
+# Fail-closed: if we could not determine who the PR author is (the
+# earlier `gh api .../pulls/$pr` lookup failed or returned an empty
+# login), we cannot enforce the author-exclusion below, so refuse via
+# the comment path entirely rather than silently allowing the true
+# author (now indistinguishable from anyone else) to self-approve.
+if not AUTHOR:
+    sys.exit(1)
+
+# Anchored, standalone-line match only (mirrors this repo own
+# _parse_verdict marker convention, and CLAUDE.md rule that MERGE APPROVED
+# must appear verbatim) -- a bare substring search would let any comment
+# that merely contains the phrase satisfy the gate, including negations
+# ("does NOT say MERGE APPROVED"), quotes, or code-block embeddings.
+MARKER = re.compile(r"(?m)^\s*MERGE APPROVED\s*$")
+FENCE = re.compile(r"```.*?```", re.DOTALL)
+
+def is_bot(user):
+    if not isinstance(user, dict):
+        return True
+    if (user.get("type") or "") == "Bot":
+        return True
+    login = user.get("login") or ""
+    return login.endswith("[bot]") or login.endswith("-bot")
+
+try:
+    pages = json.loads(sys.stdin.read())
+except Exception:
+    pages = []
+if not isinstance(pages, list):
+    pages = []
+comments = []
+for page in pages:
+    if isinstance(page, list):
+        comments.extend(page)
+for c in comments:
+    body = c.get("body") or ""
+    # Strip fenced code blocks before matching so a reviewer quoting the
+    # marker as a documentation/policy example inside a ``` block never
+    # satisfies the gate -- only a real, unfenced approval line counts.
+    body_unfenced = FENCE.sub("", body)
+    if not MARKER.search(body_unfenced):
+        continue
+    user = c.get("user") or {}
+    if is_bot(user):
+        continue
+    login = user.get("login") or ""
+    if login == AUTHOR:
+        continue
+    print("APPROVED:COMMENT:" + login)
+    sys.exit(0)
+sys.exit(1)
+' <<<"$comments_json"; then
+      return 0
+    fi
+  fi
+  events_json="$(gh api "repos/$REPO/issues/$pr/events" --paginate --slurp 2>/dev/null)"
+  if [ -n "$events_json" ]; then
+    if LABEL="$AMG_APPROVAL_LABEL" PR_AUTHOR="$author_login" python3 -c '
+import json, os, sys
+
+LABEL = os.environ.get("LABEL", "")
+AUTHOR = os.environ.get("PR_AUTHOR", "")
+# Fail-closed for the same reason as the comment path above: if we could
+# not determine the PR author, we cannot enforce author-exclusion, so
+# refuse via the label path entirely.
+if not AUTHOR:
+    sys.exit(1)
+
+def is_bot(actor):
+    if not isinstance(actor, dict):
+        return True
+    if (actor.get("type") or "") == "Bot":
+        return True
+    login = actor.get("login") or ""
+    return login.endswith("[bot]") or login.endswith("-bot")
+
+try:
+    pages = json.loads(sys.stdin.read())
+except Exception:
+    pages = []
+if not isinstance(pages, list):
+    pages = []
+events = []
+for page in pages:
+    if isinstance(page, list):
+        events.extend(page)
+
+# Reconstruct CURRENT label state from the chronological event history
+# (the /issues/$pr/events endpoint returns events oldest-first) rather
+# than approving on the first "labeled" event found: a label that was
+# applied and later REMOVED must not still count as approval, and the
+# actor recorded must be whoever most recently (re-)applied it, not
+# whoever happened to apply it first.
+current_actor = None
+for e in events:
+    if e.get("event") not in ("labeled", "unlabeled"):
+        continue
+    label_name = (e.get("label") or {}).get("name") or ""
+    if label_name != LABEL:
+        continue
+    if e.get("event") == "unlabeled":
+        current_actor = None
+        continue
+    actor = e.get("actor") or {}
+    if is_bot(actor):
+        current_actor = None
+        continue
+    login = actor.get("login") or ""
+    if login == AUTHOR:
+        current_actor = None
+        continue
+    current_actor = login
+
+if current_actor:
+    print("APPROVED:LABEL:" + current_actor)
+    sys.exit(0)
+sys.exit(1)
+' <<<"$events_json"; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
 if [ "$USE_GRAPHQL" -eq 1 ]; then
   _pr_rows="$(gh pr list --repo "$REPO" --state open --json number,headRefName \
     --jq '.[]|select(.headRefName|startswith("factory/"))|"\(.number) \(.headRefName)"' 2>/dev/null)"
@@ -356,6 +557,23 @@ while read -r num branch; do
   checks_reason="$(checks_all_green "$num" "$live_head_sha")"
   checks_rc=$?
   if [ "$checks_rc" -ne 0 ]; then
+    _runner_probe_output="$(scripts/check_runner_health.sh "$REPO" 2>&1)"
+    _runner_probe_rc=$?
+    if [ "$_runner_probe_rc" -eq 3 ]; then
+      _runner_warning="RUNNER FLEET DOWN — wait for org runner recovery; merge policy remains enforced"
+      echo "PR $num: $_runner_warning"
+      _runner_comments="$(gh pr view "$num" --repo "$REPO" --comments --json comments --jq '.comments[].body' 2>/dev/null)"
+      _runner_comments_rc=$?
+      if [ "$_runner_comments_rc" -ne 0 ]; then
+        echo "PR $num: RUNNER WARNING DEDUP INCONCLUSIVE — comment lookup failed; not posting"
+      elif [[ "$_runner_comments" != *"$_runner_warning"* ]]; then
+        gh pr comment "$num" --repo "$REPO" --body "$_runner_warning" 2>/dev/null || true
+      fi
+    elif [ "$_runner_probe_rc" -eq 1 ]; then
+      echo "PR $num: RUNNER SELECTOR DRIFT — configured labels match no online org runner"
+    elif [ "$_runner_probe_rc" -ne 0 ]; then
+      echo "PR $num: RUNNER STATUS INCONCLUSIVE — not classifying as an outage"
+    fi
     echo "PR $num: CI not green ($checks_reason) — skip"; continue
   fi
   verdict="$(latest_assessment_no_red "$num" "$live_head_sha")" || { echo "PR $num: verifier assessment ${verdict:-missing} — refusing merge (green CI is insufficient)"; continue; }
@@ -368,8 +586,24 @@ while read -r num branch; do
     _mergeable="$(gh api "repos/$REPO/pulls/$num" --jq '.mergeable' 2>/dev/null)"
     [ "$_mergeable" = "true" ] || { echo "PR $num: not MERGEABLE (conflicts) — skip"; continue; }
   fi
+  # bead rev-iwywa: SECOND, independent gate -- every other gate above can
+  # pass (CI green, assessment green, mergeable, repo-allowlisted) and this
+  # PR must still be refused without a human-posted approval marker. See
+  # human_approval_marker_present() above for the full anti-spoofing
+  # rationale (non-author, non-bot).
+  approval_reason="$(human_approval_marker_present "$num")"
+  approval_rc=$?
+  if [ "$approval_rc" -ne 0 ]; then
+    echo "PR $num: REFUSED:NO_APPROVAL_MARKER — no human-posted 'MERGE APPROVED' comment or '$AMG_APPROVAL_LABEL' label (non-author, non-bot) found — refusing merge"
+    continue
+  fi
+  echo "PR $num: approval marker ($approval_reason)"
   echo "PR $num: gates red-free + mergeable — merging"
-  gh pr merge "$num" --repo "$REPO" --squash 2>&1 | tail -1
+  # bead rev-377j4: attribute the merge-provenance JSONL line (written by
+  # gh-pr-merge-wrapper.sh, the sole caller of `gh pr merge`) to this
+  # automated timer path rather than the "manual-wrapper-invocation"
+  # default a direct/manual wrapper call would get.
+  AMG_TRIGGERING_MECHANISM="auto-merge-guard.sh" GH_REPO="$REPO" "$(dirname "${BASH_SOURCE[0]}")/gh-pr-merge-wrapper.sh" "$num" --squash 2>&1 | tail -2
   sleep 3
   if [ "$USE_GRAPHQL" -eq 1 ]; then
     _merged_state="$(gh pr view "$num" --repo "$REPO" --json state --jq .state 2>/dev/null)"

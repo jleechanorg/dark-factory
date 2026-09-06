@@ -26,7 +26,7 @@
 
 use crate::config::Config;
 use crate::errors::DaemonError;
-use crate::telemetry::{emit, TelemetryEvent};
+use crate::telemetry::{emit, local_hostname, TelemetryEvent};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -247,6 +247,7 @@ pub fn flush(
     if let Some(log) = telemetry_log {
         let event = TelemetryEvent {
             timestamp: crate::state::now_iso8601(),
+            host: local_hostname(),
             bead_id: format!("worktree-reaper:{}", repo),
             attempt_id: 0,
             lifecycle_state: "REAPER_FLUSH".to_string(),
@@ -308,6 +309,46 @@ pub fn reap(report: &ReaperReport, candidates: &[Candidate]) -> Result<usize, Da
         removed += 1;
     }
     Ok(removed)
+}
+
+/// Bead rev-3lm8k: immediately clean up ONE agent's worktree directory the
+/// moment its coder session is known to have exited (`SessionActivity`
+/// reaches `Idle`/terminal and the daemon calls `sessions.stop()`, or a
+/// park-to-`HUMAN_HELD` kill). Unlike `sweep()`/`is_prunable()`, this does
+/// NOT consult the active-session probe or `worktree_ttl_secs` — the
+/// caller already knows the session is dead, so waiting out the TTL would
+/// leave the stale AO-managed worktree blocking subsequent dispatches that
+/// hash to the same orchestrator branch (the observed incident: `wa-3538`
+/// under `/home/jleechan/.worktrees/worldarchitect/` blocked every
+/// `slim/two_node.dot` dispatch hashing to its branch until a human
+/// manually removed the directory).
+///
+/// Returns `Ok(true)` iff a directory was actually removed. `Ok(false)`
+/// when `cfg.agent_worktree_root` is unset (knob off), `agent_id` fails
+/// the path-traversal guard in `Config::agent_worktree_path`, or nothing
+/// exists at the resolved path — all treated as a no-op rather than an
+/// error, since "nothing to clean" is the expected steady state once a
+/// worktree has already been reaped once. Refuses to touch a path that
+/// exists but is not a plain directory (defensive: never delete a file,
+/// symlink, or unexpected mount the reaper does not own).
+pub fn clean_stale_worktree(
+    cfg: &Config,
+    repo: &str,
+    agent_id: &str,
+) -> Result<bool, DaemonError> {
+    let Some(path) = cfg.agent_worktree_path(repo, agent_id) else {
+        return Ok(false);
+    };
+    if !path.is_dir() {
+        return Ok(false);
+    }
+    std::fs::remove_dir_all(&path).map_err(|e| {
+        DaemonError::Config(format!(
+            "worktree reaper: clean_stale_worktree remove {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(true)
 }
 
 /// Helper for tests: epoch seconds from SystemTime.
@@ -526,5 +567,72 @@ mod tests {
         let inactive = InactiveProbe;
         let result = is_prunable(&candidate, 60, 200, &inactive);
         assert!(matches!(result, Ok(true)));
+    }
+
+    // Bead rev-3lm8k: `clean_stale_worktree` removes a single known-dead
+    // agent's worktree immediately, bypassing TTL — the fix for "AO coder
+    // sessions finish work and leave behind worktree dirs" blocking later
+    // dispatches until a human manually cleans up.
+
+    #[test]
+    fn clean_stale_worktree_removes_fresh_directory_immediately() {
+        let root = std::env::temp_dir().join(format!("afd_clean_fresh_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cfg = make_cfg(&root);
+        // `touch_dir` with 0 seconds ago is well within `worktree_ttl_secs`
+        // (60s in `make_cfg`) — a TTL-based sweep would NOT prune this, but
+        // `clean_stale_worktree` must remove it anyway because the caller
+        // already knows the session exited.
+        let target = root.join("owner/repo/wa-500");
+        touch_dir(&target, 0);
+        assert!(target.is_dir());
+        let removed = clean_stale_worktree(&cfg, "owner/repo", "wa-500").unwrap();
+        assert!(removed, "a fresh but session-dead worktree must still be removed");
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clean_stale_worktree_is_noop_when_knob_is_off() {
+        let cfg = Config {
+            agent_worktree_root: None,
+            ..make_cfg(Path::new("/tmp"))
+        };
+        let removed = clean_stale_worktree(&cfg, "owner/repo", "wa-500").unwrap();
+        assert!(!removed, "legacy layout (knob off) must be a no-op, not an error");
+    }
+
+    #[test]
+    fn clean_stale_worktree_is_noop_when_directory_absent() {
+        let root = std::env::temp_dir().join(format!("afd_clean_absent_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cfg = make_cfg(&root);
+        let removed = clean_stale_worktree(&cfg, "owner/repo", "wa-nonexistent").unwrap();
+        assert!(!removed, "nothing to clean is the expected steady state, not an error");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clean_stale_worktree_rejects_path_traversal_agent_id() {
+        let root = std::env::temp_dir().join(format!("afd_clean_traversal_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cfg = make_cfg(&root);
+        let removed = clean_stale_worktree(&cfg, "owner/repo", "../escape").unwrap();
+        assert!(!removed, "path-traversal agent_id must be refused, not resolved");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clean_stale_worktree_only_touches_directories() {
+        let root = std::env::temp_dir().join(format!("afd_clean_file_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cfg = make_cfg(&root);
+        let path = cfg.agent_worktree_path("owner/repo", "wa-file").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"not a worktree dir").unwrap();
+        let removed = clean_stale_worktree(&cfg, "owner/repo", "wa-file").unwrap();
+        assert!(!removed, "a non-directory at the resolved path must be left alone");
+        assert!(path.is_file(), "the file must survive untouched");
+        let _ = fs::remove_dir_all(&root);
     }
 }

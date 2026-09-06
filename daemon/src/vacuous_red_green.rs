@@ -383,7 +383,7 @@ pub fn resolve_pytest(python_bin: Option<&Path>) -> PytestLocation {
     if let Some(p) = python_bin {
         let candidate = p.parent().map(|d| d.join("pytest"));
         if let Some(c) = candidate {
-            if c.is_file() {
+            if is_executable_file(&c) {
                 return PytestLocation::Found(c);
             }
         }
@@ -394,11 +394,32 @@ pub fn resolve_pytest(python_bin: Option<&Path>) -> PytestLocation {
 fn which_pytest_on_path() -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for entry in std::env::split_paths(&path_var) {
-        if entry.join("pytest").is_file() {
+        if is_executable_file(&entry.join("pytest")) {
             return Some(PathBuf::new()); // bare-name hit on PATH
         }
     }
     None
+}
+
+/// Check the capability signal without spawning an unbounded subprocess at
+/// daemon startup. A regular executable bit check rejects stale/non-runnable
+/// pytest files while keeping startup non-fatal for Rust-only hosts.
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Bounded recursive Python manifest search (mirrors
@@ -640,13 +661,20 @@ fn python_fn_body_index(source: &str) -> std::collections::HashMap<String, Strin
             }
             if indent <= decl_indent
                 && (trimmed_local.starts_with("def ")
-                    || trimmed_local.starts_with("async def "))
+                    || trimmed_local.starts_with("async def ")
+                    || trimmed_local.starts_with('@'))
             {
                 break;
             }
             body_end += 1;
         }
-        let body = lines[body_start..body_end].join("\n");
+        // Ignore separator whitespace before the next function.  Otherwise
+        // merely appending a new test function changes the preceding
+        // function's captured body and falsely marks it as modified.
+        let body = lines[body_start..body_end]
+            .join("\n")
+            .trim_end()
+            .to_string();
         out.insert(name.to_string(), body);
         i = body_end;
     }
@@ -763,6 +791,7 @@ pub fn check_red_green_with_manifest(
     // into the language; pytest uses `@pytest.mark.skip` which is a
     // future-extension seam).
     let mut targeted: BTreeSet<String> = BTreeSet::new();
+    let mut pytest_targets: Vec<PytestTarget> = Vec::new();
     let mut skipped: Vec<TestFnInfo> = Vec::new();
     for path in &test_files {
         let head_src = std::fs::read_to_string(path).map_err(|e| {
@@ -783,9 +812,17 @@ pub fn check_red_green_with_manifest(
             skipped.push(info);
         }
         for name in added_or_modified {
+            if backend == Backend::Pytest {
+                pytest_targets.push(PytestTarget {
+                    path: path.clone(),
+                    name: name.clone(),
+                });
+            }
             targeted.insert(name);
         }
     }
+    pytest_targets.sort_by(|a, b| a.path.cmp(&b.path).then(a.name.cmp(&b.name)));
+    pytest_targets.dedup();
     let targeted_tests: Vec<String> = targeted.iter().cloned().collect();
 
     // Phase (a) — green-on-PR-head. If the targeted tests don't pass
@@ -800,7 +837,7 @@ pub fn check_red_green_with_manifest(
         )?,
         Backend::Pytest => run_pytest_tests(
             repo_root,
-            &test_files,
+            &pytest_targets,
             &targeted_tests,
             resolved_manifest.as_deref(),
             pytest_loc.clone(),
@@ -837,7 +874,7 @@ pub fn check_red_green_with_manifest(
         Backend::Pytest => run_pytest_baseline_check(
             repo_root,
             base_ref,
-            &test_files,
+            &pytest_targets,
             &targeted_tests,
             resolved_manifest.as_deref(),
             pytest_loc.clone(),
@@ -882,7 +919,7 @@ pub fn check_red_green_with_manifest(
         ),
         Backend::Pytest => run_pytest_tests(
             repo_root,
-            &test_files,
+            &pytest_targets,
             &targeted_tests,
             resolved_manifest.as_deref(),
             pytest_loc.clone(),
@@ -1378,6 +1415,15 @@ struct CargoOutcome {
     compile_errored: bool,
 }
 
+/// A pytest node keeps its file association. Names alone are insufficient:
+/// two changed files may both define `test_parse`, and executing a Cartesian
+/// product can report one passing file while silently missing the other.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PytestTarget {
+    path: PathBuf,
+    name: String,
+}
+
 impl CargoOutcome {
     fn all_passed(&self) -> bool {
         // A compile failure on the reverted tree is the strongest
@@ -1682,7 +1728,7 @@ fn run_baseline_check(
 /// failed" (pytest's equivalent of a Rust compile error).
 fn run_pytest_tests(
     repo_root: &Path,
-    test_files: &[PathBuf],
+    pytest_targets: &[PytestTarget],
     targeted_tests: &[String],
     manifest: Option<&Path>,
     pytest_loc: PytestLocation,
@@ -1716,14 +1762,31 @@ fn run_pytest_tests(
     // `<file>::<test_name>` nodes directly. Multiple files in
     // a single pytest invocation is fine; pytest collects them
     // all.
+    // Pytest reports node IDs relative to the effective project root. For a
+    // nested pyproject, that root is the manifest's parent rather than the
+    // daemon target-worktree root; selectors and parsing must use the same
+    // coordinate system.
+    let pytest_root = manifest
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.eq_ignore_ascii_case("pyproject.toml"))
+                .unwrap_or(false)
+        })
+        .and_then(Path::parent)
+        .unwrap_or(repo_root);
     let mut selector_args: Vec<String> = Vec::new();
-    for tf in test_files {
-        let rel = relative_repo_path(repo_root, tf).unwrap_or_else(|| {
-            tf.to_string_lossy().into_owned()
+    for target in pytest_targets {
+        // Selectors and pytest's verbose node IDs share the manifest-root
+        // coordinate system.  Passing a nested-project path such as
+        // `mvp_site/tests/test_value.py` while running from the repository
+        // root makes pytest report `tests/test_value.py::...`, so the
+        // parser would classify a passing target as NEVER_RAN.  Construct
+        // the selector relative to the same root used for output parsing.
+        let rel = relative_repo_path(pytest_root, &target.path).unwrap_or_else(|| {
+            target.path.to_string_lossy().into_owned()
         });
-        for name in targeted_tests {
-            selector_args.push(format!("{rel}::{name}"));
-        }
+        selector_args.push(format!("{rel}::{}", target.name));
     }
 
     let mut args: Vec<String> = vec![
@@ -1765,7 +1828,10 @@ fn run_pytest_tests(
     args.extend(selector_args);
 
     let out = Command::new(&pytest_bin)
-        .current_dir(repo_root)
+        // A nested pyproject is a standalone pytest project.  Running from
+        // its manifest parent makes the repo-relative selectors above valid
+        // across pytest versions while preserving root-level behavior.
+        .current_dir(pytest_root)
         .args(&args)
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
@@ -1779,18 +1845,17 @@ fn run_pytest_tests(
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // Pytest surfaces collection failures as `ERROR <file>` /
-    // `ERROR collecting <file>` on stderr. If we see those AND exit
-    // was non-zero AND no per-test PASS lines were emitted, the test
-    // never collected — the strongest possible "production code is
-    // being exercised" signal (the import chain must have failed).
-    // With `-v`, pytest emits per-test lines, so the "no PASSED
-    // lines" check is the right compile-equivalent signal.
-    if !out.status.success()
-        && (stderr.contains("ERROR collecting") || stderr.contains("ERROR "))
-        && !stdout.contains("PASSED")
-    {
+    // Any non-zero pytest exit is a hard failure, even when one target's
+    // stdout line says PASSED. This catches collection/import errors in a
+    // sibling target and prevents a same-name test in another file from
+    // masking it.
+    if !out.status.success() {
         compile_errored = true;
+        failing.push(format!(
+            "pytest process failed (rc={}): {}",
+            out.status.code().unwrap_or(-1),
+            stderr.lines().next().unwrap_or("unknown pytest error")
+        ));
     }
 
     // Parse pytest's per-test PASS/FAIL summary lines. pytest's
@@ -1798,13 +1863,17 @@ fn run_pytest_tests(
     //   `tests/test_scenario.py::test_classify_high PASSED`
     //   `tests/test_scenario.py::test_classify_high FAILED`
     //   `tests/test_scenario.py::test_classify_high SKIPPED`
-    for name in targeted_tests {
-        let passed = stdout.contains(&format!("::{name} PASSED"));
-        let failed = stdout.contains(&format!("::{name} FAILED"));
-        let skipped = stdout.contains(&format!("::{name} SKIPPED"));
-        let errored = stdout.contains(&format!("::{name} ERROR"));
+    for target in pytest_targets {
+        let rel = relative_repo_path(pytest_root, &target.path).unwrap_or_else(|| {
+            target.path.to_string_lossy().into_owned()
+        });
+        let node = format!("{rel}::{}", target.name);
+        let passed = pytest_output_has_status(&stdout, &node, "PASSED");
+        let failed = pytest_output_has_status(&stdout, &node, "FAILED");
+        let skipped = pytest_output_has_status(&stdout, &node, "SKIPPED");
+        let errored = pytest_output_has_status(&stdout, &node, "ERROR");
         if failed || errored {
-            failing.push(name.clone());
+            failing.push(format!("{node}:FAILED"));
         } else if !passed && !skipped {
             // If neither PASS nor FAIL nor SKIP is recorded, the
             // test was not collected by pytest (e.g. the file
@@ -1813,13 +1882,50 @@ fn run_pytest_tests(
             // signal — issue #387 r5 finding 3 (cargo analogue):
             // NEVER_RAN must NOT be silently counted as a real
             // pass.
-            failing.push(format!("{name}:NEVER_RAN"));
+            failing.push(format!("{node}:NEVER_RAN"));
         }
     }
 
     Ok(CargoOutcome {
         failing,
         compile_errored,
+    })
+}
+
+/// Match a pytest verbose result for one exact selected function.  Pytest
+/// appends parameter IDs (`node[param] STATUS`) for parametrized tests; the
+/// suffix must be accepted without relaxing file/function association (so
+/// `test_x` cannot match `test_xyz`).
+fn pytest_output_has_status(stdout: &str, node: &str, status: &str) -> bool {
+    stdout.lines().any(|line| {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix(node) else {
+            return false;
+        };
+
+        let has_status = |candidate: &str| {
+            let candidate = candidate.trim_start();
+            let Some(tail) = candidate.strip_prefix(status) else {
+                return false;
+            };
+            tail.is_empty()
+                || tail
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_whitespace())
+        };
+
+        if rest.starts_with('[') {
+            // The progress suffix (`[ 33%]`) can contain a later closing
+            // bracket than the parameter ID.  Accept the bracket whose
+            // following token is the requested terminal status instead of
+            // blindly taking the last `]`.
+            return rest
+                .char_indices()
+                .filter(|(_, character)| *character == ']')
+                .any(|(close, _)| has_status(&rest[close + 1..]));
+        }
+        has_status(rest)
     })
 }
 
@@ -1830,7 +1936,7 @@ fn run_pytest_tests(
 fn run_pytest_baseline_check(
     repo_root: &Path,
     base_ref: &str,
-    test_files: &[PathBuf],
+    pytest_targets: &[PytestTarget],
     targeted_tests: &[String],
     manifest: Option<&Path>,
     pytest_loc: PytestLocation,
@@ -1863,17 +1969,91 @@ fn run_pytest_baseline_check(
         )));
     }
 
-    let baseline_manifest = manifest.map(|m| {
-        if m.is_absolute() {
-            m.to_path_buf()
-        } else {
-            tmp.join(m)
+    // `test_files` and `manifest` are resolved against the PR target
+    // worktree. Rebase them into the detached baseline before invoking
+    // pytest; retaining absolute head paths here would silently execute the
+    // PR checkout during the baseline phase and invalidate red/green's
+    // baseline contract.
+    let baseline_targets: Vec<PytestTarget> = pytest_targets
+        .iter()
+        .map(|target| PytestTarget {
+            path: rebase_worktree_path(repo_root, &tmp, &target.path),
+            name: target.name.clone(),
+        })
+        .collect();
+    let mut materialized_test_modules = BTreeSet::new();
+    for (target, baseline_target) in pytest_targets.iter().zip(&baseline_targets) {
+        // Newly added test files do not exist in the detached base. Copy only
+        // that HEAD test source into the baseline so the phase can execute it
+        // against base production/configuration; existing test files remain
+        // the base revision, preserving genuine red/green semantics.
+        if !baseline_target.path.exists() && target.path.is_file() {
+            if let Some(parent) = baseline_target.path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    RedGreenError::BaselineFailed(format!(
+                        "create baseline test parent {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+            std::fs::copy(&target.path, &baseline_target.path).map_err(|e| {
+                RedGreenError::BaselineFailed(format!(
+                    "copy new head test {} into baseline {}: {e}",
+                    target.path.display(),
+                    baseline_target.path.display()
+                ))
+            })?;
+        } else if baseline_target.path.is_file() && target.path.is_file() {
+            // A newly added test function in an existing module is absent from
+            // the detached base file even though the file itself exists.  If
+            // we leave it untouched, pytest reports "not found" and the
+            // baseline phase becomes BaselineFailed -> Green, bypassing gate
+            // 8.  Its fixtures, helpers, decorators, and imports may also be
+            // newly added, so appending just the function is insufficient.
+            // Materialize the complete HEAD test module once; pytest still
+            // invokes only the explicitly targeted new/changed node IDs
+            // against baseline production/configuration.
+            let rel = relative_repo_path(repo_root, &target.path);
+            let base_src = rel.and_then(|path| read_base_blob(repo_root, base_ref, &path));
+            let head_src = std::fs::read_to_string(&target.path).map_err(|e| {
+                RedGreenError::BaselineFailed(format!(
+                    "read head pytest module {}: {e}",
+                    target.path.display()
+                ))
+            })?;
+            let base_names: BTreeSet<String> = base_src
+                .as_deref()
+                .map(discover_python_test_fns)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            if !base_names.contains(&target.name) {
+                extract_python_test_fn(&head_src, &target.name).ok_or_else(|| {
+                    RedGreenError::BaselineFailed(format!(
+                        "cannot materialize added pytest function {} from {}",
+                        target.name,
+                        target.path.display()
+                    ))
+                })?;
+                if materialized_test_modules.insert(baseline_target.path.clone()) {
+                    std::fs::write(&baseline_target.path, head_src).map_err(|e| {
+                        RedGreenError::BaselineFailed(format!(
+                            "materialize head pytest module {} into baseline {}: {e}",
+                            target.path.display(),
+                            baseline_target.path.display()
+                        ))
+                    })?;
+                }
+            }
         }
-    });
+    }
+    let baseline_manifest = manifest
+        .map(|path| rebase_worktree_path(repo_root, &tmp, path))
+        .filter(|path| path.is_file());
 
     let result = run_pytest_tests(
         &tmp,
-        test_files,
+        &baseline_targets,
         targeted_tests,
         baseline_manifest.as_deref(),
         pytest_loc,
@@ -1896,18 +2076,69 @@ fn run_pytest_baseline_check(
     result
 }
 
+/// Extract one top-level pytest function, including immediately preceding
+/// decorators, from a module. This deliberately stays line-oriented like the
+/// discovery scanner above; pytest itself remains the parser of record.
+fn extract_python_test_fn(source: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut fn_index = None;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let Some(declaration) = trimmed
+            .strip_prefix("async def ")
+            .or_else(|| trimmed.strip_prefix("def "))
+        else {
+            continue;
+        };
+        let candidate = declaration
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or_default();
+        if candidate == name && line.len() == trimmed.len() {
+            fn_index = Some(index);
+            break;
+        }
+    }
+    let fn_index = fn_index?;
+    let mut start = fn_index;
+    while start > 0 {
+        let previous = lines[start - 1].trim_start();
+        if previous.starts_with('@') {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let mut end = fn_index + 1;
+    while end < lines.len() {
+        let line = lines[end];
+        let trimmed = line.trim_start();
+        if !trimmed.is_empty() && line.len() == trimmed.len() {
+            break;
+        }
+        end += 1;
+    }
+    Some(lines[start..end].join("\n"))
+}
+
+/// Rebase a path resolved in `repo_root` into a detached worktree. Relative
+/// paths are interpreted from the repository root; absolute paths outside the
+/// repository are preserved because callers may intentionally pass an
+/// external interpreter/configuration path.
+fn rebase_worktree_path(repo_root: &Path, worktree: &Path, path: &Path) -> PathBuf {
+    if let Ok(relative) = path.strip_prefix(repo_root) {
+        worktree.join(relative)
+    } else if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        worktree.join(path)
+    }
+}
+
 // Tiny smoke test — the integration suite under `tests/` is the real proof.
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-
-    // Serializes tests that mutate the process-wide PATH/CARGO_HOME env
-    // vars. Rust runs tests in parallel by default, so without this lock
-    // a sibling test adding `.cargo/bin` to PATH races with a test
-    // trying to assert PATH is empty — the resolution result is then
-    // a coin-flip. The NOTIFY_ENV_LOCK pattern in main.rs uses the same
-    // idea.
-    static PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn discovers_plain_test_fn() {
@@ -2247,6 +2478,220 @@ fn b() {
         assert!(found.ends_with("Cargo.toml"));
     }
 
+    #[test]
+    fn pytest_baseline_rebases_head_paths_into_detached_worktree() {
+        // This fixture intentionally has different head imports/configuration
+        // from base. Only the detached base worktree can collect and pass the
+        // test; using the original absolute head paths must fail.
+        let dir = tempdir_unique("pytest-baseline-rebase");
+        std::fs::create_dir_all(dir.join("src/pkg")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname='baseline-rebase'\n\n[tool.pytest.ini_options]\npythonpath=['src']\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/pkg/__init__.py"), "").unwrap();
+        std::fs::write(dir.join("src/pkg/value.py"), "def value():\n    return 'base'\n").unwrap();
+        std::fs::write(
+            dir.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_value():\n    assert value() == 'base'\n",
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new(args[0])
+                .current_dir(&dir)
+                .args(&args[1..])
+                .output()
+                .expect("spawn fixture command");
+            assert!(
+                out.status.success(),
+                "fixture command {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["git", "init", "-q", "-b", "main"]);
+        run(&["git", "config", "user.email", "pytest@example.com"]);
+        run(&["git", "config", "user.name", "pytest"]);
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        // Head deliberately changes both pytest configuration and the test
+        // import/assertion. It is not expected to pass; the regression calls
+        // only the baseline phase and must use the detached base files.
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname='baseline-rebase-head'\n\n[tool.pytest.ini_options]\npythonpath=['.']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_value():\n    assert value() == 'head'\n",
+        )
+        .unwrap();
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "head"]);
+
+        let pytest_targets = vec![PytestTarget {
+            path: dir.join("tests/test_value.py"),
+            name: "test_value".to_owned(),
+        }];
+        let manifest = dir.join("pyproject.toml");
+        let result = run_pytest_baseline_check(
+            &dir,
+            &base,
+            &pytest_targets,
+            &["test_value".to_owned()],
+            Some(&manifest),
+            PytestLocation::OnPath,
+        )
+        .expect("detached baseline pytest should run");
+        assert!(
+            result.all_passed(),
+            "detached base test must pass after path rebasing: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pytest_baseline_materializes_added_fn_in_existing_module() {
+        // The base already contains this test module, while the PR adds a
+        // second function to it.  The added function must be copied into the
+        // detached baseline; otherwise pytest reports "not found" and the
+        // verifier would map BaselineFailed to Green.
+        let dir = tempdir_unique("pytest-baseline-added-fn");
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname='added-fn'\n\n[tool.pytest.ini_options]\npythonpath=['.']\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(dir.join("pkg/value.py"), "def value():\n    return 'base'\n").unwrap();
+        std::fs::write(
+            dir.join("tests/test_value.py"),
+            "import pytest\nfrom pkg.value import value\n\ndef test_existing():\n    assert value() == 'base'\n",
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new(args[0])
+                .current_dir(&dir)
+                .args(&args[1..])
+                .output()
+                .expect("spawn fixture command");
+            assert!(
+                out.status.success(),
+                "fixture command {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["git", "init", "-q", "-b", "main"]);
+        run(&["git", "config", "user.email", "pytest@example.com"]);
+        run(&["git", "config", "user.name", "pytest"]);
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        std::fs::write(dir.join("pkg/value.py"), "def value():\n    return 'head'\n").unwrap();
+        std::fs::write(
+            dir.join("tests/test_value.py"),
+            "import pytest\nfrom pkg.value import value\n\ndef test_existing():\n    assert value() == 'base'\n\n@pytest.fixture\ndef added_fixture():\n    return 4\n\n@pytest.mark.skipif(False, reason='regression')\n@pytest.mark.regression\ndef test_added_vacuous(added_fixture):\n    assert added_fixture == 4\n",
+        )
+        .unwrap();
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "head"]);
+
+        let changed = vec![
+            (dir.join("pkg/value.py"), FileClass::Production),
+            (dir.join("tests/test_value.py"), FileClass::Test),
+        ];
+        let report = check_red_green_with_manifest(
+            &dir,
+            &base,
+            &changed,
+            Some(&dir.join("pyproject.toml")),
+        )
+        .expect("pytest detector should execute");
+        assert_eq!(
+            report.verdict,
+            Verdict::Vacuous,
+            "added function must run on baseline, not become BaselineFailed: {report:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pytest_targets_keep_file_association_and_fail_on_sibling_collection_error() {
+        let dir = tempdir_unique("pytest-target-association");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("pyproject.toml"), "[project]\nname='association'\n").unwrap();
+        std::fs::write(
+            dir.join("tests/test_valid.py"),
+            "def test_same():\n    assert True\n",
+        )
+        .unwrap();
+        // Same test name, but invalid syntax. A name-only Cartesian matcher
+        // would see the valid file's PASSED line and incorrectly accept both.
+        std::fs::write(
+            dir.join("tests/test_invalid.py"),
+            "def test_same(:\n    assert True\n",
+        )
+        .unwrap();
+        let targets = vec![
+            PytestTarget {
+                path: dir.join("tests/test_valid.py"),
+                name: "test_same".to_owned(),
+            },
+            PytestTarget {
+                path: dir.join("tests/test_invalid.py"),
+                name: "test_same".to_owned(),
+            },
+        ];
+        let outcome = run_pytest_tests(
+            &dir,
+            &targets,
+            &["test_same".to_owned()],
+            Some(&dir.join("pyproject.toml")),
+            PytestLocation::OnPath,
+        )
+        .expect("pytest should spawn for association fixture");
+        assert!(
+            !outcome.all_passed(),
+            "sibling collection failure must fail closed: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .failing
+                .iter()
+                .any(|failure| failure.contains("pytest process failed")
+                    || failure.contains("test_invalid.py::test_same")),
+            "failure must identify process/invalid target, not be masked by same-name pass: {outcome:?}"
+        );
+    }
+
     /// Create a unique temp directory under `std::env::temp_dir()`. The
     /// directory is NOT auto-cleaned (Rust tests don't share a global
     /// fixture lifetime), but the name encodes the test pid + nanos so
@@ -2287,7 +2732,7 @@ fn b() {
     // Test helper: returns the host PATH stripped of any directory that
     // contains a `cargo` binary. This isolates the resolver from the
     // host's cargo (which would otherwise mask the "missing toolchain"
-    // signal). The PATH_ENV_LOCK guard ensures no sibling test adds a
+    // signal). The crate-wide test environment lock ensures no sibling test adds a
     // cargo directory between the snapshot and the assertion.
     fn path_without_cargo() -> std::ffi::OsString {
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -2299,7 +2744,7 @@ fn b() {
 
     #[test]
     fn resolve_cargo_returns_not_found_when_path_and_cargo_home_both_empty() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // cargo_home pointing at an empty dir + a PATH that has no
         // cargo binary anywhere. Resolver must surface NotFound without
         // requiring PATH mutation (the test pins the resolver, not the
@@ -2323,7 +2768,7 @@ fn b() {
 
     #[test]
     fn resolve_cargo_finds_cargo_in_cargo_home_bin_when_path_is_empty() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // Reproduce the systemd-unit failure mode: PATH without cargo,
         // but `~/.cargo/bin/cargo` exists. The resolver must find it.
         let fake_home = tempdir_unique("cargo-fallback");
@@ -2353,7 +2798,7 @@ fn b() {
 
     #[test]
     fn resolve_cargo_prefers_path_over_cargo_home() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // When cargo is on PATH AND the cargo_home has a shim, the
         // resolver must prefer PATH (no network/disk dependency for the
         // common case). We strip the cargo from PATH first, then add a
@@ -2392,7 +2837,7 @@ fn b() {
 
     #[test]
     fn resolve_cargo_surfaces_not_found_when_path_is_empty() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // Reproduce the systemd-unit failure mode: PATH-stripped (no
         // cargo directories), cargo_home doesn't exist. The resolver
         // must surface NotFound (or Found via rustup which cargo, when
@@ -2640,6 +3085,33 @@ def test_b():
     }
 
     #[test]
+    fn compute_targeted_python_test_fns_does_not_attach_new_decorators_to_predecessor() {
+        let base = "def test_existing():\n    assert True\n";
+        let head = "def test_existing():\n    assert True\n\n@pytest.mark.parametrize('value', [1])\n@pytest.mark.skipif(False, reason='regression')\nasync def test_added(value):\n    assert value == 1\n";
+        let (targeted, _) = compute_targeted_python_test_fns(Some(base), head);
+        assert_eq!(
+            targeted,
+            vec!["test_added".to_string()],
+            "decorators on a new async test must not retarget its unchanged predecessor"
+        );
+    }
+
+    #[test]
+    fn pytest_output_status_accepts_params_and_all_terminal_states_without_prefix_collisions() {
+        let stdout = "tests/test_mod.py::test_x[case] PASSED\n"
+            .to_owned()
+            + "tests/test_mod.py::test_failed[param] FAILED\n"
+            + "tests/test_mod.py::test_skipped SKIPPED\n"
+            + "tests/test_mod.py::test_error[repr] ERROR\n"
+            + "tests/test_mod.py::test_xyz PASSED\n";
+        assert!(pytest_output_has_status(&stdout, "tests/test_mod.py::test_x", "PASSED"));
+        assert!(pytest_output_has_status(&stdout, "tests/test_mod.py::test_failed", "FAILED"));
+        assert!(pytest_output_has_status(&stdout, "tests/test_mod.py::test_skipped", "SKIPPED"));
+        assert!(pytest_output_has_status(&stdout, "tests/test_mod.py::test_error", "ERROR"));
+        assert!(!pytest_output_has_status(&stdout, "tests/test_mod.py::test", "PASSED"));
+    }
+
+    #[test]
     fn backend_detect_picks_cargo_when_both_manifests_present() {
         let dir = tempdir_unique("backend-both");
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
@@ -2705,6 +3177,24 @@ def test_b():
         }
         let loc = resolve_pytest(None);
         assert_eq!(loc, PytestLocation::OnPath);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pytest_location_rejects_non_executable_path_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir_unique("pytest-non-executable");
+        let candidate = dir.join("pytest");
+        std::fs::write(&candidate, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut mode = std::fs::metadata(&candidate).unwrap().permissions();
+        mode.set_mode(0o644);
+        std::fs::set_permissions(&candidate, mode).unwrap();
+        assert!(!is_executable_file(&candidate));
+        let mut executable_mode = std::fs::metadata(&candidate).unwrap().permissions();
+        executable_mode.set_mode(0o755);
+        std::fs::set_permissions(&candidate, executable_mode).unwrap();
+        assert!(is_executable_file(&candidate));
     }
 }
 

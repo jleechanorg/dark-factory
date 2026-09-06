@@ -6,8 +6,8 @@ in ``docs/factory-evolve-research/reviewer-gap-taxonomy.md``:
 * **G1** — code-producing graph has no reviewer wired. A graph is
   G1-positive when there exists a path from ``start`` to ``exit`` that
   contains at least one code-producing node (resolved handler is
-  ``_codergen``) and contains **zero** reviewer nodes (handler type is
-  one of ``gate_es | gate_er | gate_code_standards | holdout_eval``).
+  ``_codergen``) and contains **zero** reviewer nodes (a registered reviewer
+  handler or an explicit codergen verdict gate).
 
 * **G2** — reviewer routes ``outcome!=success`` to ``exit`` instead of a
   bounded fix loop. A graph is G2-positive when any edge ``reviewer ->
@@ -71,7 +71,7 @@ TOPOLOGY_ONLY_SHAPES: frozenset[str] = frozenset({"point", "component", "tripleo
 # that gate / holdout the workflow at the boundary between coder output
 # and merge readiness.
 _REVIEWER_TYPE_NAMES: frozenset[str] = frozenset(
-    {"gate_es", "gate_er", "gate_skeptic", "gate_code_standards", "holdout_eval", "parallel_reviewer"}
+    {"gate_es", "gate_er", "gate_skeptic", "gate_code_standards", "holdout_eval", "parallel_reviewer", "web_advice"}
 )
 
 # Hard-tier reviewer type names. A node declaring ``type=<one-of-these>``
@@ -178,6 +178,17 @@ def _resolved_type_label(node: Node) -> str:
     return "codergen"
 
 
+def _is_codergen_verdict_gate(node: Node) -> bool:
+    """Return whether a codergen explicitly declares review-gate behavior."""
+    enabled = str(node.attrs.get("verdict_gate", "false")).strip().lower()
+    return (
+        _resolved_type_label(node) == "codergen"
+        and str(node.attrs.get("class", "")).strip().lower() == "review"
+        and str(node.attrs.get("backend", "")).strip().lower() == "codex"
+        and enabled in {"true", "1", "yes", "on"}
+    )
+
+
 def _is_code_producing(node: Node) -> bool:
     """A node is code-producing iff the engine would invoke ``_codergen``.
 
@@ -191,6 +202,8 @@ def _is_code_producing(node: Node) -> bool:
         return False
     if node.shape in TOPOLOGY_ONLY_SHAPES:
         return False
+    if _is_codergen_verdict_gate(node):
+        return False
     return _resolved_type_label(node) == "codergen"
 
 
@@ -198,12 +211,14 @@ def _is_reviewer(node: Node) -> bool:
     """A node is a reviewer iff its resolved type is in the reviewer set.
 
     Includes both ``type="gate_*"`` / ``type="holdout_eval"`` AND any
-    future aliasing added to ``TYPE_REGISTRY`` under those names. Does
-    NOT include ``type="codergen"`` even if the node is ``class="review"`` —
-    the engine never resolves a ``class=review`` codergen to a reviewer
-    handler; the class is a styling hint, not a dispatch contract.
+    future aliasing added to ``TYPE_REGISTRY`` under those names. A codergen
+    counts only when it explicitly combines ``class="review"`` with
+    ``verdict_gate="true"``; class alone remains a styling hint.
     """
-    return _resolved_type_label(node) in _REVIEWER_TYPE_NAMES
+    return (
+        _resolved_type_label(node) in _REVIEWER_TYPE_NAMES
+        or _is_codergen_verdict_gate(node)
+    )
 
 
 # ---------------------------------------------------------------------------

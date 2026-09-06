@@ -39,7 +39,7 @@ response contract.
 
 ## Controller command
 
-Run each available reviewer backend through this exact binary-owned interface:
+Run the Codex reviewer through this exact binary-owned interface:
 
 ```bash
 dark-factory review \
@@ -48,12 +48,16 @@ dark-factory review \
   --head-sha <full-40-hex-sha> \
   --task-file <path> \
   --output-dir <dir> \
-  --backend <backend>
+  --backend codex
 ```
 
-The backend selects transport only. Do not add model names, inline prompts, or
-vendor CLI flags. Factory/in-graph results may be compared only when their
-controller receipt proves the same bindings.
+The controller v1 adapter accepts only `codex` through its tool-free JSONL
+transport. A valid PASS requires non-empty `evidence_checked` and
+`commands_executed: []`. Its `ReviewTransportReceipt` and controller terminal
+receipt bind the prompt, envelope, response, reviewed revision/tree, and
+evidence manifest. Do not add model names, inline prompts, or vendor CLI
+flags. Factory/in-graph results may be compared only when their controller
+receipt proves the same bindings.
 
 ## Artifacts
 

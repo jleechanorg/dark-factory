@@ -8,6 +8,8 @@ import pathlib
 import stat
 import sys
 
+import pytest
+
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -19,6 +21,25 @@ from runner.handlers import Context, Result, TYPE_REGISTRY  # noqa: E402
 from runner.parser import parse  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _stub_fail_open_web_advice(monkeypatch):
+    """Keep graph-control tests off the host's live /web-advice transport.
+
+    These tests assert gate ordering and short-circuit behavior.  The
+    fail-open advisory node is deliberately an external integration, so let
+    the graph reach its exit without invoking ``gh``/browser transports or
+    depending on operator credentials.
+    """
+    def fake_web_advice(node, ctx):
+        return Result(
+            outcome="success",
+            output="web_advice fixture: fail-open advisory skipped",
+            metadata={"web_advice_outcome": "fixture_skipped"},
+        )
+
+    monkeypatch.setitem(TYPE_REGISTRY, "web_advice", fake_web_advice)
+
+
 def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
     """Holdout-always policy: pr_gates.dot runs sealed holdouts before the
     three adversarial gates, mirroring gates.dot."""
@@ -27,9 +48,11 @@ def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("pr_gates.dot"))
     assert g.nodes["holdout"].attrs.get("type") == "holdout_eval"
+    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
 
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
     ctx.state["gate_skeptic.outcome"] = "success"
+    ctx.state["_df_controller_fixture"] = "cold-review-v1"
     ctx.state["adversarial_reviewer.outcome"] = "success"
     ctx.state["gate_es.outcome"] = "success"
     ctx.state["gate_er.outcome"] = "success"
@@ -45,6 +68,7 @@ def test_pr_gates_runs_holdout_before_evidence_gates(monkeypatch):
         "gate_es",
         "gate_er",
         "gate_cs",
+        "web_advice",
         "exit",
     ]
     assert history[-1].outcome == "success"
@@ -74,7 +98,9 @@ def test_gate_failure_short_circuits(monkeypatch):
         return Result(outcome="success", output="ok")
     monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
     g = parse(_pipeline("gates.dot"))
+    g.nodes["adversarial_reviewer"].attrs["test_fixture"] = "true"
     ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx.state["_df_controller_fixture"] = "cold-review-v1"
     ctx.state["gate_skeptic.outcome"] = "success"
     ctx.state["adversarial_reviewer.outcome"] = "success"
     ctx.state["gate_es.outcome"] = "success"
@@ -88,6 +114,30 @@ def test_gate_failure_short_circuits(monkeypatch):
     assert "gate_er" in nodes
     assert "fix" in nodes
     assert history[-1].outcome in ("failure", "exhausted")
+
+
+def test_gate_skeptic_inconclusive_routes_to_exit_not_fix(monkeypatch):
+    """Issue #827 Defect 1 (graph-level): a null-verdict `inconclusive`
+    outcome from gate_skeptic must never reach the `fix` node — there is no
+    finding to fix — and must not be masked as a pass at exit."""
+    def fake_holdout(node, ctx):
+        return Result(outcome="success", output="ok")
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_holdout)
+    g = parse(_pipeline("gates.dot"))
+    ctx = Context(goal="t", workdir=ROOT, backend="echo")
+    ctx.state["gate_skeptic.outcome"] = "inconclusive"
+
+    history = run(g, ctx, max_steps=20)
+    nodes = [r.node for r in history]
+
+    assert "fix" not in nodes
+    assert "gate_skeptic" in nodes
+    assert history[-1].node == "exit"
+    # `_classify_outcome` (runner/_classify.py) buckets the raw
+    # "inconclusive" outcome into "failure" for engine-internal routing —
+    # the important, previously-broken invariant is that it never reaches
+    # `exit` looking like a pass, and never routes through `fix`.
+    assert history[-1].outcome != "success"
 
 
 def test_gate_nonzero_returncode_cannot_spoof_pass(monkeypatch, tmp_path):

@@ -121,9 +121,12 @@ elif [[ "${PREFLIGHT_RC}" -eq 0 && -n "${PREFLIGHT_JSON}" ]]; then
   STATUS="$(printf '%s' "${PREFLIGHT_JSON}" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
   FALLBACK="$(printf '%s' "${PREFLIGHT_JSON}" | sed -n 's/.*"fallback_recommendation"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
   if [[ "${STATUS}" == "warn" ]]; then
-    printf '\033[33mwarning\033[0m: %s missing; falling back to %s\n' \
-      "${PREFLIGHT_BACKEND}" "${FALLBACK}" >&2
-    if [[ -n "${FALLBACK}" ]]; then
+    if [[ "${__DF_IS_REVIEW}" -eq 1 ]]; then
+      printf '\033[33mwarning\033[0m: %s missing; review keeps the requested backend (no fallback)\n' \
+        "${PREFLIGHT_BACKEND}" >&2
+    elif [[ -n "${FALLBACK}" ]]; then
+      printf '\033[33mwarning\033[0m: %s missing; falling back to %s\n' \
+        "${PREFLIGHT_BACKEND}" "${FALLBACK}" >&2
       new_argv=()
       backend_replaced=0
       prev=""
@@ -140,26 +143,12 @@ elif [[ "${PREFLIGHT_RC}" -eq 0 && -n "${PREFLIGHT_JSON}" ]]; then
         prev="${arg}"
       done
       if [[ "${backend_replaced}" -eq 0 ]]; then
-        if [[ "${__DF_IS_REVIEW:-0}" -eq 1 ]]; then
-          new_argv=("review" "--backend" "${FALLBACK}" "${new_argv[@]:1}")
-        else
-          new_argv=("--backend" "${FALLBACK}" "${new_argv[@]}")
-        fi
+        new_argv=("--backend" "${FALLBACK}" "${new_argv[@]}")
       fi
       set -- "${new_argv[@]}"
     fi
   fi
 fi
-
-# agy-safe: install the FileNotFoundError monkey-patch for the agy
-# subprocess BEFORE the runner Python code runs. handlers.py:627 has
-# an unguarded Popen that panics when agy is missing; this shim
-# returns a stub Popen (exit 127 + "backend_missing=true") so the
-# codergen node returns a clean Result instead of a traceback.
-# No-op when agy is on PATH. Stop-gap for the WIP branch's upstream
-# try/except in handlers.py.
-env PYTHONPATH="${DARK_FACTORY_HOME}${PYTHONPATH:+:${PYTHONPATH}}" \
-  "${VENV_PYTHON}" -m runner._agy_safe >/dev/null 2>&1 || true
 
 args=("$@")
 if [[ "${__DF_IS_REVIEW}" -ne 1 ]]; then

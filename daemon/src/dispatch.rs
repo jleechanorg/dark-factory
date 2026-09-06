@@ -1,5 +1,5 @@
 // Task 9: slot supervisor (design doc §5, spec §4.2.2/§4.2.4). Enforces the
-// operator safety envelope from spec §4.2.8: <= 30 concurrent workers total,
+// operator safety envelope from spec §4.2.8: <= 40 concurrent workers total,
 // <= 15 spawned in a single dispatch call. Pure arithmetic over `Sessions` +
 // `StateStore` trait calls — no subprocess use, no LLM judgment (ZFC: routing
 // to SMALL_PATH/STANDARD_PATH already happened in router.rs; this module only
@@ -7,10 +7,10 @@
 use crate::config::Config;
 use crate::errors::DaemonError;
 use crate::router::RoutingVerdict;
-use crate::state::{
-    set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore,
+use crate::state::{set_human_hold_reason, BeadOverlay, HumanHoldReason, OverlayState, StateStore};
+use crate::tools::{
+    remote_url_for_display, remote_url_matches_repo, Bead, Sessions, SpawnSpec, Vcs,
 };
-use crate::tools::{remote_url_for_display, remote_url_matches_repo, Bead, Sessions, SpawnSpec, Vcs};
 
 #[cfg(test)]
 const SPAWN_CLEANUP_FAILED_PARK_REASON: &str = "spawn_cleanup_failed";
@@ -19,6 +19,7 @@ fn record_spawn_cleanup_failure(
     store: &dyn StateStore,
     overlay: &mut BeadOverlay,
     session_id: &crate::tools::SessionId,
+    ao_project: &str,
     root_error: DaemonError,
     cleanup_error: DaemonError,
 ) -> DaemonError {
@@ -27,6 +28,7 @@ fn record_spawn_cleanup_failure(
     // startup reconciliation would blindly requeue.
     overlay.state = OverlayState::HumanHeld;
     overlay.session_id = Some(session_id.0.clone());
+    overlay.session_ao_project = Some(ao_project.to_string());
     set_human_hold_reason(overlay, HumanHoldReason::SpawnCleanupFailed);
     let cleanup_error = match store.save(overlay) {
         Ok(()) => cleanup_error,
@@ -239,19 +241,20 @@ pub fn dispatch_ready_with_vcs(
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            // jleechan-8jxr r2: pre-fill with cfg.target_repo so this
-            // defensive fallback (no overlay row in the store yet —
-            // should be dead code in production since intake always
-            // persists before dispatch) survives the no-repo park. The
-            // bead's "real" repo would normally be set by
-            // `tick::run_slow_tier`/`intake::normalize`; this value is
-            // only used if the dispatch path runs before any intake.
-            target_repo: Some(cfg.target_repo.clone()),
-            attempt_started_at: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                // jleechan-8jxr r2: pre-fill with cfg.target_repo so this
+                // defensive fallback (no overlay row in the store yet —
+                // should be dead code in production since intake always
+                // persists before dispatch) survives the no-repo park. The
+                // bead's "real" repo would normally be set by
+                // `tick::run_slow_tier`/`intake::normalize`; this value is
+                // only used if the dispatch path runs before any intake.
+                target_repo: Some(cfg.target_repo.clone()),
+                attempt_started_at: None,
             },
             Err(err) if err.is_transient() => {
                 report
@@ -395,6 +398,7 @@ pub fn dispatch_ready_with_vcs(
             ));
             overlay.state = OverlayState::HumanHeld;
             overlay.session_id = None;
+            overlay.session_ao_project = None;
             set_human_hold_reason(
                 &mut overlay,
                 HumanHoldReason::TargetCheckoutUnconfigured,
@@ -426,6 +430,7 @@ pub fn dispatch_ready_with_vcs(
                 ));
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(
                     &mut overlay,
                     HumanHoldReason::TargetCheckoutUnconfigured,
@@ -472,10 +477,8 @@ pub fn dispatch_ready_with_vcs(
                 // an ordinary bead that was never actually adopted from an
                 // external PR.
                 if overlay.is_adopted {
-                    if let Some(ref existing) = overlay
-                        .branch
-                        .as_deref()
-                        .filter(|b| !b.trim().is_empty())
+                    if let Some(ref existing) =
+                        overlay.branch.as_deref().filter(|b| !b.trim().is_empty())
                     {
                         (existing.to_string(), "pr_head")
                     } else {
@@ -576,7 +579,7 @@ pub fn dispatch_ready_with_vcs(
                     .and_then(|num| num.parse::<u64>().ok());
             }
         }
-        if let Err(err) = store.save(&overlay) {
+        if let Err(err) = store.save_dispatch_intent(&overlay, &routing.ao_project) {
             if err.is_transient() {
                 report.failures.push(failure(
                     bead,
@@ -590,30 +593,65 @@ pub fn dispatch_ready_with_vcs(
             return Err(err);
         }
 
+        let target_branch = if overlay.is_adopted || branch_mode == "pr_head" {
+            &branch
+        } else {
+            &cfg.base_branch
+        };
         let expected_revision = match vcs {
-            Some(vcs) => match vcs.base_head_for_repo(&repo, &cfg.base_branch) {
+            Some(vcs) => match vcs.head_sha_within_for_repo(&repo, target_branch, 30) {
                 Ok(sha) if !sha.trim().is_empty() => sha,
-                Ok(_) => {
-                    let error = DaemonError::Config(format!(
-                        "authoritative base revision for repo {repo:?} is empty"
-                    ));
-                    overlay.state = OverlayState::HumanHeld;
-                    set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
+                Err(error)
+                    if error.is_gh_rate_limit()
+                        || matches!(error, DaemonError::Timeout(_) | DaemonError::Deferred(_)) =>
+                {
+                    // A rate-limited/unavailable authoritative revision is
+                    // a resumable admission failure, not proof that the
+                    // checkout is misconfigured. Requeue the same phase;
+                    // the already-registered branch is idempotent for this
+                    // bead on the next dispatch pass. Checked before falling
+                    // back to base_head_for_repo below: a transient failure
+                    // on the primary method should requeue, not spend a
+                    // second lookup that will likely hit the same limit.
+                    overlay.state = OverlayState::Queued;
+                    overlay.park_reason = None;
+                    overlay.attempt_started_at = None;
                     store.save(&overlay)?;
                     report.failures.push(failure(
-                        bead, overlay.attempt, None, "expected_revision_unavailable", error,
+                        bead,
+                        overlay.attempt,
+                        Some(branch),
+                        "expected_revision_deferred",
+                        error,
                     ));
                     continue;
                 }
-                Err(error) => {
-                    overlay.state = OverlayState::HumanHeld;
-                    set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
-                    store.save(&overlay)?;
-                    report.failures.push(failure(
-                        bead, overlay.attempt, None, "expected_revision_unavailable", error,
-                    ));
-                    continue;
-                }
+                // Primary lookup returned an empty sha or a non-transient
+                // error; fall back to base_head_for_repo before giving up.
+                _ => match vcs.base_head_for_repo(&repo, target_branch) {
+                    Ok(sha) if !sha.trim().is_empty() => sha,
+                    Ok(_) => {
+                        let error = DaemonError::Config(format!(
+                            "authoritative revision for branch {target_branch:?} in repo {repo:?} is empty"
+                        ));
+                        overlay.state = OverlayState::HumanHeld;
+                        set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
+                        store.save(&overlay)?;
+                        report.failures.push(failure(
+                            bead, overlay.attempt, None, "expected_revision_unavailable", error,
+                        ));
+                        continue;
+                    }
+                    Err(error) => {
+                        overlay.state = OverlayState::HumanHeld;
+                        set_human_hold_reason(&mut overlay, HumanHoldReason::TargetCheckoutUnconfigured);
+                        store.save(&overlay)?;
+                        report.failures.push(failure(
+                            bead, overlay.attempt, None, "expected_revision_unavailable", error,
+                        ));
+                        continue;
+                    }
+                },
             },
             None => overlay
                 .pre_session_head_sha
@@ -623,16 +661,24 @@ pub fn dispatch_ready_with_vcs(
         overlay.pre_session_head_sha = Some(expected_revision.clone());
         store.save(&overlay)?;
         let preamble = dispatch_prompt_preamble(&repo, &routing.push_remote, &branch);
+        let route_label = routing_verdict_label(*verdict);
+        let pipeline = factory_pipeline_for(*verdict, branch_mode);
+        // Bead rev-z7wua CHANGE 1: this match is EXHAUSTIVE on purpose. It
+        // previously ended in a `_` catch-all, which silently swallowed
+        // `SmallPath` and `StandardPath` — the two code-implementing
+        // verdicts — so they never ran a `.dot` graph at all while the two
+        // read-only verdicts did. An exhaustive match makes any future
+        // `RoutingVerdict` variant a compile error here rather than another
+        // silent non-routing regression.
         let prompt = match verdict {
-            RoutingVerdict::ResearchPath => {
+            RoutingVerdict::ResearchPath | RoutingVerdict::GenericPath => {
+                let verb = if *verdict == RoutingVerdict::ResearchPath {
+                    "research"
+                } else {
+                    "handle"
+                };
                 format!(
-                    "{preamble}Route to RESEARCH_PATH: Run /factory with pipelines/slim/minimal_research.dot to research: {}",
-                    bead.title
-                )
-            }
-            RoutingVerdict::GenericPath => {
-                format!(
-                    "{preamble}Route to GENERIC_PATH: Run /factory with pipelines/slim/spec_gen.dot to handle: {}",
+                    "{preamble}Route to {route_label}: Run /factory with {pipeline} to {verb}: {}",
                     bead.title
                 )
             }
@@ -642,7 +688,22 @@ pub fn dispatch_ready_with_vcs(
             // interim mitigation before this bead's `[repos]` plumbing
             // existed) plus the exact `routing.push_remote`, closing the
             // gap #247's doc comment explicitly deferred to this bead.
-            _ => build_coder_prompt(bead, &branch, &repo, &routing.push_remote),
+            //
+            // rev-z7wua: the `ROUTE:` line is rendered INSIDE
+            // `build_coder_prompt` rather than prepended here, so it counts
+            // against `CODER_PROMPT_TOTAL_CAP` (4,000 — only ~96 chars of
+            // headroom under AO's hard 4,096 spawn ceiling). Prepending it
+            // afterwards would reintroduce the deterministic
+            // "Prompt must be at most 4096 characters" spawn failure that
+            // canary bead jleechan-j4i8 hit.
+            RoutingVerdict::SmallPath | RoutingVerdict::StandardPath => build_coder_prompt(
+                bead,
+                &branch,
+                &repo,
+                &routing.push_remote,
+                route_label,
+                pipeline,
+            ),
         };
 
         let spec = SpawnSpec {
@@ -680,6 +741,7 @@ pub fn dispatch_ready_with_vcs(
                 };
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = Some(session.clone());
+                overlay.session_ao_project = Some(routing.ao_project.clone());
                 set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnCleanupFailed);
                 if let Err(state_error) = store.save(&overlay) {
                     return Err(DaemonError::SpawnCleanupFailed {
@@ -720,6 +782,7 @@ pub fn dispatch_ready_with_vcs(
             Err(err) if err.is_deferred() => {
                 overlay.state = OverlayState::Queued;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
@@ -730,9 +793,41 @@ pub fn dispatch_ready_with_vcs(
                 ));
                 continue;
             }
+            // jleechan-vu3k: AO running but not polling this project is a
+            // DISTINCT failure mode from a genuine transient spawn error.
+            // `DaemonError::Tool`'s stderr for this case satisfies
+            // `is_transient()` too, so this arm MUST precede the general
+            // `is_transient()` arm below (same match-arm-order requirement
+            // as the `is_deferred()` arm above) or it would never fire.
+            // Bare retry composes the identical spawn request against the
+            // identical non-polling AO instance every time — it can never
+            // succeed on its own, so this parks IMMEDIATELY instead of
+            // burning `MAX_TRANSIENT_SPAWN_RETRY` attempts first (live
+            // incident: attempt=10, spawn_failure_count=25, generic
+            // `transient_spawn_retry_cap_exceeded` park with no signal that
+            // the real fix is an operator action on AO, not a bead retry).
+            // `spawn_failure_count` is deliberately NOT incremented — this
+            // isn't a per-bead vendor failure to charge against the bead's
+            // retry budget, it's an infrastructure-readiness gap.
+            Err(err) if err.is_ao_not_polling_project() => {
+                overlay.state = OverlayState::HumanHeld;
+                overlay.session_id = None;
+                overlay.session_ao_project = None;
+                set_human_hold_reason(&mut overlay, HumanHoldReason::AoOrchestratorNotRunning);
+                store.save(&overlay)?;
+                report.failures.push(failure(
+                    bead,
+                    overlay.attempt,
+                    Some(branch.clone()),
+                    "ao_orchestrator_not_running",
+                    err,
+                ));
+                continue;
+            }
             Err(err) if err.is_transient() => {
                 overlay.spawn_failure_count += 1;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 if overlay.spawn_failure_count > MAX_TRANSIENT_SPAWN_RETRY {
                     // Cap exceeded: stop silently cycling Queued<->Dispatching
                     // forever (the livelock this bead-follow-up closes — see
@@ -779,6 +874,7 @@ pub fn dispatch_ready_with_vcs(
             Err(err @ DaemonError::WorktreeCwdMismatch { .. }) => {
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(&mut overlay, HumanHoldReason::WorktreeCwdMismatch);
                 store.save(&overlay)?;
                 report.failures.push(failure(
@@ -793,6 +889,7 @@ pub fn dispatch_ready_with_vcs(
             Err(err) => {
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnFailed);
                 store.save(&overlay)?;
                 report.failures.push(failure(
@@ -817,24 +914,28 @@ pub fn dispatch_ready_with_vcs(
         // newly-created id whose live status contradicts that contract. The
         // id came directly from this spawn call, so it is owned by this
         // dispatch and must be stopped rather than leaked and requeued.
-        if let Ok(Some(actual_branch)) = sessions.session_branch(&session_id) {
+        if let Ok(Some(actual_branch)) =
+            sessions.session_branch_in_project(&session_id, &routing.ao_project)
+        {
             if actual_branch != branch {
                 let phase = "spawn_branch_mismatch";
                 let branch_error = DaemonError::Parse(format!(
                     "ao spawn returned session {} but its live branch is {actual_branch:?}, expected {branch:?} — refusing to record as DISPATCHED",
                     session_id.0
                 ));
-                if let Err(cleanup_error) = sessions.stop(&session_id) {
+                if let Err(cleanup_error) = sessions.stop_in_project(&session_id, &routing.ao_project) {
                     return Err(record_spawn_cleanup_failure(
                         store,
                         &mut overlay,
                         &session_id,
+                        &routing.ao_project,
                         branch_error,
                         cleanup_error,
                     ));
                 }
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(&mut overlay, HumanHoldReason::SpawnBranchMismatch);
                 store.save(&overlay)?;
                 report.failures.push(failure(
@@ -876,17 +977,19 @@ pub fn dispatch_ready_with_vcs(
         let remote_url = match verified_remote {
             Ok(url) => url,
             Err(error) => {
-                if let Err(cleanup_error) = sessions.stop(&session_id) {
+                if let Err(cleanup_error) = sessions.stop_in_project(&session_id, &routing.ao_project) {
                     return Err(record_spawn_cleanup_failure(
                         store,
                         &mut overlay,
                         &session_id,
+                        &routing.ao_project,
                         error,
                         cleanup_error,
                     ));
                 }
                 overlay.state = OverlayState::HumanHeld;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 set_human_hold_reason(
                     &mut overlay,
                     HumanHoldReason::WorktreeRemoteUnverifiable,
@@ -921,17 +1024,19 @@ pub fn dispatch_ready_with_vcs(
                  (jleechan-9sh5 discipline).",
                 bead.id, routing.push_remote
             ));
-            if let Err(cleanup_error) = sessions.stop(&session_id) {
+            if let Err(cleanup_error) = sessions.stop_in_project(&session_id, &routing.ao_project) {
                 return Err(record_spawn_cleanup_failure(
                     store,
                     &mut overlay,
                     &session_id,
+                    &routing.ao_project,
                     remote_error,
                     cleanup_error,
                 ));
             }
             overlay.state = OverlayState::HumanHeld;
             overlay.session_id = None;
+            overlay.session_ao_project = None;
             set_human_hold_reason(&mut overlay, HumanHoldReason::WorktreeRemoteMismatch);
             store.save(&overlay)?;
             report.failures.push(failure(
@@ -946,6 +1051,7 @@ pub fn dispatch_ready_with_vcs(
 
         overlay.state = OverlayState::Dispatched;
         overlay.session_id = Some(session_id.0.clone());
+        overlay.session_ao_project = Some(routing.ao_project.clone());
         // Real progress: whatever was previously blocking spawn (session cap,
         // transient tool error, ...) has cleared, so the retry-cap counter no
         // longer needs to remember it.
@@ -968,7 +1074,7 @@ pub fn dispatch_ready_with_vcs(
             .as_secs();
         overlay.attempt_started_at = Some(now_epoch);
         overlay.autonomy_secs = 0;
-        if let Err(save_err) = store.save(&overlay) {
+        if let Err(save_err) = store.save_dispatched_session(&overlay, &routing.ao_project) {
             // The worker process now exists but the daemon failed to
             // durably record it as DISPATCHED. Kill the just-spawned worker
             // so no live session survives without a matching on-disk record
@@ -976,11 +1082,12 @@ pub fn dispatch_ready_with_vcs(
             // we now have an untracked live session we can't even kill —
             // that's a more urgent operator-facing failure than the original
             // save error, so it takes priority and is returned instead.
-            if let Err(cleanup_error) = sessions.stop(&session_id) {
+            if let Err(cleanup_error) = sessions.stop_in_project(&session_id, &routing.ao_project) {
                 return Err(record_spawn_cleanup_failure(
                     store,
                     &mut overlay,
                     &session_id,
+                    &routing.ao_project,
                     save_err,
                     cleanup_error,
                 ));
@@ -988,6 +1095,7 @@ pub fn dispatch_ready_with_vcs(
             if save_err.is_transient() {
                 overlay.state = OverlayState::Queued;
                 overlay.session_id = None;
+                overlay.session_ao_project = None;
                 store.save(&overlay)?;
                 report.failures.push(failure(
                     bead,
@@ -1121,6 +1229,64 @@ fn truncate_at_char_boundary(s: &mut String, cap: usize) {
     s.truncate(n);
 }
 
+/// Pipeline (`.dot` graph) the spawned coder must run via `/factory` for a
+/// code-implementing routing verdict.
+///
+/// Bead rev-z7wua CHANGE 1: `SMALL_PATH` and `STANDARD_PATH` used to fall
+/// into `dispatch_ready`'s catch-all `_` arm and therefore never ran a graph
+/// at all — the coder got a bare instruction prompt while `RESEARCH_PATH` and
+/// `GENERIC_PATH` (the two verdicts that already had explicit arms) were the
+/// only ones that reached the runner. Every verdict now names a pipeline.
+///
+/// Selection rationale (see `docs/pipeline-selection.md`):
+///
+/// * The dimension that actually picks the graph is *is there already a PR to
+///   iterate on?*, not the router's complexity judgment. `branch_mode ==
+///   "pr_head"` is exactly `DriveBranchDecision::PrHead` — the coder is bound
+///   to an open PR's own head ref — which is the doc's "In-flight PR
+///   iteration" row: `pipelines/slim/minimal_pr.dot`.
+/// * Otherwise this is create-new-work (`Generated` / `ForkFallback`), the
+///   doc's "New feature, full production loop" row:
+///   `pipelines/slim/minimal_feature.dot`.
+/// * `SMALL_PATH` deliberately gets the SAME graph as `STANDARD_PATH` rather
+///   than a lighter one. The holdout-always policy (`docs/pipeline-selection.md`
+///   §"Holdout-always policy") requires every implement-bearing lane to run
+///   the sealed behavioral holdouts, and the only implement-bearing lanes that
+///   carry both a holdout node and a bounded fix loop are `minimal_feature.dot`
+///   and `minimal_pr.dot`. `hello.dot` is the `--backend echo` wiring smoke,
+///   and `gates.dot` / `pr_gates.dot` are validate-only (no fix loop), so
+///   neither is a legitimate "small implementation" lane. The router verdict
+///   still reaches the coder as the `SMALL_PATH`/`STANDARD_PATH` label in the
+///   prompt.
+/// * Both graphs pin their reviewer through `backend_priority=` (rather than a
+///   hard `backend=`), which is the attribute `DARK_FACTORY_ADVERSARIAL_PRIORITY`
+///   overrides — this is why they, and not `two_node.dot` (whose
+///   `parallel_reviewer` is codex-only by transport), are the right targets.
+fn factory_pipeline_for(verdict: RoutingVerdict, branch_mode: &str) -> &'static str {
+    match verdict {
+        RoutingVerdict::ResearchPath => "pipelines/slim/minimal_research.dot",
+        RoutingVerdict::GenericPath => "pipelines/slim/spec_gen.dot",
+        RoutingVerdict::SmallPath | RoutingVerdict::StandardPath => {
+            if branch_mode == "pr_head" {
+                "pipelines/slim/minimal_pr.dot"
+            } else {
+                "pipelines/slim/minimal_feature.dot"
+            }
+        }
+    }
+}
+
+/// Stable `SMALL_PATH` / `STANDARD_PATH` / ... token for a verdict, used both
+/// in the dispatch prompt and (via `tick.rs`) in telemetry.
+fn routing_verdict_label(verdict: RoutingVerdict) -> &'static str {
+    match verdict {
+        RoutingVerdict::SmallPath => "SMALL_PATH",
+        RoutingVerdict::StandardPath => "STANDARD_PATH",
+        RoutingVerdict::ResearchPath => "RESEARCH_PATH",
+        RoutingVerdict::GenericPath => "GENERIC_PATH",
+    }
+}
+
 /// Render the full coder prompt template from already-capped `description`,
 /// `notes`, and `tree` text. Split out of `build_coder_prompt` so the
 /// total-budget reconciliation pass (jleechan-niqz) can re-render cheaply
@@ -1136,15 +1302,30 @@ fn truncate_at_char_boundary(s: &mut String, cap: usize) {
 /// dominates the description (it's the operator's per-attempt override of
 /// the bead body), and the repo-map tree drops first when the AO 4,096-char
 /// ceiling forces a cut.
+/// The three already-capped, shrinkable text sections of a coder prompt,
+/// grouped so `render_coder_prompt` stays within clippy's 7-argument limit
+/// after bead rev-z7wua added the `route_label` / `pipeline` pair. They
+/// travel together through every budget-reconciliation pass anyway.
+struct CoderPromptSections<'a> {
+    description: &'a str,
+    notes: &'a str,
+    tree: &'a str,
+}
+
 fn render_coder_prompt(
     bead: &crate::tools::Bead,
     branch: &str,
     target_repo: &str,
     remote: &str,
-    description: &str,
-    notes: &str,
-    tree: &str,
+    route_label: &str,
+    pipeline: &str,
+    sections: CoderPromptSections<'_>,
 ) -> String {
+    let CoderPromptSections {
+        description,
+        notes,
+        tree,
+    } = sections;
     let description_block = if description.is_empty() {
         String::new()
     } else {
@@ -1193,6 +1374,10 @@ fn render_coder_prompt(
         "You are an autonomous factory coder working bead {id}.\n\
          \n\
          TASK: {title}\n\
+         \n\
+         ROUTE: {route_label} — run /factory with {pipeline}. That graph owns \
+         the review, holdout, and evidence gates; do not hand-implement \
+         outside it.\n\
          {description_block}{notes_block}{external_block}\
          \n\
          REPO: {target_repo} — all commits, pushes, and the PR belong to this \
@@ -1260,14 +1445,24 @@ fn shrink_by(text: &mut String, excess: usize, marker: &str) {
     // chars of the original survive (operator sees "[tree truncated]"
     // and knows the section was sacrificed, not silently dropped).
     let was_nonempty = !text.is_empty();
-    let target = text.len().saturating_sub(excess).saturating_sub(marker.len());
+    let target = text
+        .len()
+        .saturating_sub(excess)
+        .saturating_sub(marker.len());
     truncate_at_char_boundary(text, target);
     if was_nonempty {
         text.push_str(marker);
     }
 }
 
-fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str, remote: &str) -> String {
+fn build_coder_prompt(
+    bead: &crate::tools::Bead,
+    branch: &str,
+    target_repo: &str,
+    remote: &str,
+    route_label: &str,
+    pipeline: &str,
+) -> String {
     let mut description = bead.description.trim().to_string();
     if description.len() > CODER_PROMPT_DESCRIPTION_CAP {
         truncate_at_char_boundary(&mut description, CODER_PROMPT_DESCRIPTION_CAP);
@@ -1286,7 +1481,15 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
         tree.push_str("\n[tree truncated]");
     }
 
-    let mut prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+    let mut prompt = render_coder_prompt(
+        bead,
+        branch,
+        target_repo,
+        remote,
+        route_label,
+        pipeline,
+        CoderPromptSections { description: &description, notes: &notes, tree: &tree },
+    );
 
     // jleechan-niqz: the per-section caps above bound `description`, `notes`,
     // and `tree` independently but never reconciled their SUM (plus the fixed
@@ -1305,19 +1508,43 @@ fn build_coder_prompt(bead: &crate::tools::Bead, branch: &str, target_repo: &str
     if prompt.len() > CODER_PROMPT_TOTAL_CAP && !tree.is_empty() {
         let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
         shrink_by(&mut tree, excess, "\n[tree truncated]");
-        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+        prompt = render_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            route_label,
+            pipeline,
+            CoderPromptSections { description: &description, notes: &notes, tree: &tree },
+        );
     }
 
     if prompt.len() > CODER_PROMPT_TOTAL_CAP && !description.is_empty() {
         let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
         shrink_by(&mut description, excess, "\n[description truncated]");
-        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+        prompt = render_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            route_label,
+            pipeline,
+            CoderPromptSections { description: &description, notes: &notes, tree: &tree },
+        );
     }
 
     if prompt.len() > CODER_PROMPT_TOTAL_CAP && !notes.is_empty() {
         let excess = prompt.len() - CODER_PROMPT_TOTAL_CAP;
         shrink_by(&mut notes, excess, "\n[notes truncated]");
-        prompt = render_coder_prompt(bead, branch, target_repo, remote, &description, &notes, &tree);
+        prompt = render_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            route_label,
+            pipeline,
+            CoderPromptSections { description: &description, notes: &notes, tree: &tree },
+        );
     }
 
     prompt
@@ -1331,6 +1558,28 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
+    /// `build_coder_prompt` with the ordinary new-work STANDARD_PATH route
+    /// arguments (bead rev-z7wua added `route_label` / `pipeline`). The
+    /// pre-existing prompt-shape and cap-reconciliation tests below care
+    /// about description/notes/tree budgeting, not about which graph the
+    /// coder is told to run, so they all go through this shim rather than
+    /// repeating the same two literals nine times.
+    fn coder_prompt(
+        bead: &crate::tools::Bead,
+        branch: &str,
+        target_repo: &str,
+        remote: &str,
+    ) -> String {
+        build_coder_prompt(
+            bead,
+            branch,
+            target_repo,
+            remote,
+            "STANDARD_PATH",
+            "pipelines/slim/minimal_feature.dot",
+        )
+    }
+
     /// Local unit-test fake mirroring `tests/common/mod.rs`'s `FakeSessions`
     /// (same call-log shape) without the `daemon::` crate-qualified imports
     /// that fakes file needs when included from `tests/*.rs` as a separate
@@ -1341,6 +1590,12 @@ mod tests {
         calls: RefCell<Vec<String>>,
         fail_spawn_for: RefCell<Vec<String>>,
         fail_spawn_fatal_for: RefCell<Vec<String>>,
+        // jleechan-vu3k: scripted spawn failure carrying the real
+        // "AO running but not polling this project" bridge signature —
+        // distinct from `fail_spawn_for`'s generic scripted `Tool` error,
+        // so tests can assert the dedicated escalation path fires instead
+        // of the generic transient-retry-cap path.
+        fail_spawn_ao_not_polling_for: RefCell<Vec<String>>,
         // jleechan-w28n: scripted `DaemonError::Deferred` spawn outcome,
         // distinct from `fail_spawn_for`'s `DaemonError::Tool` — exercises
         // the AO admission-control-queue path (session-cap backpressure)
@@ -1409,6 +1664,7 @@ mod tests {
                 calls: RefCell::new(Vec::new()),
                 fail_spawn_for: RefCell::new(Vec::new()),
                 fail_spawn_fatal_for: RefCell::new(Vec::new()),
+                fail_spawn_ao_not_polling_for: RefCell::new(Vec::new()),
                 fail_spawn_deferred_for: RefCell::new(Vec::new()),
                 fail_spawn_fallback_exhausted_deferred_for: RefCell::new(Vec::new()),
                 fail_spawn_cleanup_for: RefCell::new(Vec::new()),
@@ -1428,6 +1684,12 @@ mod tests {
 
         fn fail_spawn_fatal_for(&self, bead_id: &str) {
             self.fail_spawn_fatal_for
+                .borrow_mut()
+                .push(bead_id.to_string());
+        }
+
+        fn fail_spawn_ao_not_polling_for(&self, bead_id: &str) {
+            self.fail_spawn_ao_not_polling_for
                 .borrow_mut()
                 .push(bead_id.to_string());
         }
@@ -1509,17 +1771,17 @@ mod tests {
             // the WorktreeCwdMismatch branch upstream. Tests can flip
             // `ignore_cwd_guard_for.borrow_mut().insert(spec.bead_id.clone())`
             // to bypass the guard for legacy layout coverage.
-            if !self
-                .ignore_cwd_guard_for
-                .borrow()
-                .contains(&spec.bead_id)
-            {
+            if !self.ignore_cwd_guard_for.borrow().contains(&spec.bead_id) {
                 let actual = self
                     .spawn_cwd_for
                     .borrow()
                     .get(&spec.bead_id)
                     .cloned()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    .unwrap_or_else(|| {
+                        spec.expected_cwd
+                            .clone()
+                            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+                    });
                 crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), &actual)?;
             }
             self.calls
@@ -1536,6 +1798,17 @@ mod tests {
                     "scripted fatal spawn failure for {}",
                     spec.bead_id
                 )));
+            }
+            if self
+                .fail_spawn_ao_not_polling_for
+                .borrow()
+                .contains(&spec.bead_id)
+            {
+                return Err(DaemonError::Tool {
+                    tool: "ao spawn --agent minimax".to_string(),
+                    rc: 1,
+                    stderr: "[dark-factory AO bridge] running AO instance is not polling project dark-factory".to_string(),
+                });
             }
             if self.fail_spawn_cleanup_for.borrow().contains(&spec.bead_id) {
                 return Err(DaemonError::SpawnCleanupFailed {
@@ -1586,10 +1859,7 @@ mod tests {
                     ),
                     (
                         "agy".to_string(),
-                        DaemonError::Deferred(format!(
-                            "REQUEST=sq-scripted-{}",
-                            spec.bead_id
-                        )),
+                        DaemonError::Deferred(format!("REQUEST=sq-scripted-{}", spec.bead_id)),
                     ),
                 ]));
             }
@@ -1643,6 +1913,84 @@ mod tests {
                 .borrow()
                 .get(ao_project)
                 .cloned())
+        }
+    }
+
+    /// Minimal `Vcs` fake for the `target_branch` regression coverage below:
+    /// scripts `head_sha_within_for_repo`/`base_head_for_repo` to return a
+    /// SHA only for a known-good branch (e.g. `cfg.base_branch`) and an
+    /// error for any other branch name, so a test can distinguish "dispatch
+    /// queried the correct branch" from "dispatch queried a stale/not-yet-
+    /// created branch" by observing whether `expected_revision` resolution
+    /// succeeds. Every other `Vcs` method is unused by `dispatch_ready_with_vcs`
+    /// and panics if called, so an unexpected call fails loudly.
+    struct FakeVcs {
+        known_branches: HashMap<String, String>,
+    }
+
+    impl FakeVcs {
+        fn new(known_branches: &[(&str, &str)]) -> Self {
+            Self {
+                known_branches: known_branches
+                    .iter()
+                    .map(|(branch, sha)| (branch.to_string(), sha.to_string()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Vcs for FakeVcs {
+        fn base_head(&self, _base_branch: &str) -> Result<String, DaemonError> {
+            unimplemented!("FakeVcs::base_head not scripted for this test")
+        }
+        fn create_branch_at(&self, _name: &str, _sha: &str) -> Result<(), DaemonError> {
+            unimplemented!("FakeVcs::create_branch_at not scripted for this test")
+        }
+        fn head_sha(&self, _branch: &str) -> Result<String, DaemonError> {
+            unimplemented!("FakeVcs::head_sha not scripted for this test")
+        }
+        fn head_sha_within_for_repo(
+            &self,
+            _repo: &str,
+            branch: &str,
+            _timeout_secs: u64,
+        ) -> Result<String, DaemonError> {
+            self.known_branches.get(branch).cloned().ok_or_else(|| {
+                DaemonError::Tool {
+                    tool: "gh api".into(),
+                    rc: 1,
+                    stderr: format!("branch {branch:?} not found"),
+                }
+            })
+        }
+        fn base_head_for_repo(
+            &self,
+            _repo: &str,
+            base_branch: &str,
+        ) -> Result<String, DaemonError> {
+            self.known_branches.get(base_branch).cloned().ok_or_else(|| {
+                DaemonError::Tool {
+                    tool: "gh api".into(),
+                    rc: 1,
+                    stderr: format!("branch {base_branch:?} not found"),
+                }
+            })
+        }
+        fn is_remote_ahead(&self, _branch: &str, _remote_sha: &str) -> Result<bool, DaemonError> {
+            unimplemented!("FakeVcs::is_remote_ahead not scripted for this test")
+        }
+        fn remote_head_sha(&self, _branch: &str) -> Result<String, DaemonError> {
+            unimplemented!("FakeVcs::remote_head_sha not scripted for this test")
+        }
+        fn is_ancestor(
+            &self,
+            _ancestor_sha: &str,
+            _descendant_sha: &str,
+        ) -> Result<bool, DaemonError> {
+            unimplemented!("FakeVcs::is_ancestor not scripted for this test")
+        }
+        fn push_fix_commit(&self, _branch: &str, _message: &str) -> Result<(), DaemonError> {
+            unimplemented!("FakeVcs::push_fix_commit not scripted for this test")
         }
     }
 
@@ -1827,7 +2175,7 @@ mod tests {
             ao_project: None,
             base_branch: "main".into(),
             stage: 1,
-            max_workers: 30,
+            max_workers: 40,
             max_batch: 15,
             fast_tick_secs: 60,
             slow_tick_secs: 600,
@@ -2012,7 +2360,10 @@ mod tests {
             .get("jleechan-fork-pr-bead")
             .cloned()
             .expect("overlay must be persisted");
-        assert_eq!(overlay.branch.as_deref(), Some("factory/jleechan-fork-pr-bead-r1"));
+        assert_eq!(
+            overlay.branch.as_deref(),
+            Some("factory/jleechan-fork-pr-bead-r1")
+        );
         assert!(
             !overlay.is_adopted,
             "fork fallback dispatches a fresh generated branch, not the PR's own              branch, so it must NOT take the append-only adopted-remediation path"
@@ -2031,7 +2382,7 @@ mod tests {
         assert_eq!(
             report.success_count(),
             15,
-            "must cap at max_batch even with 30 free slots"
+            "must cap at max_batch even with 40 free slots"
         );
         let spawn_calls = sessions
             .calls
@@ -2043,10 +2394,142 @@ mod tests {
     }
 
     #[test]
+    fn capacity_40_workers_15_batch_boundaries() {
+        let store = FakeStateStore::new();
+
+        // Verify ALL canonical production configuration files specify max_workers = 40, max_batch = 15
+        let canonical_paths = [
+            std::path::Path::new("contracts/daemon.toml.example"),
+            std::path::Path::new("config.toml"),
+            std::path::Path::new("../config/daemon.toml"),
+        ];
+        for path in canonical_paths {
+            let loaded = crate::config::load(path)
+                .unwrap_or_else(|e| panic!("failed to load canonical config {}: {e}", path.display()));
+            assert_eq!(
+                loaded.max_workers, 40,
+                "canonical config {} must specify max_workers = 40",
+                path.display()
+            );
+            assert_eq!(
+                loaded.max_batch, 15,
+                "canonical config {} must specify max_batch = 15",
+                path.display()
+            );
+        }
+
+        let prod_example = crate::config::load(std::path::Path::new("contracts/daemon.toml.example"))
+            .expect("canonical contracts/daemon.toml.example must be valid");
+        let mut cfg = cfg();
+        cfg.max_workers = prod_example.max_workers;
+        cfg.max_batch = prod_example.max_batch;
+        let ready = beads(40);
+
+        // 1. With 39 active sessions exactly one capacity slot remains
+        let sessions_39 = FakeSessions::new(39);
+        let report_39 = dispatch_ready(&sessions_39, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report_39.success_count(),
+            1,
+            "with 39 active workers out of 40 capacity, exactly 1 slot must be dispatched"
+        );
+
+        // With 40 active sessions, zero remain
+        let sessions_40 = FakeSessions::new(40);
+        let report_40 = dispatch_ready(&sessions_40, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report_40.success_count(),
+            0,
+            "with 40 active workers out of 40 capacity, 0 slots must be dispatched"
+        );
+
+        // 2. Forty ready tasks with 0 active dispatch at most 15 in one tick
+        let sessions_0 = FakeSessions::new(0);
+        let report_0 = dispatch_ready(&sessions_0, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report_0.success_count(),
+            15,
+            "with 0 active workers and 40 ready tasks, tick 1 must dispatch exactly max_batch (15)"
+        );
+
+        // Next tick with 15 active sessions and remaining ready tasks dispatches next batch of 15 (total 30 <= 40)
+        let sessions_15 = FakeSessions::new(15);
+        let report_15 = dispatch_ready(&sessions_15, &store, &cfg, &ready[15..]).unwrap();
+        assert_eq!(
+            report_15.success_count(),
+            15,
+            "tick 2 with 15 active workers must dispatch at most 15"
+        );
+
+        // Tick 3 with 30 active workers dispatches remaining 10 (30 + 10 = 40 cap)
+        let sessions_30 = FakeSessions::new(30);
+        let report_30 = dispatch_ready(&sessions_30, &store, &cfg, &ready[30..]).unwrap();
+        assert_eq!(
+            report_30.success_count(),
+            10,
+            "tick 3 with 30 active workers must dispatch remaining 10 capacity slots"
+        );
+    }
+
+    #[test]
+    fn production_capacity_config_integration() {
+        // `capacity_40_workers_15_batch_boundaries` above already loads a
+        // fixed enumeration of canonical config paths through the real
+        // `config::load` parser. This test instead mirrors the actual
+        // runtime SELECTION rule the daemon binary applies at startup
+        // (`daemon/src/main.rs::default_config_path`: prefer the live
+        // deployed `config/daemon.toml`, else fall back to the shipped
+        // example) so the file proven correct here is the one production
+        // would truly load, not merely one candidate among several that
+        // happen to agree today.
+        let live = std::path::Path::new("../config/daemon.toml");
+        let selected = if live.exists() {
+            live
+        } else {
+            std::path::Path::new("contracts/daemon.toml.example")
+        };
+
+        let prod_cfg = crate::config::load(selected).unwrap_or_else(|e| {
+            panic!(
+                "production-selected config {} failed to load: {e}",
+                selected.display()
+            )
+        });
+        assert_eq!(
+            prod_cfg.max_workers, 40,
+            "daemon startup config must resolve max_workers = 40"
+        );
+        assert_eq!(
+            prod_cfg.max_batch, 15,
+            "daemon startup config must resolve max_batch = 15"
+        );
+
+        // Prove the production-loaded capacity values actually gate
+        // dispatch_ready's real slot arithmetic end-to-end, not merely that
+        // they deserialize correctly.
+        let mut cfg = cfg();
+        cfg.max_workers = prod_cfg.max_workers;
+        cfg.max_batch = prod_cfg.max_batch;
+
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let ready = beads(prod_cfg.max_batch + 5);
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report.success_count(),
+            prod_cfg.max_batch,
+            "a single tick against the production-selected config must cap dispatch at max_batch"
+        );
+    }
+
+    #[test]
     fn twenty_eight_active_of_thirty_spawns_exactly_two() {
         let sessions = FakeSessions::new(28);
         let store = FakeStateStore::new();
-        let cfg = cfg();
+        // Pinned to 30 (independent of cfg()'s default max_workers) so this
+        // test keeps exercising the 30-worker boundary it's named for.
+        let mut cfg = cfg();
+        cfg.max_workers = 30;
         let ready = beads(40);
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
@@ -2069,7 +2552,10 @@ mod tests {
     fn thirty_active_spawns_nothing_and_never_calls_spawn() {
         let sessions = FakeSessions::new(30);
         let store = FakeStateStore::new();
-        let cfg = cfg();
+        // Pinned to 30 (independent of cfg()'s default max_workers) so this
+        // test keeps exercising the 30-worker boundary it's named for.
+        let mut cfg = cfg();
+        cfg.max_workers = 30;
         let ready = beads(40);
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
@@ -2103,18 +2589,19 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
-            pre_session_head_sha: None,
-            park_reason: None,
-            // jleechan-8jxr r2: a real intake-persisted overlay carries a
-            // resolved `target_repo`. The old test left this `None` and
-            // relied on the pre-fix silent default to `cfg.target_repo` —
-            // which is exactly the bug this bead's regression test
-            // (`dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all`)
-            // pins. Update the test fixture to reflect production reality.
-            target_repo: Some("owner/repo".to_string()),
-            attempt_started_at: None,
+                pre_session_head_sha: None,
+                park_reason: None,
+                // jleechan-8jxr r2: a real intake-persisted overlay carries a
+                // resolved `target_repo`. The old test left this `None` and
+                // relied on the pre-fix silent default to `cfg.target_repo` —
+                // which is exactly the bug this bead's regression test
+                // (`dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all`)
+                // pins. Update the test fixture to reflect production reality.
+                target_repo: Some("owner/repo".to_string()),
+                attempt_started_at: None,
             })
             .unwrap();
         let cfg = cfg();
@@ -2156,6 +2643,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2216,6 +2704,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2267,6 +2756,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2319,6 +2809,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2374,6 +2865,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2408,7 +2900,9 @@ mod tests {
             "distinct reason from unmapped_target_repo so operators can tell which remediation to apply"
         );
         assert!(
-            report.failures[0].error.contains("no resolvable repo identity"),
+            report.failures[0]
+                .error
+                .contains("no resolvable repo identity"),
             "error must explain why the bead was parked: {}",
             report.failures[0].error
         );
@@ -2483,6 +2977,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2521,10 +3016,7 @@ mod tests {
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
         assert!(
-            report
-                .failures
-                .iter()
-                .all(|f| f.phase != "unmapped_repo"),
+            report.failures.iter().all(|f| f.phase != "unmapped_repo"),
             "a bead with a parseable external_ref MUST NOT park as unmapped_repo; \
              the legacy overlay's None should be back-filled from the bead. failures = {:?}",
             report.failures
@@ -2559,6 +3051,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2591,10 +3084,7 @@ mod tests {
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
         assert!(
-            report
-                .failures
-                .iter()
-                .all(|f| f.phase != "unmapped_repo"),
+            report.failures.iter().all(|f| f.phase != "unmapped_repo"),
             "a bead with a body `target_repo:` field MUST NOT park as unmapped_repo; \
              legacy overlay's None must be back-filled from the bead body. failures = {:?}",
             report.failures
@@ -2630,6 +3120,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2715,6 +3206,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -2730,7 +3222,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "worldai".to_string(),
-               local_checkout: Some(std::env::current_dir().unwrap()),
+                local_checkout: Some(std::env::current_dir().unwrap()),
             },
         );
         let ready = beads(1);
@@ -2746,7 +3238,10 @@ mod tests {
     fn dispatch_order_follows_ready_slice_order() {
         let sessions = FakeSessions::new(29);
         let store = FakeStateStore::new();
-        let cfg = cfg();
+        // Pinned to 30 (independent of cfg()'s default max_workers) so this
+        // test keeps exercising the 30-worker boundary it's named for.
+        let mut cfg = cfg();
+        cfg.max_workers = 30;
         let ready = beads(5);
 
         let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
@@ -2833,7 +3328,10 @@ mod tests {
         assert_eq!(overlay.state, OverlayState::HumanHeld);
         assert_eq!(overlay.session_id, None);
         assert_eq!(overlay.branch.as_deref(), Some("factory/bead-0-r1"));
-        assert_eq!(overlay.park_reason.as_deref(), Some("spawn_branch_mismatch"));
+        assert_eq!(
+            overlay.park_reason.as_deref(),
+            Some("spawn_branch_mismatch")
+        );
     }
 
     #[test]
@@ -3125,8 +3623,48 @@ mod tests {
     }
 
     #[test]
+    fn ao_not_polling_project_spawn_failure_parks_distinctly_without_retry() {
+        // jleechan-vu3k: the real live signature is a `Tool` error whose
+        // stderr is `is_transient() == true` (a generic tool failure would
+        // just retry). This test proves the daemon distinguishes AO
+        // running-but-not-polling from a generic transient spawn failure:
+        // it must park IMMEDIATELY under a distinct reason, WITHOUT
+        // incrementing `spawn_failure_count` (no retry budget burned) and
+        // WITHOUT going through the generic `transient_spawn_retry_cap_exceeded`
+        // path at all.
+        let sessions = FakeSessions::new(0);
+        sessions.fail_spawn_ao_not_polling_for("bead-0");
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let ready = beads(2);
+
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+
+        let bead_0 = store.load("bead-0").unwrap().unwrap();
+        assert_eq!(bead_0.state, OverlayState::HumanHeld);
+        assert_eq!(
+            bead_0.park_reason.as_deref(),
+            Some("ao_orchestrator_not_running")
+        );
+        assert_eq!(
+            bead_0.spawn_failure_count, 0,
+            "AO-not-polling must not charge the bead's spawn retry budget"
+        );
+        assert_eq!(report.success_count(), 1);
+        assert_eq!(report.successes[0].bead_id, "bead-1");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].bead_id, "bead-0");
+        assert_eq!(report.failures[0].phase, "ao_orchestrator_not_running");
+        let calls = sessions.calls.borrow();
+        assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
+        assert!(calls.iter().any(|c| c == "spawn(bead-1)"));
+    }
+
+    #[test]
     fn adapter_cleanup_failure_persists_live_session_before_fatal_return() {
         let sessions = FakeSessions::new(0);
+        sessions.ignore_cwd_guard("bead-0");
+        sessions.ignore_cwd_guard("bead-1");
         sessions.fail_spawn_cleanup_for("bead-0");
         let store = FakeStateStore::new();
         let cfg = cfg();
@@ -3159,6 +3697,8 @@ mod tests {
     #[test]
     fn adapter_cleanup_hold_save_failure_leaves_branch_for_fail_closed_recovery() {
         let sessions = FakeSessions::new(0);
+        sessions.ignore_cwd_guard("bead-0");
+        sessions.ignore_cwd_guard("bead-1");
         sessions.fail_spawn_cleanup_for("bead-0");
         let store = FakeStateStore::new();
         store.fail_save_for("bead-0", OverlayState::HumanHeld);
@@ -3254,7 +3794,10 @@ mod tests {
             matches!(err, DaemonError::SpawnCleanupFailed { .. }),
             "stop failure must remain fatal because a live untracked worker may remain: {err:?}"
         );
-        assert!(!err.is_transient(), "cleanup failure must never back off/retry");
+        assert!(
+            !err.is_transient(),
+            "cleanup failure must never back off/retry"
+        );
 
         let calls = sessions.calls.borrow();
         assert!(calls.iter().any(|c| c == "spawn(bead-0)"));
@@ -3286,7 +3829,7 @@ mod tests {
             file_tree_summary: "src/\n  flux.rs\n  main.rs".into(),
             external_ref: Some("jleechanorg/delorean#42".into()),
         };
-        let prompt = build_coder_prompt(&bead, "factory/bead-x-r1", "jleechanorg/delorean", "worldai");
+        let prompt = coder_prompt(&bead, "factory/bead-x-r1", "jleechanorg/delorean", "worldai");
 
         assert!(prompt.contains("Fix the flux capacitor"), "title missing");
         assert!(
@@ -3358,7 +3901,7 @@ mod tests {
             file_tree_summary: String::new(),
             external_ref: None,
         };
-        let prompt = build_coder_prompt(
+        let prompt = coder_prompt(
             &bead,
             "factory/bead-rln6-r1",
             "jleechanorg/dark-factory",
@@ -3411,8 +3954,7 @@ mod tests {
         // (d) Mid-session publication is the failure mode this fixes. The
         //     prompt must call out the consequence so coders stop doing it.
         assert!(
-            prompt.contains("Mid-session publication")
-                && prompt.contains("rejected fast"),
+            prompt.contains("Mid-session publication") && prompt.contains("rejected fast"),
             "prompt must warn against mid-session evidence publication:\n{prompt}"
         );
     }
@@ -3427,7 +3969,7 @@ mod tests {
             file_tree_summary: String::new(),
             external_ref: None,
         };
-        let prompt = build_coder_prompt(&bead, "factory/bead-y-r1", "owner/repo", "origin");
+        let prompt = coder_prompt(&bead, "factory/bead-y-r1", "owner/repo", "origin");
 
         assert!(
             prompt.contains("[description truncated]"),
@@ -3458,7 +4000,7 @@ mod tests {
             external_ref: None,
         };
         // Must not panic.
-        let prompt = build_coder_prompt(&bead, "factory/bead-u-r1", "owner/repo", "origin");
+        let prompt = coder_prompt(&bead, "factory/bead-u-r1", "owner/repo", "origin");
         assert!(prompt.contains("[description truncated]"));
     }
 
@@ -3479,8 +4021,7 @@ mod tests {
 
         let bead = Bead {
             id: "jleechan-j4i8".into(),
-            title: "Regression-shape bead: description + tree summary would sum past 4096"
-                .into(),
+            title: "Regression-shape bead: description + tree summary would sum past 4096".into(),
             // A "moderate-length" description like the live incident's
             // ~1,100 chars, but sized here to sit under its own 6,000-char
             // per-section cap while still contributing meaningfully to the
@@ -3496,7 +4037,7 @@ mod tests {
             external_ref: Some("jleechanorg/dark-factory#999".into()),
         };
 
-        let prompt = build_coder_prompt(
+        let prompt = coder_prompt(
             &bead,
             "factory/jleechan-j4i8-r1",
             "jleechanorg/dark-factory",
@@ -3562,7 +4103,7 @@ mod tests {
         };
 
         // Must not panic.
-        let prompt = build_coder_prompt(&bead, "factory/bead-total-unicode-r1", "owner/repo", "origin");
+        let prompt = coder_prompt(&bead, "factory/bead-total-unicode-r1", "owner/repo", "origin");
         assert!(prompt.len() <= CODER_PROMPT_TOTAL_CAP);
     }
 
@@ -3586,7 +4127,7 @@ mod tests {
             file_tree_summary: String::new(),
             external_ref: Some("jleechanorg/dark-factory#338".into()),
         };
-        let prompt = build_coder_prompt(
+        let prompt = coder_prompt(
             &bead,
             "factory/jleechan-0hqx-r2",
             "jleechanorg/dark-factory",
@@ -3598,7 +4139,9 @@ mod tests {
         // issue spec, so the priority relationship is spelled out for the
         // coder (not just implied by ordering).
         assert!(
-            prompt.contains("OPERATOR GUIDANCE (attempt-specific; authoritative over the DESCRIPTION above"),
+            prompt.contains(
+                "OPERATOR GUIDANCE (attempt-specific; authoritative over the DESCRIPTION above"
+            ),
             "prompt must contain the OPERATOR GUIDANCE section header verbatim, got:\n{prompt}"
         );
 
@@ -3635,7 +4178,7 @@ mod tests {
             file_tree_summary: String::new(),
             external_ref: None,
         };
-        let prompt = build_coder_prompt(
+        let prompt = coder_prompt(
             &bead,
             "factory/jleechan-no-notes-r1",
             "owner/repo",
@@ -3661,23 +4204,40 @@ mod tests {
         let bead = Bead {
             id: "jleechan-0hqx-budget".into(),
             title: "Reconciliation priority".into(),
-            // Sized so each section sits under its own per-section cap (no
-            // pre-truncation marker) yet their SUM pushes the rendered
-            // prompt past the 4,000-char total cap — forcing the
-            // reconciliation pass to do real work in the documented
-            // priority order. With tree=3,500 + description=500 +
-            // notes=1,400 + boilerplate~1,100 (the rln6 EVIDENCE block grew
-            // the fixed boilerplate from ~700 to ~1,100 chars) ≈ 6,500 chars
-            // total, the excess (~2,500) absorbs entirely into the tree's
-            // first shrink pass; tree survives with the `[tree truncated]`
-            // marker appended, while description and notes stay intact
-            // (no further shrink passes needed).
+            // Sized so their SUM pushes the rendered prompt well past the
+            // 4,000-char total cap, forcing the reconciliation pass to do
+            // real work in the documented priority order (tree, then
+            // description, then notes).
+            //
+            // How the cascade ACTUALLY runs (bead rev-z7wua corrected this
+            // comment, which previously claimed the excess "absorbs entirely
+            // into the tree's first shrink pass" — it never did): `shrink_by`
+            // charges the WHOLE remaining excess against a single section, so
+            // when the excess exceeds that section's length the section is
+            // annihilated down to its bare truncation marker and the leftover
+            // excess cascades to the next one. Here the tree is annihilated
+            // first, then the description, and only the residue reaches the
+            // notes. The assertions below are the invariant: notes — the
+            // operator's per-attempt override — must be the section that
+            // survives.
+            //
+            // rev-z7wua also RE-CALIBRATED `notes` from 35 repeats (1,470
+            // chars) to 25 (1,050). The fixed boilerplate is now 2,345 chars
+            // (it grew by the ~180-char `ROUTE:` line that tells the coder
+            // which `.dot` graph to run), and at 35 repeats the notes block
+            // alone consumed the entire remaining budget — the residue
+            // reached notes and tripped the `[notes truncated]` assertion.
+            // 25 repeats restores ~200 chars of genuine headroom so this test
+            // asserts the priority ORDER rather than sitting on a byte-exact
+            // boundary. If a future change to the fixed boilerplate trips the
+            // `[notes truncated]` assertion again, shrink this repeat count —
+            // do not weaken the assertion.
             description: "D".repeat(500),
-            notes: "OPERATOR_GUIDANCE_SENTINEL_DO_NOT_TRUNCATE".repeat(35), // ~1,400 chars
+            notes: "OPERATOR_GUIDANCE_SENTINEL_DO_NOT_TRUNCATE".repeat(25), // ~1,050 chars
             file_tree_summary: "x/".repeat(1_750), // 3,500 chars pre-render
             external_ref: None,
         };
-        let prompt = build_coder_prompt(
+        let prompt = coder_prompt(
             &bead,
             "factory/jleechan-0hqx-budget-r1",
             "owner/repo",
@@ -3736,6 +4296,188 @@ mod tests {
         );
     }
 
+    // ---- bead rev-z7wua CHANGE 1: every verdict routes to /factory ----
+
+    /// Dispatch one bead with the given verdict + drive decision and return
+    /// the exact prompt handed to `Sessions::spawn`.
+    fn dispatched_prompt_for(
+        verdict: RoutingVerdict,
+        drive: DriveBranchDecision,
+    ) -> String {
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::default();
+        let cfg = cfg();
+        let ready = vec![(
+            Bead {
+                id: "bead-z7wua".into(),
+                title: "wire the widget".into(),
+                description: "acceptance: the widget is wired".into(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            verdict,
+            drive,
+        )];
+        let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+        assert_eq!(
+            report.success_count(),
+            1,
+            "dispatch must succeed for {verdict:?}; failures: {:?}",
+            report.failures
+        );
+        let prompts = sessions.spawn_prompts.borrow();
+        assert_eq!(prompts.len(), 1);
+        prompts[0].1.clone()
+    }
+
+    /// RED-proof for the reported defect: before this bead `SmallPath` and
+    /// `StandardPath` fell into a `_` catch-all whose prompt never mentioned
+    /// `/factory` or any `.dot` graph at all, so those two verdicts — the
+    /// only two that actually produce code — were the ONLY ones that never
+    /// ran a pipeline. All four must now name a pipeline.
+    #[test]
+    fn all_four_routing_verdicts_dispatch_a_factory_pipeline() {
+        let cases = [
+            (
+                RoutingVerdict::ResearchPath,
+                "RESEARCH_PATH",
+                "pipelines/slim/minimal_research.dot",
+            ),
+            (
+                RoutingVerdict::GenericPath,
+                "GENERIC_PATH",
+                "pipelines/slim/spec_gen.dot",
+            ),
+            (
+                RoutingVerdict::SmallPath,
+                "SMALL_PATH",
+                "pipelines/slim/minimal_feature.dot",
+            ),
+            (
+                RoutingVerdict::StandardPath,
+                "STANDARD_PATH",
+                "pipelines/slim/minimal_feature.dot",
+            ),
+        ];
+
+        for (verdict, label, pipeline) in cases {
+            let prompt = dispatched_prompt_for(verdict, DriveBranchDecision::Generated);
+            assert!(
+                prompt.contains("/factory"),
+                "{label} must be told to run /factory, got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains(pipeline),
+                "{label} must name {pipeline}, got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains(label),
+                "{label} prompt must carry its own verdict label, got:\n{prompt}"
+            );
+        }
+    }
+
+    /// The graph is picked by *is there already a PR to iterate on*, not by
+    /// the router's complexity judgment: a bead bound to an open PR's head
+    /// ref gets the in-flight-PR lane, and this holds for BOTH code verdicts.
+    #[test]
+    fn code_verdicts_bound_to_a_pr_head_get_the_pr_iteration_pipeline() {
+        for (verdict, label) in [
+            (RoutingVerdict::SmallPath, "SMALL_PATH"),
+            (RoutingVerdict::StandardPath, "STANDARD_PATH"),
+        ] {
+            let prompt = dispatched_prompt_for(
+                verdict,
+                DriveBranchDecision::PrHead("feat/live-pr-branch".to_string()),
+            );
+            assert!(
+                prompt.contains("pipelines/slim/minimal_pr.dot"),
+                "{label} driving an existing PR head must use the PR-iteration lane, got:\n{prompt}"
+            );
+            assert!(
+                !prompt.contains("pipelines/slim/minimal_feature.dot"),
+                "{label} driving an existing PR head must NOT use the new-feature lane, got:\n{prompt}"
+            );
+        }
+    }
+
+    /// A fork-head PR falls back to a generated branch (`ForkFallback`), which
+    /// is create-new-work — so it must get the new-feature lane, not the
+    /// PR-iteration lane whose graph assumes an existing PR to iterate on.
+    #[test]
+    fn fork_fallback_uses_the_new_feature_pipeline_not_the_pr_pipeline() {
+        let prompt =
+            dispatched_prompt_for(RoutingVerdict::StandardPath, DriveBranchDecision::ForkFallback);
+        assert!(
+            prompt.contains("pipelines/slim/minimal_feature.dot"),
+            "fork fallback is create-new-work, got:\n{prompt}"
+        );
+    }
+
+    /// The `/factory` route line must not push a maxed-out coder prompt past
+    /// AO's hard 4,096-char spawn ceiling — the deterministic
+    /// "Prompt must be at most 4096 characters" failure canary bead
+    /// jleechan-j4i8 hit. Rendering it inside `build_coder_prompt` (rather
+    /// than prepending it at the dispatch site) is what keeps it inside the
+    /// budget reconciliation; this test fails if that ever regresses.
+    #[test]
+    fn route_line_stays_inside_the_total_prompt_budget() {
+        let bead = Bead {
+            id: "bead-z7wua-cap".into(),
+            title: "oversized bead".into(),
+            description: "d".repeat(CODER_PROMPT_DESCRIPTION_CAP + 5_000),
+            notes: "n".repeat(CODER_PROMPT_NOTES_CAP + 5_000),
+            file_tree_summary: "t".repeat(CODER_PROMPT_TREE_CAP + 5_000),
+            external_ref: None,
+        };
+        let prompt = build_coder_prompt(
+            &bead,
+            "factory/bead-z7wua-cap-r1",
+            "owner/repo",
+            "origin",
+            "STANDARD_PATH",
+            "pipelines/slim/minimal_feature.dot",
+        );
+        assert!(
+            prompt.len() <= CODER_PROMPT_TOTAL_CAP,
+            "prompt with the ROUTE line must still fit the {CODER_PROMPT_TOTAL_CAP}-char budget, got {}",
+            prompt.len()
+        );
+        assert!(
+            prompt.contains("pipelines/slim/minimal_feature.dot"),
+            "the ROUTE line is a FIXED section and must survive every truncation pass, got:\n{prompt}"
+        );
+    }
+
+    /// Pure-helper coverage for the selection rule, independent of the
+    /// dispatch plumbing.
+    #[test]
+    fn factory_pipeline_for_maps_every_verdict() {
+        assert_eq!(
+            factory_pipeline_for(RoutingVerdict::ResearchPath, "generated"),
+            "pipelines/slim/minimal_research.dot"
+        );
+        assert_eq!(
+            factory_pipeline_for(RoutingVerdict::GenericPath, "generated"),
+            "pipelines/slim/spec_gen.dot"
+        );
+        for verdict in [RoutingVerdict::SmallPath, RoutingVerdict::StandardPath] {
+            assert_eq!(
+                factory_pipeline_for(verdict, "generated"),
+                "pipelines/slim/minimal_feature.dot"
+            );
+            assert_eq!(
+                factory_pipeline_for(verdict, "generated_fork_fallback"),
+                "pipelines/slim/minimal_feature.dot"
+            );
+            assert_eq!(
+                factory_pipeline_for(verdict, "pr_head"),
+                "pipelines/slim/minimal_pr.dot"
+            );
+        }
+    }
+
     // Wiring test: a STANDARD_PATH dispatch must hand the ENRICHED prompt to
     // Sessions::spawn — reverting the default arm to `bead.title.clone()`
     // makes this fail (red-proof for the jleechan-if09 wiring).
@@ -3791,7 +4533,10 @@ mod tests {
         let prompt = &prompts[0].1;
         assert!(prompt.contains("REPO: owner/repo"), "prompt: {prompt}");
         assert!(prompt.contains("REMOTE: origin"), "prompt: {prompt}");
-        assert!(prompt.contains("BRANCH: factory/bead-0-r1"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("BRANCH: factory/bead-0-r1"),
+            "prompt: {prompt}"
+        );
         assert!(
             prompt.contains("git push origin factory/bead-0-r1"),
             "prompt must state the literal push command verbatim: {prompt}"
@@ -3825,6 +4570,7 @@ mod tests {
                 pr_number: None,
                 branch: None,
                 session_id: None,
+            session_ao_project: None,
                 is_adopted: false,
                 spawn_failure_count: 0,
                 pre_session_head_sha: None,
@@ -3839,7 +4585,7 @@ mod tests {
             crate::config::RepoConfig {
                 ao_project: "worldarchitect".to_string(),
                 push_remote: "worldai".to_string(),
-               local_checkout: Some(std::env::current_dir().unwrap()),
+                local_checkout: Some(std::env::current_dir().unwrap()),
             },
         );
         let ready = beads(1);
@@ -3849,7 +4595,10 @@ mod tests {
 
         let prompts = sessions.spawn_prompts.borrow();
         let prompt = &prompts[0].1;
-        assert!(prompt.contains("REPO: jleechanorg/worldarchitect.ai"), "prompt: {prompt}");
+        assert!(
+            prompt.contains("REPO: jleechanorg/worldarchitect.ai"),
+            "prompt: {prompt}"
+        );
         assert!(prompt.contains("REMOTE: worldai"), "prompt: {prompt}");
         assert!(
             prompt.contains("git push worldai factory/bead-0-r1"),
@@ -3979,10 +4728,7 @@ mod tests {
     #[test]
     fn cleanup_wrapper_hold_save_failure_preserves_dispatching_branch() {
         let sessions = FakeSessions::new(0);
-        sessions.set_worktree_remote(
-            "repo",
-            "https://github.com/wrong-owner/wrong-repo.git",
-        );
+        sessions.set_worktree_remote("repo", "https://github.com/wrong-owner/wrong-repo.git");
         sessions.fail_stop_for("fake-session-1");
         let store = FakeStateStore::new();
         store.fail_save_for("bead-0", OverlayState::HumanHeld);
@@ -4024,13 +4770,11 @@ mod tests {
 
         assert_eq!(report.success_count(), 0);
         assert_eq!(report.failures[0].phase, "worktree_remote_unverifiable");
-        assert!(
-            sessions
-                .calls
-                .borrow()
-                .iter()
-                .any(|call| call == "stop(fake-session-1)")
-        );
+        assert!(sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call == "stop(fake-session-1)"));
         let overlay = store.load("bead-0").unwrap().unwrap();
         assert_eq!(overlay.state, OverlayState::HumanHeld);
         assert_eq!(
@@ -4081,7 +4825,10 @@ mod tests {
             let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
 
             assert_eq!(report.success_count(), 0, "remote={remote_url}");
-            assert_eq!(report.failures[0].phase, "worktree_remote_mismatch", "remote={remote_url}");
+            assert_eq!(
+                report.failures[0].phase, "worktree_remote_mismatch",
+                "remote={remote_url}"
+            );
             let calls = sessions.calls.borrow();
             assert!(
                 calls.iter().any(|c| c == "stop(fake-session-1)"),
@@ -4089,7 +4836,10 @@ mod tests {
             );
             let overlay = store.load("bead-0").unwrap().unwrap();
             assert_eq!(overlay.state, OverlayState::HumanHeld);
-            assert_eq!(overlay.park_reason.as_deref(), Some("worktree_remote_mismatch"));
+            assert_eq!(
+                overlay.park_reason.as_deref(),
+                Some("worktree_remote_mismatch")
+            );
         }
     }
 
@@ -4109,6 +4859,7 @@ mod tests {
             pr_number: Some(622),
             branch: Some("factory/dark-factory-2xt8-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -4145,7 +4896,10 @@ mod tests {
             .load("redrive-bead-123")
             .unwrap()
             .expect("overlay must be persisted");
-        assert_eq!(overlay.branch.as_deref(), Some("factory/dark-factory-2xt8-r1"));
+        assert_eq!(
+            overlay.branch.as_deref(),
+            Some("factory/dark-factory-2xt8-r1")
+        );
         assert_eq!(overlay.pr_number, Some(622));
         assert!(overlay.is_adopted, "redriven PR must maintain adopted mode");
     }
@@ -4166,6 +4920,7 @@ mod tests {
             pr_number: None,
             branch: Some("factory/ordinary-retry-bead-123-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -4232,6 +4987,7 @@ mod tests {
             pr_number: Some(999),
             branch: Some("factory/recovered-ordinary-bead-456-r1".into()),
             session_id: None,
+            session_ao_project: None,
             is_adopted: false,
             spawn_failure_count: 0,
             pre_session_head_sha: None,
@@ -4277,12 +5033,92 @@ mod tests {
     }
 
     #[test]
+    fn human_held_recovered_ordinary_bead_with_stale_pr_number_queries_base_branch_revision() {
+        // Regression test for the `target_branch` sibling of the bug fixed by
+        // `human_held_recovered_ordinary_bead_with_stale_pr_number_generates_next_attempt_branch`
+        // above. That test proves the branch-NAME decision (`branch`/`branch_mode`)
+        // and `overlay.is_adopted` are computed correctly for an ordinary bead
+        // carrying a stale `pr_number` — but it calls `dispatch_ready` (`vcs: None`),
+        // which skips the `target_branch` computation entirely (the `None` arm at
+        // line ~626 just falls back to `overlay.pre_session_head_sha` unconditionally).
+        // It therefore does NOT exercise the separate `target_branch` condition
+        // (`overlay.is_adopted || overlay.pr_number.is_some()`) that selects which
+        // branch's revision to look up as the worker's `expected_revision`. That
+        // condition has the exact same overreach bug: a non-adopted bead with a
+        // stale `pr_number` wrongly takes the `&branch` (the freshly-computed
+        // NEXT-attempt branch, e.g. `-r2`) arm instead of `&cfg.base_branch` — and
+        // since the `-r2` branch does not exist yet (this dispatch is what will
+        // create it), looking up its revision fails and wrongly parks the bead
+        // HUMAN_HELD instead of dispatching it.
+        let sessions = FakeSessions::new(0);
+        let store = FakeStateStore::new();
+        let cfg = cfg();
+        let vcs = FakeVcs::new(&[(cfg.base_branch.as_str(), "BASE_SHA")]);
+
+        let recovered_overlay = BeadOverlay {
+            bead_id: "recovered-ordinary-bead-789".into(),
+            state: OverlayState::Queued,
+            attempt: 2,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+           pr_number: Some(999),
+           branch: Some("factory/recovered-ordinary-bead-789-r1".into()),
+           session_id: None,
+            session_ao_project: None,
+           is_adopted: false,
+            spawn_failure_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some(cfg.target_repo.clone()),
+            attempt_started_at: None,
+        };
+        store.save(&recovered_overlay).unwrap();
+
+        let ready = vec![(
+            Bead {
+                id: "recovered-ordinary-bead-789".into(),
+                title: "recovered ordinary bead".into(),
+                description: String::new(),
+                notes: String::new(),
+                file_tree_summary: String::new(),
+                external_ref: None,
+            },
+            RoutingVerdict::StandardPath,
+            DriveBranchDecision::Generated,
+        )];
+
+        let report = dispatch_ready_with_vcs(&sessions, &store, &cfg, &ready, Some(&vcs)).unwrap();
+
+        assert_eq!(
+            report.success_count(),
+            1,
+            "ordinary bead with a stale pr_number must dispatch successfully by \
+             querying cfg.base_branch's revision, not fail by querying the \
+             not-yet-created next-attempt branch: failures={:?}",
+            report.failures
+        );
+        let overlay = store
+            .load("recovered-ordinary-bead-789")
+            .unwrap()
+            .expect("overlay must be persisted");
+        assert_eq!(
+            overlay.pre_session_head_sha.as_deref(),
+            Some("BASE_SHA"),
+            "expected_revision must resolve from cfg.base_branch, not the stale \
+             pr_number-triggered branch"
+        );
+    }
+
+    #[test]
     fn register_branch_conflict_on_one_bead_parks_only_that_item_without_refusing_unrelated_work() {
         let sessions = FakeSessions::new(0);
         let store = FakeStateStore::new();
         let cfg = cfg();
 
-        store.register_branch("other-owner", "factory/bead-conflict-r1").unwrap();
+        store
+            .register_branch("other-owner", "factory/bead-conflict-r1")
+            .unwrap();
 
         let ready = vec![
             (
@@ -4372,8 +5208,7 @@ mod tests {
         );
         assert_eq!(
             conflict_overlay.park_reason.as_deref(),
-            Some(HumanHoldReason::BranchRegistrationConflict.value())
-                .as_deref(),
+            Some(HumanHoldReason::BranchRegistrationConflict.value()).as_deref(),
             "a branch-registration collision is a distinct failure category from a worker \
              spawn-time branch mismatch and must not reuse SpawnBranchMismatch's reason"
         );
@@ -4396,10 +5231,8 @@ mod tests {
         // The fake's default cwd is the test process's cwd (which matches
         // `worker_checkout`'s assignment from `local_checkout`). Re-route
         // bead-0's spawn cwd to a divergent path so the guard rejects it.
-        let divergent = std::env::temp_dir().join(format!(
-            "afd_cwd_mismatch_{}",
-            std::process::id()
-        ));
+        let divergent =
+            std::env::temp_dir().join(format!("afd_cwd_mismatch_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&divergent);
         std::fs::create_dir_all(&divergent).unwrap();
         sessions.set_spawn_cwd("bead-0", divergent.clone());
@@ -4445,4 +5278,3 @@ mod tests {
         );
     }
 }
-

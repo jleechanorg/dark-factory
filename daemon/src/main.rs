@@ -529,6 +529,30 @@ fn verify_startup_cargo_toolchain(args: Args) {
     }
 }
 
+/// Emit a non-fatal startup capability signal for Python gate-8 targets.
+/// Cargo remains the primary daemon toolchain, so a host without pytest must
+/// not prevent startup or Rust-only assessments; it should nevertheless be
+/// visible in the service journal before a Python PR reaches verification.
+fn verify_startup_pytest_capability(args: Args) {
+    if args.dry_run {
+        return;
+    }
+    match daemon::vacuous_red_green::resolve_pytest(None) {
+        daemon::vacuous_red_green::PytestLocation::OnPath
+        | daemon::vacuous_red_green::PytestLocation::Found(_) => {
+            eprintln!("auto-factory daemon: gate-8 pytest capability available");
+        }
+        daemon::vacuous_red_green::PytestLocation::NotFound => {
+            eprintln!(
+                "auto-factory daemon: WARNING: pytest binary not found. Python target PRs will \
+                 report a structured pytest-not-found gate-8 result; Rust-only assessments and \
+                 daemon startup remain unaffected. Install pytest in the daemon service PATH \
+                 (for example, `python3 -m pip install pytest`)."
+            );
+        }
+    }
+}
+
 fn run(args: Args) -> Result<(), DaemonError> {
     let cfg_path = default_config_path();
     let cfg = load_config(&cfg_path)?;
@@ -551,6 +575,9 @@ fn run(args: Args) -> Result<(), DaemonError> {
     // operator sees it in the journalctl output before the first
     // assessment.
     verify_startup_cargo_toolchain(args);
+    // Python parity: expose whether the optional pytest backend is available
+    // without making non-Python daemon startup fail closed.
+    verify_startup_pytest_capability(args);
     // Verify the telemetry log path is writable BEFORE we start polling
     // ticks — every assessment writes here, and a churning 7-green false
     // alarm usually traces back to a silent telemetry write failure.
@@ -566,6 +593,22 @@ fn run(args: Args) -> Result<(), DaemonError> {
     };
 
     store.reconcile_dispatching()?;
+
+    let restored_session_projects = store.session_routing_bindings()?
+        .into_iter()
+        .map(|binding| {
+            let project = if let Some(project) = binding.ao_project {
+                project
+            } else {
+                let repo = binding.target_repo.as_deref().unwrap_or(&cfg.target_repo);
+                cfg.resolve_repo(repo).ok_or_else(|| DaemonError::Config(format!(
+                    "durable AO identity {:?}/{:?} references unmapped target repo {repo:?}",
+                    binding.session_id, binding.branch
+                )))?.ao_project
+            };
+            Ok((binding.session_id, binding.branch, project))
+        })
+        .collect::<Result<Vec<_>, DaemonError>>()?;
 
     let (scm, tracker, sessions, llm, vcs): DaemonAdapters = if args.dry_run {
         #[cfg(any(test, debug_assertions))]
@@ -589,7 +632,12 @@ fn run(args: Args) -> Result<(), DaemonError> {
         (
             Box::new(CliScm::new(cfg.target_repo.clone())),
             Box::new(CliTracker),
-            Box::new(CliSessions::new(&ao_project, &default_agent)),
+            Box::new(CliSessions::with_restored_projects(
+                &ao_project,
+                &default_agent,
+                restored_session_projects,
+                cfg.repos.is_empty(),
+            )?),
             Box::new(ChainLlm),
             Box::new(CliVcs::new(cfg.target_repo.clone())),
         )
@@ -826,6 +874,7 @@ fn run_recover_held(db: &Path, telemetry_log: &Path) -> Result<(), DaemonError> 
             telemetry_log,
             &daemon::telemetry::TelemetryEvent {
                 timestamp: daemon::state::now_iso8601(),
+                host: daemon::telemetry::local_hostname(),
                 bead_id: overlay.bead_id.clone(),
                 attempt_id: overlay.attempt,
                 lifecycle_state: "QUEUED".to_string(),
@@ -878,11 +927,13 @@ fn main() {
 mod tests {
     use super::*;
 
-    // Serializes tests that mutate the process-wide NOTIFY_SOCKET env var. Rust
-    // runs tests in parallel by default, so without this lock two tests can each
-    // set NOTIFY_SOCKET and systemd_notify may send its datagram to the sibling
-    // test's socket, leaving this listener's recv() to time out (WouldBlock).
-    static NOTIFY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The daemon binary's unit tests are a separate crate from the daemon
+    // library tests, so they need their own process-wide environment lock.
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn test_env_lock() -> &'static std::sync::Mutex<()> {
+        &TEST_ENV_LOCK
+    }
 
     #[test]
     fn scaffold_compiles() {
@@ -949,6 +1000,9 @@ mod tests {
     // preflight sees the same vendor order the runtime fallback chain does.
     #[test]
     fn configured_vendor_list_resolves_aliases_and_dedupes() {
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Snapshot the existing env, mutate it for the test, restore after.
         let prior_default = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT").ok();
         let prior_chain = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
@@ -1322,7 +1376,9 @@ mod tests {
         use std::os::unix::net::UnixDatagram;
         use std::time::Duration;
 
-        let _env_guard = NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let socket_path = std::path::PathBuf::from(format!(
             "/tmp/df-notify-{}.sock",
@@ -1354,7 +1410,9 @@ mod tests {
         use std::os::unix::net::{SocketAddr, UnixDatagram};
         use std::time::Duration;
 
-        let _env_guard = NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let socket_name = format!(
             "df-abs-{}",
@@ -1382,6 +1440,9 @@ mod tests {
     /// under `--dry-run` (tests construct synthetic envs).
     #[test]
     fn startup_cargo_check_is_silent_under_dry_run() {
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Even with PATH stripped to "/tmp/some_empty_dir" and a
         // nonexistent CARGO_HOME, the dry-run flag must keep the
         // startup function silent — no stderr write, no panic.
@@ -1401,5 +1462,15 @@ mod tests {
             Some(p) => std::env::set_var("CARGO_HOME", p),
             None => std::env::remove_var("CARGO_HOME"),
         }
+    }
+
+    #[test]
+    fn startup_pytest_check_is_silent_under_dry_run() {
+        // Dry-run diagnostics must not probe or mutate the host's optional
+        // Python toolchain; production startup remains non-fatal either way.
+        verify_startup_pytest_capability(Args {
+            dry_run: true,
+            once: false,
+        });
     }
 }

@@ -89,6 +89,8 @@ CREATE TABLE IF NOT EXISTS bead_overlay (
   -- `ensure_target_repo_column` migration in `SqliteStateStore::open` (same
   -- guard pattern as `ensure_is_adopted_column`).
   target_repo TEXT,
+  -- Immutable spawn-time routing provenance for a persisted AO session.
+  ao_project TEXT,
   -- Consecutive re-roll deferral counter (bead jleechan-zeij / issue #322
   -- r2). The fail-closed re-roll proceed predicate in daemon/src/reroll.rs
   -- supersedes a worker ONLY once it can positively confirm the previous
@@ -204,6 +206,21 @@ CREATE TABLE IF NOT EXISTS branch_registry (
   branch     TEXT PRIMARY KEY,
   bead_id    TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+
+-- Exact identity bound to an adopted PR branch.  branch_registry remains the
+-- deletion guard; this table is the proof used when deciding whether a second
+-- intake bead is the same PR or an attempted branch steal.
+CREATE TABLE IF NOT EXISTS adopted_pr_binding (
+  branch     TEXT PRIMARY KEY,
+  repo       TEXT NOT NULL,
+  pr_number  INTEGER NOT NULL,
+  head_sha   TEXT NOT NULL,
+  bead_id    TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (length(repo) > 0),
+  CHECK (pr_number > 0),
+  CHECK (length(head_sha) > 0)
 );
 
 
