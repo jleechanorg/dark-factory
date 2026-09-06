@@ -249,6 +249,16 @@ def _launch_shadow_gate_review(
             )
     except Exception:
         pass
+    # Built-in backends have known executables; probe those. Registered
+    # (non-built-in) backends are NOT probed here — they enter via node
+    # ``backend=`` / ``model=`` attrs only, not the ``--backend`` CLI
+    # choices list (runner/__main__.py:322). A registered name without
+    # a working executable should surface as a launch failure, not a
+    # silent fallback to the Claude binary.
+    import runner.backend_registry as _backend_registry  # late-bound shim
+    if _backend_registry.get_backend(backend) is not None:
+        shadow.launch_error = f"{backend} registered backend; probe_bin not supported"
+        return shadow
     probe_bin = "codex" if backend == "codex" else ("agy" if backend == "agy" else _handlers_shim._get_claude_executable())
     if shutil.which(probe_bin) is None:
         shadow.launch_error = f"{backend} executable not found"
@@ -656,14 +666,26 @@ def _gate_subprocess_env(backend: str) -> dict[str, str]:
 
     Registered (non-built-in) backends may add their own env vars via
     ``gate_env``; the hook return is layered on top of the sanitized
-    base.
+    base, and any key that looks like a holdout leak (matches
+    ``*HOLDOUT*`` / ``DARK_FACTORY_HOLDOUTS*``) is dropped before the
+    subprocess sees it — the hook can ONLY add benign env vars, never
+    override the isolation guarantee that ``_sanitized_env`` enforces.
     """
     base = _handlers_shim._sanitized_env()
     if backend == "minimax":
         base = {**base, "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic"}
     registered = _backend_registry.get_backend(backend)
     if registered is not None:
-        return {**base, **registered.gate_env(backend)}
+        hook_env = registered.gate_env(backend)
+        # Drop any key that looks like a holdout leak (jleechan-113 contract).
+        # A malicious or buggy hook cannot ship DARK_FACTORY_HOLDOUTS or
+        # anything matching *HOLDOUT* into the reviewer subprocess.
+        safe_hook_env = {
+            key: value
+            for key, value in hook_env.items()
+            if "HOLDOUT" not in key.upper()
+        }
+        return {**base, **safe_hook_env}
     return base
 
 
