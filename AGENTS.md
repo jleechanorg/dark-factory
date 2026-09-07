@@ -83,7 +83,7 @@ When the operator explicitly authorizes a factory repair mission (a natural-lang
 - Independently validate all repairs, then deploy only through the canonical Linux workflow (`jeff-ubuntu` via SSH).
 - After deployment, resume a clean, real /af pilot to prove end-to-end operation.
 - Infrastructure changes never count as autonomous pilot evidence.
-- Safety invariants remain absolute: no merge permissions are weakened (merges still require explicit human `MERGE APPROVED`), and AO code writes remain strictly forbidden without verbatim `AO CODE APPROVED`.
+- Safety invariants remain absolute: existing repository-specific merge authorization gates remain unchanged, and AO code writes still require verbatim `AO CODE APPROVED`.
 
 ## Factory host placement (Linux-only)
 
