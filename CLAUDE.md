@@ -88,11 +88,12 @@ When the operator explicitly authorizes a factory repair mission (a natural-lang
 ## Factory host placement (Linux-only)
 
 `jeff-ubuntu` is the sole Auto-Factory host. Start, stop, inspect, and deploy
-the daemon only through `/linux` and its user systemd unit
-`ai.dark-factory.daemon.service`. AO worker dispatch is allowed on that Linux
-host only. This Mac is an operator client: do not load or start a Dark Factory
-LaunchAgent, a local daemon, or local AO workers from factory intake. Use SSH
-to Linux for telemetry and operational control.
+the daemon only through `/linux` (`ssh jeff-ubuntu ...`) and its user systemd unit
+`ai.dark-factory.daemon.service`. AO worker dispatch runs on that Linux host only.
+This Mac is an operator client: do not load or start a Dark Factory LaunchAgent,
+a local daemon, or local AO workers from factory intake on macOS.
+Always use SSH to Linux for telemetry (`/home/jleechan/Library/Logs/dark-factory/daemon.jsonl`)
+and operational control.
 
 ## Setup
 

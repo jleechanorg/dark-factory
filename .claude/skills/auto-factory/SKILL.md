@@ -16,9 +16,9 @@ Distinguish host capability, service liveness, Bead freshness, integrity, and au
 Before any intake mutation, resolve the exact Bead DB and checkout from the
 local factory supervisor. Bind `br`, the overlay, and any manual tick to
 that same installation; ambient `br where` discovery is not authority. The
-known Linux systemd supervisor is the canonical adapter. Another
-registered host may provide explicit `DARK_FACTORY_ROOT` and
-`DARK_FACTORY_BR_DB` values:
+known Linux systemd supervisor on `jeff-ubuntu` is the canonical adapter.
+Unsupported operating systems reject intake and route operational control,
+diagnostics, and recovery to `jeff-ubuntu` via SSH (`/linux`):
 
 ```bash
 case "$(uname -s)" in
@@ -35,13 +35,13 @@ case "$(uname -s)" in
     ;;
   Darwin)
     # macOS is an operator client; jeff-ubuntu via SSH Linux is the sole factory execution host.
-    # An unsupported host stops intake here; continue canonical Linux diagnosis/recovery.
-    echo "macOS is an operator client: no local factory launches on Darwin" >&2
+    # An unsupported host stops intake here; route diagnosis/recovery to jeff-ubuntu via SSH.
+    echo "macOS is an operator client: no local factory launches on Darwin; route to jeff-ubuntu via SSH (/linux)" >&2
     exit 1
     ;;
   *)
-    FACTORY_ROOT="${DARK_FACTORY_ROOT:?registered factory checkout required}"
-    BR_DB="${DARK_FACTORY_BR_DB:?registered factory Bead DB required}"
+    echo "Unsupported OS $(uname -s): jeff-ubuntu (Linux) is the sole Auto-Factory host; route via SSH (/linux)" >&2
+    exit 1
     ;;
 esac
 [ -n "$BR_DB" ] && [ "${BR_DB#/}" != "$BR_DB" ] && [ -f "$BR_DB" ] || exit 1
@@ -76,7 +76,7 @@ br --no-auto-flush --db "$BR_DB" doctor --quick
 ```
 
 Distinguish Bead freshness, integrity, and authority:
-- **Freshness vs. Authority**: `db_newer` alone with known supervisor-selected authority (`$BR_DB`) means supported reconciliation, not asking the operator. Reconcile it via the supported Beads sync/reconciliation workflow (`br --no-auto-flush export` or standard sync).
+- **Freshness vs. Authority**: `db_newer` alone with known supervisor-selected authority (`$BR_DB`) indicates supported reconciliation rather than an ambiguous conflict, not requiring operator intervention. Reconcile it via the supervisor-bound supported Beads sync workflow using installed command help (`br sync --help` / `br --help`) without inventing syntax.
 - **Integrity Errors & Conflicting Representations**: Integrity errors or conflicting representations (e.g. both `jsonl_newer` and `db_newer` true with contradictory states, corrupt records, or duplicate references) stop unsafe intake mutation (`br create`, `br update`) and dependent dispatch.
   1. Preserve backups before changes and preserve all missing records. Never force export, never perform raw Beads mutations on `beads.db` or `.jsonl`, and never discard missing records.
   2. Inspect the recovery candidate via supported Beads workflow. When the supported reader fails (e.g. `br` fails or crashes on malformed interchange or duplicate references), perform bounded read-only copy forensics on an isolated copy with secrets excluded.
@@ -316,6 +316,6 @@ result (cooldown handling is unchanged from the original 7-gate design).
   after capability and store integrity/authority pass. Restore/restart the daemon through
   the canonical Linux deployment workflow (`ssh jeff-ubuntu systemctl --user start ai.dark-factory.daemon.service`
   or repository deployment script). Do not broaden unrelated held queue or change selected pilot scope.
-- **Bead stuck HUMAN_HELD**: `factory-af-tick.sh` already calls `$H recover-held` every tick, which requeues any `HUMAN_HELD` bead with `attempt < 10` back to `QUEUED` (incrementing `attempt`, resetting `autonomy_secs`) automatically. To force it immediately: `$H recover-held` (no bead-id argument — it processes every eligible `HUMAN_HELD` row). Never mutate `bead_overlay` with a raw `sqlite3` command.
+- **Bead stuck HUMAN_HELD**: In a selected-pilot mission, bulk recover must not release unrelated held items. Explicitly inspect the held scope first (e.g. via `$H list HUMAN_HELD`). Because `$H recover-held` processes every eligible `HUMAN_HELD` row (`attempt < 10`) without a bead filter, you cannot run global recover if unrelated held rows are eligible; retain holds on unrelated items and only use supported scoped recovery. Only when inspection confirms no unrelated held items exist (or only the intended pilot bead is eligible) may `$H recover-held` be invoked to requeue back to `QUEUED` (incrementing `attempt`, resetting `autonomy_secs`). Never mutate `bead_overlay` with a raw `sqlite3` command.
 - **PR ci_green stuck on pre-existing infra**: document in PR comment, treat as known-issue; do NOT block readiness.
 - **File-overlap conflict across multiple PRs**: serialize per stacked-PR single-writer rule.
