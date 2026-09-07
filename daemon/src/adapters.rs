@@ -3263,6 +3263,12 @@ fn ao_controller_home(project: &str) -> Result<std::path::PathBuf, String> {
 /// reused existing session (df-orchestrator)" and exited 0 in under a
 /// second). In that case, hand the bridge the operator's real `HOME` instead,
 /// so it observes the same `running.json` the shared instance actually wrote.
+fn resolve_ao_config_path(operator_home: &str) -> String {
+    std::env::var("DARK_FACTORY_AO_CONFIG_PATH")
+        .or_else(|_| std::env::var("AO_CONFIG_PATH"))
+        .unwrap_or_else(|_| format!("{operator_home}/agent-orchestrator.yaml"))
+}
+
 fn ao_controller_env(project: &str) -> Result<Vec<(String, String)>, String> {
     let operator_home = operator_home()?;
     let bridge_home = if matches!(
@@ -3280,9 +3286,7 @@ fn ao_controller_env(project: &str) -> Result<Vec<(String, String)>, String> {
         })?;
         controller_home.to_string_lossy().into_owned()
     };
-    let config_path = std::env::var("DARK_FACTORY_AO_CONFIG_PATH")
-        .or_else(|_| std::env::var("AO_CONFIG_PATH"))
-        .unwrap_or_else(|_| format!("{operator_home}/agent-orchestrator.yaml"));
+    let config_path = resolve_ao_config_path(&operator_home);
 
     Ok(vec![
         ("HOME".to_string(), bridge_home),
@@ -3369,46 +3373,6 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn process_start_ticks(_pid: u32) -> Option<u64> {
     None
-}
-
-/// True iff `pid`'s command line contains `needle` (case-insensitive).
-///
-/// A bare "is this PID alive" check cannot distinguish the real AO process
-/// from an unrelated process that has since reused the same PID -- a real
-/// risk for `probe_operator_ao_project`, which (unlike `probe_ao_project`)
-/// has no daemon-owned manifest recording the PID's expected start time to
-/// cross-check against. Requiring the live process's own command line to
-/// still look like AO is a cheap, no-new-persistent-state way to reject that
-/// case (CodeRabbit finding on PR #839).
-#[cfg(target_os = "linux")]
-fn process_command_contains(pid: u32, needle: &str) -> bool {
-    std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|bytes| {
-            String::from_utf8_lossy(&bytes)
-                .split('\0')
-                .any(|arg| arg.to_lowercase().contains(needle))
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(target_os = "macos")]
-fn process_command_contains(pid: u32, needle: &str) -> bool {
-    Command::new("ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .to_lowercase()
-                .contains(needle)
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn process_command_contains(_pid: u32, _needle: &str) -> bool {
-    false
 }
 
 fn acquire_ao_recovery_file_lock(project: &str) -> Result<AoRecoveryFileLock, String> {
@@ -3525,8 +3489,25 @@ fn validate_controller_manifest_project(
 /// polling `my-project`, `worldarchitect`, and `dark-factory` at once).
 /// Unlike `probe_ao_project`, this has no daemon-owned controller manifest to
 /// cross-check a PID against -- the operator's `ao start` is not a process
-/// this daemon spawned or tracks -- so it trusts `running.json`'s own `pid`
-/// once that PID is confirmed alive.
+/// this daemon spawned or tracks.
+///
+/// PID-alive alone is not identity: a PID recorded in a stale `running.json`
+/// (AO crashed without cleanup) can be reused by an unrelated live process.
+/// An earlier version of this check tried to compensate with a command-line
+/// substring match (`"agent-orchestrator"`), but that is itself unreliable --
+/// an ordinary install, an alternate package layout, or the project's
+/// canonical Go AO binary need not contain that literal string in argv,
+/// which would wrongly reject a genuinely healthy instance and reproduce the
+/// exact "AO is not running" outage this function exists to prevent
+/// (independent finding from both a CodeRabbit review and a GitHub Codex
+/// review on PR #839). Instead, bind identity to `running.json`'s own
+/// `configPath` field: it must match the exact AO config this daemon itself
+/// resolves for this project (`resolve_ao_config_path`). An unrelated
+/// process reusing the PID would need to also have written a `running.json`
+/// declaring our specific config path to pass this check, which is not
+/// something PID reuse can produce by accident -- and a differently-shaped
+/// AO binary is trivially recognized because the check has nothing to do
+/// with argv.
 fn probe_operator_ao_project(project: &str, operator_home: &str) -> AoReadiness {
     let running_path =
         std::path::Path::new(operator_home).join(".agent-orchestrator/running.json");
@@ -3540,9 +3521,11 @@ fn probe_operator_ao_project(project: &str, operator_home: &str) -> AoReadiness 
     let Some(pid) = running.get("pid").and_then(serde_json::Value::as_u64) else {
         return AoReadiness::Unavailable;
     };
-    if pid > u64::from(u32::MAX)
-        || process_start_ticks(pid as u32).is_none()
-        || !process_command_contains(pid as u32, "agent-orchestrator")
+    if pid > u64::from(u32::MAX) || process_start_ticks(pid as u32).is_none() {
+        return AoReadiness::Unavailable;
+    }
+    let expected_config_path = resolve_ao_config_path(operator_home);
+    if running.get("configPath").and_then(serde_json::Value::as_str) != Some(expected_config_path.as_str())
     {
         return AoReadiness::Unavailable;
     }
@@ -5011,8 +4994,8 @@ mod spawn_classification_tests {
 mod ao_spawn_contract_tests {
     use super::{
         ao_controller_env, ao_controller_home, ao_spawn_bridge_path, ensure_ao_recovery_for_target,
-        operator_home, probe_operator_ao_project, process_start_identity_from_ps,
-        process_start_ticks, safe_project_component, validate_controller_manifest_project,
+        probe_operator_ao_project, process_start_identity_from_ps, process_start_ticks,
+        resolve_ao_config_path, safe_project_component, validate_controller_manifest_project,
         AoControllerManifest, AoReadiness, CliSessions, RecoveryOutcome,
     };
     use crate::errors::DaemonError;
@@ -5154,33 +5137,30 @@ mod ao_spawn_contract_tests {
         pid
     }
 
-    /// Spawn a long-lived child whose command line contains "agent-orchestrator",
-    /// so it passes `process_command_contains`'s identity check the same way a
-    /// real AO process would. Invoked via a symlink named
-    /// `agent-orchestrator-fake` (rather than e.g. `sh -c "sleep 30 # marker"`)
-    /// because a single-command `sh -c` often `exec`s directly into the target
-    /// binary, replacing the process image and losing any comment/marker text
-    /// from the original argv. Callers must `.kill()` (and ideally `.wait()`) it.
-    fn spawn_fake_ao_process() -> std::process::Child {
-        let dir = std::env::temp_dir().join(format!("afd_fake_ao_bin_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let link = dir.join("agent-orchestrator-fake");
-        let _ = std::fs::remove_file(&link);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("/bin/sleep", &link)
-            .expect("symlink agent-orchestrator-fake -> /bin/sleep");
-        std::process::Command::new(&link)
-            .arg("30")
-            .spawn()
-            .expect("spawn fake agent-orchestrator process for test fixture")
+    /// Writes `running.json` with whatever `configPath` `resolve_ao_config_path`
+    /// would ACTUALLY derive for `home` right now -- calling it directly
+    /// (rather than reimplementing its default formula) keeps this fixture
+    /// correct even when the ambient dev/CI environment already exports
+    /// `AO_CONFIG_PATH`/`DARK_FACTORY_AO_CONFIG_PATH` (observed locally: a
+    /// developer shell with `AO_CONFIG_PATH` set globally silently broke a
+    /// hardcoded-formula version of this fixture).
+    fn write_running_json(home: &std::path::Path, pid: u32, projects: &[&str]) {
+        let config_path = resolve_ao_config_path(&home.to_string_lossy());
+        write_running_json_with_config(home, pid, projects, &config_path);
     }
 
-    fn write_running_json(home: &std::path::Path, pid: u32, projects: &[&str]) {
+    fn write_running_json_with_config(
+        home: &std::path::Path,
+        pid: u32,
+        projects: &[&str],
+        config_path: &str,
+    ) {
         let dir = home.join(".agent-orchestrator");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("running.json"),
-            serde_json::json!({ "pid": pid, "projects": projects }).to_string(),
+            serde_json::json!({ "pid": pid, "projects": projects, "configPath": config_path })
+                .to_string(),
         )
         .unwrap();
     }
@@ -5198,15 +5178,39 @@ mod ao_spawn_contract_tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&home);
-        let mut fake_ao = spawn_fake_ao_process();
-        write_running_json(&home, fake_ao.id(), &["dark-factory", "worldarchitect"]);
+        write_running_json(&home, std::process::id(), &["dark-factory", "worldarchitect"]);
 
         let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
 
-        let _ = fake_ao.kill();
-        let _ = fake_ao.wait();
         let _ = std::fs::remove_dir_all(&home);
         assert!(matches!(outcome, AoReadiness::Ready(_)), "{outcome:?}");
+    }
+
+    /// The threat model both CodeRabbit and a GitHub Codex review converged
+    /// on independently: a PID recorded in a stale `running.json` (AO
+    /// crashed without cleanup) can be reused by an unrelated live process.
+    /// Binding identity to `configPath` (rather than a command-line
+    /// heuristic) means an unrelated process cannot pass this check merely
+    /// by existing -- its `running.json` would need to also declare our
+    /// exact AO config path, which PID reuse cannot produce by accident.
+    #[test]
+    fn probe_operator_ao_project_rejects_config_path_mismatch() {
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_config_mismatch_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json_with_config(
+            &home,
+            std::process::id(),
+            &["dark-factory"],
+            "/some/other/unrelated-config.yaml",
+        );
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
     }
 
     #[test]
@@ -5276,8 +5280,7 @@ mod ao_spawn_contract_tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&home);
-        let mut fake_ao = spawn_fake_ao_process();
-        write_running_json(&home, fake_ao.id(), &["dark-factory"]);
+        write_running_json(&home, std::process::id(), &["dark-factory"]);
         std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &home);
         // Prepend a directory containing a hard-failing `ao` stub, ahead of
         // the real PATH, so if the private-sandbox path ran at all it would
@@ -5307,8 +5310,6 @@ mod ao_spawn_contract_tests {
         std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
 
         let outcome = ensure_ao_recovery_for_target("dark-factory", "dark-factory");
-        let _ = fake_ao.kill();
-        let _ = fake_ao.wait();
         let _ = std::fs::remove_dir_all(&empty_bin);
 
         match prior_operator_home {
@@ -5347,14 +5348,11 @@ mod ao_spawn_contract_tests {
         ));
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&controller_base);
-        let mut fake_ao = spawn_fake_ao_process();
-        write_running_json(&home, fake_ao.id(), &["dark-factory"]);
+        write_running_json(&home, std::process::id(), &["dark-factory"]);
         std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &home);
         std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", &controller_base);
 
         let env = ao_controller_env("dark-factory").unwrap();
-        let _ = fake_ao.kill();
-        let _ = fake_ao.wait();
 
         match prior_operator_home {
             Some(value) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", value),
