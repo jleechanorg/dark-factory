@@ -17,8 +17,10 @@ Before any intake mutation, resolve the exact Bead DB and checkout from the
 local factory supervisor. Bind `br`, the overlay, and any manual tick to
 that same installation; ambient `br where` discovery is not authority. The
 known Linux systemd supervisor on `jeff-ubuntu` is the canonical adapter.
-Unsupported operating systems reject intake and route operational control,
-diagnostics, and recovery to `jeff-ubuntu` via SSH (`/linux`):
+Preflight `where`, `sync`, and `doctor` invocations must use both
+`--no-auto-flush` and `--no-auto-import` with `--db "$BR_DB"` to disable
+implicit export/import. Unsupported operating systems reject intake and
+route operational control, diagnostics, and recovery to `jeff-ubuntu` via SSH (`/linux`):
 
 ```bash
 case "$(uname -s)" in
@@ -70,19 +72,21 @@ if target != cfg.get("target_repo") and target not in cfg.get("repos", {}):
 PY
 export BR_DB CONFIG TARGET_REPO
 command -v br >/dev/null
-br --no-auto-flush --db "$BR_DB" where
-br --no-auto-flush --db "$BR_DB" sync --status --json
-br --no-auto-flush --db "$BR_DB" doctor --quick
+br --no-auto-flush --no-auto-import --db "$BR_DB" where
+br --no-auto-flush --no-auto-import --db "$BR_DB" sync --status --json
+br --no-auto-flush --no-auto-import --db "$BR_DB" doctor --robot-triage --json
 ```
 
 Distinguish Bead freshness, integrity, and authority:
-- **Freshness vs. Authority**: `db_newer` alone with known supervisor-selected authority (`$BR_DB`) indicates supported reconciliation rather than an ambiguous conflict, not requiring operator intervention. Reconcile it via the supervisor-bound supported Beads sync workflow using installed command help (`br sync --help` / `br --help`) without inventing syntax.
-- **Integrity Errors & Conflicting Representations**: Integrity errors or conflicting representations (e.g. both `jsonl_newer` and `db_newer` true with contradictory states, corrupt records, or duplicate references) stop unsafe intake mutation (`br create`, `br update`) and dependent dispatch.
+- **Integrity Coverage vs. Quick Checks**: `--quick` skips count and recoverable anomaly detectors and cannot prove reconciliation safety. Fresh Linux evidence reveals that `br doctor --quick` can misleadingly report healthy while real store discrepancies exist; furthermore, full diagnostics (such as `--repair --dry-run --json` on an isolated copy) may return `report.ok=true` and `verified=true` yet reveal `workspace_health=degraded` and a severe ID set / count mismatch (`db_jsonl_id_set_mismatch`, e.g. 681 in DB vs 1100 in JSONL). Inspect actual findings, `workspace_health`, ID sets, and count anomalies rather than relying on boolean `ok`, `verified`, or freshness indicators alone.
+- **Freshness vs. Authority & Reconciliation**: `db_newer` alone with known supervisor-selected authority (`$BR_DB`) indicates supported reconciliation rather than an ambiguous conflict, not requiring operator intervention—ONLY after full read-only diagnostics (`doctor --robot-triage --json`) confirm no missing-record, ID-set mismatch, or integrity conflicts. An existing known-authority DB-newer canary remains automatic to reconcile if full diagnostics are clean. Reconcile it via the supervisor-bound supported Beads sync workflow using installed command help (`br sync --help` / `br --help`) without inventing syntax; never force export.
+- **Integrity Errors & Conflicting Representations**: Integrity errors, degraded workspace health, missing records, or conflicting representations (e.g. `db_jsonl_id_set_mismatch`, both `jsonl_newer` and `db_newer` true with contradictory states, corrupt records, or duplicate references) stop unsafe intake mutation (`br create`, `br update`) and dependent dispatch.
   1. Preserve backups before changes and preserve all missing records. Never force export, never perform raw Beads mutations on `beads.db` or `.jsonl`, and never discard missing records.
-  2. Inspect the recovery candidate via supported Beads workflow. When the supported reader fails (e.g. `br` fails or crashes on malformed interchange or duplicate references), perform bounded read-only copy forensics on an isolated copy with secrets excluded.
-  3. Validate the recovery candidate before promoting it to authoritative.
-  4. Ask the operator only for a specific conflict with materially different valid resolutions that cannot be resolved from evidence and existing authority.
-  5. Continue independent safe diagnostic and repair work when one mutation is blocked.
+  2. Keep investigation and isolated recovery continuing when unsafe intake mutation is blocked; blocking an unsafe write does not abort authorized diagnostics or safe recovery exploration.
+  3. Inspect the recovery candidate via supported Beads workflow. When the supported reader fails (e.g. `br` fails or crashes on malformed interchange or duplicate references), perform bounded read-only copy forensics on an isolated copy with secrets excluded.
+  4. Validate the recovery candidate before promoting it to authoritative.
+  5. Ask the operator only for a specific conflict with materially different valid resolutions that cannot be resolved from evidence and existing authority.
+  6. Continue independent safe diagnostic and repair work when one mutation is blocked.
 A GitHub fallback does not authorize a write to an ambiguous or damaged Bead store.
 
 Intake is a two-phase operation: create without the `factory` label, prove that
