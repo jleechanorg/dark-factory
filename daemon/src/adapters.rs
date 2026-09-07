@@ -3225,11 +3225,15 @@ fn safe_project_component(project: &str) -> String {
     encoded
 }
 
-fn ao_controller_home(project: &str) -> Result<std::path::PathBuf, String> {
-    let operator_home = std::env::var("DARK_FACTORY_OPERATOR_HOME")
+fn operator_home() -> Result<String, String> {
+    std::env::var("DARK_FACTORY_OPERATOR_HOME")
         .or_else(|_| std::env::var("AO_ORIGINAL_HOME"))
         .or_else(|_| std::env::var("HOME"))
-        .map_err(|_| "HOME/AO_ORIGINAL_HOME is unavailable".to_string())?;
+        .map_err(|_| "HOME/AO_ORIGINAL_HOME is unavailable".to_string())
+}
+
+fn ao_controller_home(project: &str) -> Result<std::path::PathBuf, String> {
+    let operator_home = operator_home()?;
     Ok(std::env::var("DARK_FACTORY_AO_CONTROLLER_HOME")
         .map(|base| std::path::PathBuf::from(base).join(safe_project_component(project)))
         .unwrap_or_else(|_| {
@@ -3245,24 +3249,47 @@ fn ao_controller_home(project: &str) -> Result<std::path::PathBuf, String> {
 /// therefore avoids disrupting an operator/shared AO instance while the
 /// explicit config and original-home variables preserve the real project,
 /// credentials, and agent configuration.
-fn ao_controller_env(project: &str) -> Result<Vec<(String, String)>, String> {
-    let operator_home = std::env::var("DARK_FACTORY_OPERATOR_HOME")
-        .or_else(|_| std::env::var("AO_ORIGINAL_HOME"))
-        .or_else(|_| std::env::var("HOME"))
-        .map_err(|_| "HOME/AO_ORIGINAL_HOME is unavailable".to_string())?;
-    let controller_home = ao_controller_home(project)?;
-    std::fs::create_dir_all(&controller_home).map_err(|error| {
-        format!(
-            "failed to create AO controller state home {}: {error}",
-            controller_home.display()
-        )
-    })?;
-    let config_path = std::env::var("DARK_FACTORY_AO_CONFIG_PATH")
+///
+/// EXCEPT when an operator-run shared AO instance is ALREADY polling this
+/// project under the real `$HOME` (see `probe_operator_ao_project`): AO's own
+/// `ao start` detects that live session, prints "reused existing session",
+/// and exits immediately without ever becoming a persistent child or writing
+/// `running.json` under the private controller HOME. Pointing `HOME` at the
+/// private sandbox in that case makes every subsequent `getRunning()` lookup
+/// (in `ao-spawn-v013-bridge.mjs`) see nothing, so real spawns fail with
+/// "AO is not running" forever even though AO is healthy -- confirmed live on
+/// jeff-ubuntu 2026-09-06 (private `.agent-orchestrator/running.json` never
+/// existed; manual repro of the recovery `ao start` printed "Orchestrator:
+/// reused existing session (df-orchestrator)" and exited 0 in under a
+/// second). In that case, hand the bridge the operator's real `HOME` instead,
+/// so it observes the same `running.json` the shared instance actually wrote.
+fn resolve_ao_config_path(operator_home: &str) -> String {
+    std::env::var("DARK_FACTORY_AO_CONFIG_PATH")
         .or_else(|_| std::env::var("AO_CONFIG_PATH"))
-        .unwrap_or_else(|_| format!("{operator_home}/agent-orchestrator.yaml"));
+        .unwrap_or_else(|_| format!("{operator_home}/agent-orchestrator.yaml"))
+}
+
+fn ao_controller_env(project: &str) -> Result<Vec<(String, String)>, String> {
+    let operator_home = operator_home()?;
+    let bridge_home = if matches!(
+        probe_operator_ao_project(project, &operator_home),
+        AoReadiness::Ready(_)
+    ) {
+        operator_home.clone()
+    } else {
+        let controller_home = ao_controller_home(project)?;
+        std::fs::create_dir_all(&controller_home).map_err(|error| {
+            format!(
+                "failed to create AO controller state home {}: {error}",
+                controller_home.display()
+            )
+        })?;
+        controller_home.to_string_lossy().into_owned()
+    };
+    let config_path = resolve_ao_config_path(&operator_home);
 
     Ok(vec![
-        ("HOME".to_string(), controller_home.to_string_lossy().into_owned()),
+        ("HOME".to_string(), bridge_home),
         ("AO_ORIGINAL_HOME".to_string(), operator_home.clone()),
         ("AO_CONFIG_PATH".to_string(), config_path),
         (
@@ -3346,6 +3373,115 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn process_start_ticks(_pid: u32) -> Option<u64> {
     None
+}
+
+/// Returns the process's actual start time as Unix epoch seconds. Unlike
+/// `process_start_ticks` (an opaque per-platform tick/hash value), this is
+/// directly comparable to a self-reported wall-clock timestamp -- used by
+/// `probe_operator_ao_project` to cross-check `running.json`'s `startedAt`
+/// field and reject a PID that has since been silently reused by an
+/// unrelated process (live-verified gap, PR #839 review).
+#[cfg(target_os = "linux")]
+fn process_start_epoch_secs(pid: u32) -> Option<i64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let starttime_ticks: i64 = stat.rsplit_once(") ")?.1.split_whitespace().nth(19)?.parse().ok()?;
+    let uptime_stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let btime: i64 = uptime_stat
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    // sysconf(_SC_CLK_TCK) has been 100 on every mainstream Linux
+    // distribution since the 2.6 kernel era; avoiding an FFI sysconf() call
+    // for a constant that has not varied in over a decade.
+    const CLOCK_TICKS_PER_SEC: i64 = 100;
+    Some(btime + starttime_ticks / CLOCK_TICKS_PER_SEC)
+}
+
+/// Parses macOS `ps -o etime=` output -- `[[dd-]hh:]mm:ss` -- into total
+/// seconds. macOS `ps` has no `etimes=` (raw-seconds) keyword, unlike Linux,
+/// so the formatted form has to be parsed.
+#[cfg(target_os = "macos")]
+fn parse_macos_etime_secs(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let (days, rest) = match value.split_once('-') {
+        Some((d, rest)) => (d.parse::<i64>().ok()?, rest),
+        None => (0, value),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [h, m, s] => (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?, s.parse::<i64>().ok()?),
+        [m, s] => (0, m.parse::<i64>().ok()?, s.parse::<i64>().ok()?),
+        _ => return None,
+    };
+    Some(((days * 24 + hours) * 60 + minutes) * 60 + seconds)
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_epoch_secs(pid: u32) -> Option<i64> {
+    let output = Command::new("ps")
+        .args(["-o", "etime=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let elapsed_secs = parse_macos_etime_secs(std::str::from_utf8(&output.stdout).ok()?)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some(now - elapsed_secs)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_start_epoch_secs(_pid: u32) -> Option<i64> {
+    None
+}
+
+/// Parses AO's `new Date().toISOString()` output (e.g.
+/// `"2026-09-06T12:10:23.191Z"`) into Unix epoch seconds. Deliberately
+/// narrow -- this is not a general RFC3339 parser, only the exact fixed
+/// shape `running-state.ts` is known to emit, so anything else fails
+/// closed. Uses the standard days-from-civil-date algorithm (Howard
+/// Hinnant's `days_from_civil`) rather than pulling in a date/time crate
+/// for one narrow conversion.
+fn parse_ao_started_at_epoch(value: &str) -> Option<i64> {
+    let value = value.strip_suffix('Z')?;
+    let (date, time) = value.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: i64 = date_parts.next()?.parse().ok()?;
+    let day: i64 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    let time = time.split('.').next().unwrap_or(time);
+    let mut time_parts = time.split(':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next()?.parse().ok()?;
+    let second: i64 = time_parts.next()?.parse().ok()?;
+    if time_parts.next().is_some() {
+        return None;
+    }
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..24).contains(&hour)
+        || !(0..60).contains(&minute)
+        || !(0..60).contains(&second)
+    {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days_since_epoch = era * 146097 + doe - 719468;
+    Some(days_since_epoch * 86400 + hour * 3600 + minute * 60 + second)
 }
 
 fn acquire_ao_recovery_file_lock(project: &str) -> Result<AoRecoveryFileLock, String> {
@@ -3455,6 +3591,90 @@ fn validate_controller_manifest_project(
     }
 }
 
+/// True iff a healthy AO instance is ALREADY polling `project` under the
+/// operator's real, shared `$HOME` -- e.g. a long-lived operator-run `ao
+/// start` that predates this daemon and serves multiple projects (worked
+/// example on jeff-ubuntu 2026-09-06: one `agent-orchestrator-ts` process
+/// polling `my-project`, `worldarchitect`, and `dark-factory` at once).
+/// Unlike `probe_ao_project`, this has no daemon-owned controller manifest to
+/// cross-check a PID against -- the operator's `ao start` is not a process
+/// this daemon spawned or tracks.
+///
+/// PID-alive alone is not identity: a PID recorded in a stale `running.json`
+/// (AO crashed without cleanup) can be reused by an unrelated live process.
+/// An earlier version of this check tried to compensate with a command-line
+/// substring match (`"agent-orchestrator"`), but that is itself unreliable --
+/// an ordinary install, an alternate package layout, or the project's
+/// canonical Go AO binary need not contain that literal string in argv,
+/// which would wrongly reject a genuinely healthy instance and reproduce the
+/// exact "AO is not running" outage this function exists to prevent
+/// (independent finding from both a CodeRabbit review and a GitHub Codex
+/// review on PR #839). Instead, bind identity to `running.json`'s own
+/// `configPath` field: it must match the exact AO config this daemon itself
+/// resolves for this project (`resolve_ao_config_path`). An unrelated
+/// process reusing the PID would need to also have written a `running.json`
+/// declaring our specific config path to pass this check, which is not
+/// something PID reuse can produce by accident -- and a differently-shaped
+/// AO binary is trivially recognized because the check has nothing to do
+/// with argv.
+fn probe_operator_ao_project(project: &str, operator_home: &str) -> AoReadiness {
+    let running_path =
+        std::path::Path::new(operator_home).join(".agent-orchestrator/running.json");
+    let running: serde_json::Value = match std::fs::read(&running_path)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+    {
+        Ok(value) => value,
+        Err(_) => return AoReadiness::Unavailable,
+    };
+    let Some(pid) = running.get("pid").and_then(serde_json::Value::as_u64) else {
+        return AoReadiness::Unavailable;
+    };
+    if pid > u64::from(u32::MAX) || process_start_ticks(pid as u32).is_none() {
+        return AoReadiness::Unavailable;
+    }
+    let expected_config_path = resolve_ao_config_path(operator_home);
+    if running.get("configPath").and_then(serde_json::Value::as_str) != Some(expected_config_path.as_str())
+    {
+        return AoReadiness::Unavailable;
+    }
+    // configPath alone does not defend against PID reuse: a `running.json`
+    // that AO wrote before crashing (without cleanup) still declares the
+    // correct configPath verbatim, so a later, unrelated process that
+    // happens to receive the same recycled PID would otherwise pass every
+    // check above. Cross-check the PID's ACTUAL start time against AO's own
+    // self-reported `startedAt` -- a process that took over a recycled PID
+    // necessarily started strictly after the original one exited, which is
+    // strictly after `startedAt`, so a mismatch beyond measurement slop
+    // means this is not the process that wrote this file (live-verified gap
+    // in prior revisions of this function, PR #839 review).
+    let Some(claimed_started_at) = running
+        .get("startedAt")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_ao_started_at_epoch)
+    else {
+        return AoReadiness::Unavailable;
+    };
+    let Some(actual_started_at) = process_start_epoch_secs(pid as u32) else {
+        return AoReadiness::Unavailable;
+    };
+    const START_TIME_TOLERANCE_SECS: i64 = 120;
+    if (actual_started_at - claimed_started_at).abs() > START_TIME_TOLERANCE_SECS {
+        return AoReadiness::Unavailable;
+    }
+    let has_project = running
+        .get("projects")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|projects| projects.iter().any(|value| value.as_str() == Some(project)));
+    if has_project {
+        AoReadiness::Ready(format!(
+            "operator AO instance pid={pid} already polling project={project}"
+        ))
+    } else {
+        AoReadiness::Unavailable
+    }
+}
+
 fn probe_ao_project(project: &str) -> AoReadiness {
     let manifest = match read_controller_manifest(project) {
         Ok(Some(manifest)) => manifest,
@@ -3555,6 +3775,17 @@ fn kill_controller_scope(child: &mut std::process::Child) {
 /// instance. The elected caller starts one detached, factory-owned controller
 /// and polls a project-scoped ready condition for a bounded interval.
 fn ensure_ao_recovery_for_target(project: &str, target: &str) -> RecoveryOutcome {
+    // A shared operator instance already polling this project makes the rest
+    // of this function actively harmful to invoke: its `ao start` would
+    // detect that live session, print "reused existing session", and exit
+    // immediately without ever satisfying `probe_ao_project`'s private-HOME
+    // readiness check below -- burning the recovery cooldown on a doomed
+    // attempt every cycle. Check first and skip the private sandbox entirely.
+    if let Ok(home) = operator_home() {
+        if let AoReadiness::Ready(evidence) = probe_operator_ao_project(project, &home) {
+            return RecoveryOutcome::Healthy { evidence };
+        }
+    }
     let slot = ao_recovery_slot(project);
     let mut slot = slot
         .lock()
@@ -4895,9 +5126,11 @@ mod spawn_classification_tests {
 #[cfg(test)]
 mod ao_spawn_contract_tests {
     use super::{
-        ao_controller_home, ao_spawn_bridge_path,
-        process_start_identity_from_ps, process_start_ticks, safe_project_component,
-        validate_controller_manifest_project, AoControllerManifest, CliSessions,
+        ao_controller_env, ao_controller_home, ao_spawn_bridge_path, ensure_ao_recovery_for_target,
+        parse_ao_started_at_epoch, probe_operator_ao_project, process_start_epoch_secs,
+        process_start_identity_from_ps, process_start_ticks, resolve_ao_config_path,
+        safe_project_component, validate_controller_manifest_project, AoControllerManifest,
+        AoReadiness, CliSessions, RecoveryOutcome,
     };
     use crate::errors::DaemonError;
     use crate::tools::{SessionId, Sessions, SpawnSpec};
@@ -5024,6 +5257,406 @@ mod ao_spawn_contract_tests {
         };
         let error = validate_controller_manifest_project(&manifest, "dark-factory").unwrap_err();
         assert!(error.contains("refusing to signal or remove"));
+    }
+
+    /// Returns a PID that is guaranteed dead: spawn a trivial child and wait
+    /// for it to exit, then hand back its now-recycled-eventually-but-
+    /// currently-reaped PID.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn /bin/true for a dead-pid fixture");
+        let pid = child.id();
+        child.wait().expect("wait for dead-pid fixture to exit");
+        pid
+    }
+
+    /// Inverse of `parse_ao_started_at_epoch`, for test fixtures only:
+    /// formats an epoch-seconds value the way AO's `new Date().toISOString()`
+    /// would. Uses the standard civil-from-days algorithm (inverse of the
+    /// days-from-civil algorithm the parser uses).
+    fn format_epoch_as_ao_started_at(epoch: i64) -> String {
+        let days = epoch.div_euclid(86400);
+        let secs_of_day = epoch.rem_euclid(86400);
+        let (hour, minute, second) = (secs_of_day / 3600, (secs_of_day / 60) % 60, secs_of_day % 60);
+        let z = days + 719468;
+        let era = z.div_euclid(146097);
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = if month <= 2 { y + 1 } else { y };
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.000Z")
+    }
+
+    /// Writes `running.json` with whatever `configPath` `resolve_ao_config_path`
+    /// would ACTUALLY derive for `home` right now -- calling it directly
+    /// (rather than reimplementing its default formula) keeps this fixture
+    /// correct even when the ambient dev/CI environment already exports
+    /// `AO_CONFIG_PATH`/`DARK_FACTORY_AO_CONFIG_PATH` (observed locally: a
+    /// developer shell with `AO_CONFIG_PATH` set globally silently broke a
+    /// hardcoded-formula version of this fixture). `startedAt` is derived
+    /// from `pid`'s own actual start time via `process_start_epoch_secs` so
+    /// it is self-consistent with the identity check by construction; when
+    /// the pid is already dead (the `dead_pid` fixture), falls back to now.
+    fn write_running_json(home: &std::path::Path, pid: u32, projects: &[&str]) {
+        let config_path = resolve_ao_config_path(&home.to_string_lossy());
+        write_running_json_with_config(home, pid, projects, &config_path);
+    }
+
+    fn write_running_json_with_config(
+        home: &std::path::Path,
+        pid: u32,
+        projects: &[&str],
+        config_path: &str,
+    ) {
+        let started_at_epoch = process_start_epoch_secs(pid).unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+        });
+        let started_at = format_epoch_as_ao_started_at(started_at_epoch);
+        let dir = home.join(".agent-orchestrator");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("running.json"),
+            serde_json::json!({
+                "pid": pid,
+                "projects": projects,
+                "configPath": config_path,
+                "startedAt": started_at,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// Live incident, jeff-ubuntu 2026-09-06: an operator-run AO instance was
+    /// already healthy and polling "dark-factory", but the daemon's private
+    /// controller-HOME probe could never see it (that instance's
+    /// `running.json` lives under the operator's real `$HOME`, not the
+    /// private sandbox), so every real spawn attempt saw "AO is not running"
+    /// forever. `probe_operator_ao_project` closes that gap.
+    #[test]
+    fn probe_operator_ao_project_detects_healthy_shared_instance() {
+        // AO_CONFIG_PATH/DARK_FACTORY_AO_CONFIG_PATH are process-global, and
+        // other tests in this module (via ReadyAoControllerEnv) mutate them
+        // under this same lock -- without it, a concurrent test can flip
+        // the value between this test's write and probe_operator_ao_project's
+        // own read, causing a spurious configPath mismatch.
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_healthy_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json(&home, std::process::id(), &["dark-factory", "worldarchitect"]);
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Ready(_)), "{outcome:?}");
+    }
+
+    /// The threat model both CodeRabbit and a GitHub Codex review converged
+    /// on independently: a PID recorded in a stale `running.json` (AO
+    /// crashed without cleanup) can be reused by an unrelated live process.
+    /// Binding identity to `configPath` (rather than a command-line
+    /// heuristic) means an unrelated process cannot pass this check merely
+    /// by existing -- its `running.json` would need to also declare our
+    /// exact AO config path, which PID reuse cannot produce by accident.
+    #[test]
+    fn probe_operator_ao_project_rejects_config_path_mismatch() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_config_mismatch_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json_with_config(
+            &home,
+            std::process::id(),
+            &["dark-factory"],
+            "/some/other/unrelated-config.yaml",
+        );
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    /// The gap that survived Round 1 (configPath alone): a `running.json`
+    /// genuinely written by the real AO before it crashed without cleanup
+    /// still declares the correct configPath and project verbatim. If the
+    /// OS later reissues that same PID to any unrelated process, the
+    /// unrelated process's mere liveness plus the stale-but-accurate
+    /// configPath would otherwise pass every prior check. A process that
+    /// took over a recycled PID necessarily started AFTER the file's own
+    /// `startedAt` claim (live-verified gap found by an independent /advice
+    /// pass reading the real host, PR #839 review) -- so a `startedAt` far
+    /// in the past relative to the live PID's actual start time must be
+    /// rejected even though the PID is alive right now.
+    #[test]
+    fn probe_operator_ao_project_rejects_started_at_mismatch() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_started_at_mismatch_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let config_path = resolve_ao_config_path(&home.to_string_lossy());
+        // A startedAt far enough in the past that no real process start-time
+        // tolerance could excuse it, while the pid (this test binary) is
+        // genuinely alive right now -- exactly the stale-file-plus-live-
+        // unrelated-pid shape the check must reject.
+        write_running_json_with_config(&home, std::process::id(), &["dark-factory"], &config_path);
+        let running_path = home.join(".agent-orchestrator/running.json");
+        let mut running: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&running_path).unwrap()).unwrap();
+        running["startedAt"] = serde_json::Value::String("2000-01-01T00:00:00.000Z".to_string());
+        std::fs::write(&running_path, running.to_string()).unwrap();
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    #[test]
+    fn probe_operator_ao_project_rejects_missing_started_at() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_missing_started_at_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let config_path = resolve_ao_config_path(&home.to_string_lossy());
+        let dir = home.join(".agent-orchestrator");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("running.json"),
+            serde_json::json!({
+                "pid": std::process::id(),
+                "projects": ["dark-factory"],
+                "configPath": config_path,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    #[test]
+    fn parse_ao_started_at_epoch_matches_known_values() {
+        assert_eq!(
+            parse_ao_started_at_epoch("2026-09-06T12:10:23.191Z"),
+            Some(1788696623)
+        );
+        assert_eq!(
+            parse_ao_started_at_epoch("1970-01-01T00:00:00.000Z"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_ao_started_at_epoch("2000-03-01T00:00:00.000Z"),
+            Some(951868800)
+        );
+        assert_eq!(parse_ao_started_at_epoch("not-a-timestamp"), None);
+        assert_eq!(parse_ao_started_at_epoch("2026-09-06T12:10:23.191"), None);
+    }
+
+    #[test]
+    fn started_at_round_trips_through_format_and_parse() {
+        for epoch in [0_i64, 1788696623, 951868800, 1893456000] {
+            let formatted = format_epoch_as_ao_started_at(epoch);
+            assert_eq!(
+                parse_ao_started_at_epoch(&formatted),
+                Some(epoch),
+                "round-trip failed for {epoch} -> {formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_operator_ao_project_rejects_project_not_in_running_json() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_wrong_project_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json(&home, std::process::id(), &["worldarchitect"]);
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    #[test]
+    fn probe_operator_ao_project_rejects_dead_pid() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_dead_pid_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json(&home, dead_pid(), &["dark-factory"]);
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    #[test]
+    fn probe_operator_ao_project_rejects_missing_running_json() {
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_missing_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    /// The actual bug: `ensure_ao_recovery_for_target` must short-circuit to
+    /// `Healthy` the moment a shared operator instance is already polling the
+    /// project, WITHOUT ever invoking the `ao` binary. Proven here with a
+    /// stub `ao` on PATH that always exits nonzero -- if the private-sandbox
+    /// recovery path ran at all, `Command::new("ao").spawn()` would succeed
+    /// (the stub exists) but the stub's failure would surface as
+    /// `Unknown`/`FailClosed`, not `Healthy`. A stub that actively fails is a
+    /// stronger negative proof than an empty PATH entry, which would pass
+    /// silently if a real `ao` happened to be reachable elsewhere on PATH in
+    /// some other environment (CodeRabbit finding on PR #839).
+    #[test]
+    fn ensure_ao_recovery_short_circuits_when_operator_instance_already_healthy() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_operator_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+        let prior_path = std::env::var_os("PATH");
+        let home = std::env::temp_dir().join(format!(
+            "afd_recovery_short_circuit_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json(&home, std::process::id(), &["dark-factory"]);
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &home);
+        // Prepend a directory containing a hard-failing `ao` stub, ahead of
+        // the real PATH, so if the private-sandbox path ran at all it would
+        // hit this stub (not silently succeed via some other `ao` on PATH),
+        // while keeping the real PATH so `ps`/`true`/`sh` (used by liveness
+        // checks and the fake-AO fixture) keep working on macOS test runs.
+        let empty_bin = std::env::temp_dir().join(format!(
+            "afd_recovery_short_circuit_bin_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&empty_bin).unwrap();
+        let ao_stub = empty_bin.join("ao");
+        std::fs::write(
+            &ao_stub,
+            "#!/bin/sh\necho 'stub ao: recovery must not invoke ao' >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&ao_stub).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&ao_stub, permissions).unwrap();
+        }
+        let mut paths = vec![empty_bin.clone()];
+        paths.extend(std::env::split_paths(&prior_path.clone().unwrap_or_default()));
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+
+        let outcome = ensure_ao_recovery_for_target("dark-factory", "dark-factory");
+        let _ = std::fs::remove_dir_all(&empty_bin);
+
+        match prior_operator_home {
+            Some(value) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        match prior_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            matches!(outcome, RecoveryOutcome::Healthy { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// When a shared operator instance is already healthy for the project,
+    /// the bridge's `HOME` must point at the operator's real home (where
+    /// AO's own `getRunning()` will actually find it) instead of the private
+    /// controller sandbox.
+    #[test]
+    fn ao_controller_env_uses_operator_home_when_shared_instance_healthy() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_operator_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+        let prior_controller_home = std::env::var_os("DARK_FACTORY_AO_CONTROLLER_HOME");
+        let home = std::env::temp_dir().join(format!(
+            "afd_controller_env_operator_home_{}",
+            std::process::id()
+        ));
+        let controller_base = std::env::temp_dir().join(format!(
+            "afd_controller_env_private_home_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&controller_base);
+        write_running_json(&home, std::process::id(), &["dark-factory"]);
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &home);
+        std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", &controller_base);
+
+        let env = ao_controller_env("dark-factory").unwrap();
+
+        match prior_operator_home {
+            Some(value) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        match prior_controller_home {
+            Some(value) => std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_AO_CONTROLLER_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&controller_base);
+
+        let resolved_home = env
+            .iter()
+            .find(|(key, _)| key == "HOME")
+            .map(|(_, value)| value.clone())
+            .expect("HOME must be set");
+        assert_eq!(resolved_home, home.to_string_lossy());
     }
 
     #[test]
