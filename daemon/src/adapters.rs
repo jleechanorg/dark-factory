@@ -3225,11 +3225,15 @@ fn safe_project_component(project: &str) -> String {
     encoded
 }
 
-fn ao_controller_home(project: &str) -> Result<std::path::PathBuf, String> {
-    let operator_home = std::env::var("DARK_FACTORY_OPERATOR_HOME")
+fn operator_home() -> Result<String, String> {
+    std::env::var("DARK_FACTORY_OPERATOR_HOME")
         .or_else(|_| std::env::var("AO_ORIGINAL_HOME"))
         .or_else(|_| std::env::var("HOME"))
-        .map_err(|_| "HOME/AO_ORIGINAL_HOME is unavailable".to_string())?;
+        .map_err(|_| "HOME/AO_ORIGINAL_HOME is unavailable".to_string())
+}
+
+fn ao_controller_home(project: &str) -> Result<std::path::PathBuf, String> {
+    let operator_home = operator_home()?;
     Ok(std::env::var("DARK_FACTORY_AO_CONTROLLER_HOME")
         .map(|base| std::path::PathBuf::from(base).join(safe_project_component(project)))
         .unwrap_or_else(|_| {
@@ -3245,24 +3249,43 @@ fn ao_controller_home(project: &str) -> Result<std::path::PathBuf, String> {
 /// therefore avoids disrupting an operator/shared AO instance while the
 /// explicit config and original-home variables preserve the real project,
 /// credentials, and agent configuration.
+///
+/// EXCEPT when an operator-run shared AO instance is ALREADY polling this
+/// project under the real `$HOME` (see `probe_operator_ao_project`): AO's own
+/// `ao start` detects that live session, prints "reused existing session",
+/// and exits immediately without ever becoming a persistent child or writing
+/// `running.json` under the private controller HOME. Pointing `HOME` at the
+/// private sandbox in that case makes every subsequent `getRunning()` lookup
+/// (in `ao-spawn-v013-bridge.mjs`) see nothing, so real spawns fail with
+/// "AO is not running" forever even though AO is healthy -- confirmed live on
+/// jeff-ubuntu 2026-09-06 (private `.agent-orchestrator/running.json` never
+/// existed; manual repro of the recovery `ao start` printed "Orchestrator:
+/// reused existing session (df-orchestrator)" and exited 0 in under a
+/// second). In that case, hand the bridge the operator's real `HOME` instead,
+/// so it observes the same `running.json` the shared instance actually wrote.
 fn ao_controller_env(project: &str) -> Result<Vec<(String, String)>, String> {
-    let operator_home = std::env::var("DARK_FACTORY_OPERATOR_HOME")
-        .or_else(|_| std::env::var("AO_ORIGINAL_HOME"))
-        .or_else(|_| std::env::var("HOME"))
-        .map_err(|_| "HOME/AO_ORIGINAL_HOME is unavailable".to_string())?;
-    let controller_home = ao_controller_home(project)?;
-    std::fs::create_dir_all(&controller_home).map_err(|error| {
-        format!(
-            "failed to create AO controller state home {}: {error}",
-            controller_home.display()
-        )
-    })?;
+    let operator_home = operator_home()?;
+    let bridge_home = if matches!(
+        probe_operator_ao_project(project, &operator_home),
+        AoReadiness::Ready(_)
+    ) {
+        operator_home.clone()
+    } else {
+        let controller_home = ao_controller_home(project)?;
+        std::fs::create_dir_all(&controller_home).map_err(|error| {
+            format!(
+                "failed to create AO controller state home {}: {error}",
+                controller_home.display()
+            )
+        })?;
+        controller_home.to_string_lossy().into_owned()
+    };
     let config_path = std::env::var("DARK_FACTORY_AO_CONFIG_PATH")
         .or_else(|_| std::env::var("AO_CONFIG_PATH"))
         .unwrap_or_else(|_| format!("{operator_home}/agent-orchestrator.yaml"));
 
     Ok(vec![
-        ("HOME".to_string(), controller_home.to_string_lossy().into_owned()),
+        ("HOME".to_string(), bridge_home),
         ("AO_ORIGINAL_HOME".to_string(), operator_home.clone()),
         ("AO_CONFIG_PATH".to_string(), config_path),
         (
@@ -3455,6 +3478,44 @@ fn validate_controller_manifest_project(
     }
 }
 
+/// True iff a healthy AO instance is ALREADY polling `project` under the
+/// operator's real, shared `$HOME` -- e.g. a long-lived operator-run `ao
+/// start` that predates this daemon and serves multiple projects (worked
+/// example on jeff-ubuntu 2026-09-06: one `agent-orchestrator-ts` process
+/// polling `my-project`, `worldarchitect`, and `dark-factory` at once).
+/// Unlike `probe_ao_project`, this has no daemon-owned controller manifest to
+/// cross-check a PID against -- the operator's `ao start` is not a process
+/// this daemon spawned or tracks -- so it trusts `running.json`'s own `pid`
+/// once that PID is confirmed alive.
+fn probe_operator_ao_project(project: &str, operator_home: &str) -> AoReadiness {
+    let running_path =
+        std::path::Path::new(operator_home).join(".agent-orchestrator/running.json");
+    let running: serde_json::Value = match std::fs::read(&running_path)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+    {
+        Ok(value) => value,
+        Err(_) => return AoReadiness::Unavailable,
+    };
+    let Some(pid) = running.get("pid").and_then(serde_json::Value::as_u64) else {
+        return AoReadiness::Unavailable;
+    };
+    if pid > u64::from(u32::MAX) || process_start_ticks(pid as u32).is_none() {
+        return AoReadiness::Unavailable;
+    }
+    let has_project = running
+        .get("projects")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|projects| projects.iter().any(|value| value.as_str() == Some(project)));
+    if has_project {
+        AoReadiness::Ready(format!(
+            "operator AO instance pid={pid} already polling project={project}"
+        ))
+    } else {
+        AoReadiness::Unavailable
+    }
+}
+
 fn probe_ao_project(project: &str) -> AoReadiness {
     let manifest = match read_controller_manifest(project) {
         Ok(Some(manifest)) => manifest,
@@ -3555,6 +3616,17 @@ fn kill_controller_scope(child: &mut std::process::Child) {
 /// instance. The elected caller starts one detached, factory-owned controller
 /// and polls a project-scoped ready condition for a bounded interval.
 fn ensure_ao_recovery_for_target(project: &str, target: &str) -> RecoveryOutcome {
+    // A shared operator instance already polling this project makes the rest
+    // of this function actively harmful to invoke: its `ao start` would
+    // detect that live session, print "reused existing session", and exit
+    // immediately without ever satisfying `probe_ao_project`'s private-HOME
+    // readiness check below -- burning the recovery cooldown on a doomed
+    // attempt every cycle. Check first and skip the private sandbox entirely.
+    if let Ok(home) = operator_home() {
+        if let AoReadiness::Ready(evidence) = probe_operator_ao_project(project, &home) {
+            return RecoveryOutcome::Healthy { evidence };
+        }
+    }
     let slot = ao_recovery_slot(project);
     let mut slot = slot
         .lock()
@@ -4895,9 +4967,10 @@ mod spawn_classification_tests {
 #[cfg(test)]
 mod ao_spawn_contract_tests {
     use super::{
-        ao_controller_home, ao_spawn_bridge_path,
-        process_start_identity_from_ps, process_start_ticks, safe_project_component,
-        validate_controller_manifest_project, AoControllerManifest, CliSessions,
+        ao_controller_env, ao_controller_home, ao_spawn_bridge_path, ensure_ao_recovery_for_target,
+        operator_home, probe_operator_ao_project, process_start_identity_from_ps,
+        process_start_ticks, safe_project_component, validate_controller_manifest_project,
+        AoControllerManifest, AoReadiness, CliSessions, RecoveryOutcome,
     };
     use crate::errors::DaemonError;
     use crate::tools::{SessionId, Sessions, SpawnSpec};
@@ -5024,6 +5097,191 @@ mod ao_spawn_contract_tests {
         };
         let error = validate_controller_manifest_project(&manifest, "dark-factory").unwrap_err();
         assert!(error.contains("refusing to signal or remove"));
+    }
+
+    /// Returns a PID that is guaranteed dead: spawn a trivial child and wait
+    /// for it to exit, then hand back its now-recycled-eventually-but-
+    /// currently-reaped PID.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn /bin/true for a dead-pid fixture");
+        let pid = child.id();
+        child.wait().expect("wait for dead-pid fixture to exit");
+        pid
+    }
+
+    fn write_running_json(home: &std::path::Path, pid: u32, projects: &[&str]) {
+        let dir = home.join(".agent-orchestrator");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("running.json"),
+            serde_json::json!({ "pid": pid, "projects": projects }).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// Live incident, jeff-ubuntu 2026-09-06: an operator-run AO instance was
+    /// already healthy and polling "dark-factory", but the daemon's private
+    /// controller-HOME probe could never see it (that instance's
+    /// `running.json` lives under the operator's real `$HOME`, not the
+    /// private sandbox), so every real spawn attempt saw "AO is not running"
+    /// forever. `probe_operator_ao_project` closes that gap.
+    #[test]
+    fn probe_operator_ao_project_detects_healthy_shared_instance() {
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_healthy_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json(&home, std::process::id(), &["dark-factory", "worldarchitect"]);
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Ready(_)), "{outcome:?}");
+    }
+
+    #[test]
+    fn probe_operator_ao_project_rejects_project_not_in_running_json() {
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_wrong_project_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json(&home, std::process::id(), &["worldarchitect"]);
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    #[test]
+    fn probe_operator_ao_project_rejects_dead_pid() {
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_dead_pid_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json(&home, dead_pid(), &["dark-factory"]);
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    #[test]
+    fn probe_operator_ao_project_rejects_missing_running_json() {
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_missing_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    /// The actual bug: `ensure_ao_recovery_for_target` must short-circuit to
+    /// `Healthy` the moment a shared operator instance is already polling the
+    /// project, WITHOUT ever invoking the `ao` binary. Proven here by never
+    /// putting `ao` on PATH -- if the private-sandbox recovery path ran at
+    /// all, `Command::new("ao").spawn()` would fail and this would return
+    /// `Unknown`/`FailClosed`, not `Healthy`.
+    #[test]
+    fn ensure_ao_recovery_short_circuits_when_operator_instance_already_healthy() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_operator_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+        let prior_path = std::env::var_os("PATH");
+        let home = std::env::temp_dir().join(format!(
+            "afd_recovery_short_circuit_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json(&home, std::process::id(), &["dark-factory"]);
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &home);
+        // Prepend an empty directory so no `ao` binary is reachable (any
+        // attempt to actually run `ao start` fails loudly), while keeping
+        // the real PATH so `ps`/`true` (used by liveness checks in this very
+        // code path) keep working on macOS test runs.
+        let empty_bin = std::env::temp_dir().join(format!(
+            "afd_recovery_short_circuit_bin_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&empty_bin).unwrap();
+        let mut paths = vec![empty_bin.clone()];
+        paths.extend(std::env::split_paths(&prior_path.clone().unwrap_or_default()));
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+
+        let outcome = ensure_ao_recovery_for_target("dark-factory", "dark-factory");
+        let _ = std::fs::remove_dir_all(&empty_bin);
+
+        match prior_operator_home {
+            Some(value) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        match prior_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            matches!(outcome, RecoveryOutcome::Healthy { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// When a shared operator instance is already healthy for the project,
+    /// the bridge's `HOME` must point at the operator's real home (where
+    /// AO's own `getRunning()` will actually find it) instead of the private
+    /// controller sandbox.
+    #[test]
+    fn ao_controller_env_uses_operator_home_when_shared_instance_healthy() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_operator_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+        let prior_controller_home = std::env::var_os("DARK_FACTORY_AO_CONTROLLER_HOME");
+        let home = std::env::temp_dir().join(format!(
+            "afd_controller_env_operator_home_{}",
+            std::process::id()
+        ));
+        let controller_base = std::env::temp_dir().join(format!(
+            "afd_controller_env_private_home_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&controller_base);
+        write_running_json(&home, std::process::id(), &["dark-factory"]);
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &home);
+        std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", &controller_base);
+
+        let env = ao_controller_env("dark-factory").unwrap();
+
+        match prior_operator_home {
+            Some(value) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        match prior_controller_home {
+            Some(value) => std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_AO_CONTROLLER_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&controller_base);
+
+        let resolved_home = env
+            .iter()
+            .find(|(key, _)| key == "HOME")
+            .map(|(_, value)| value.clone())
+            .expect("HOME must be set");
+        assert_eq!(resolved_home, home.to_string_lossy());
     }
 
     #[test]
