@@ -56,11 +56,11 @@ Operational rules:
    token budget on adversarial validation, it is probably under-testing.
 6. Treat `.dot` graphs as the durable process code. Runner code is disposable;
    graph shape, specs, holdouts, and scoring contracts are the important assets.
-7. **Deprecate human interactive hat**: All coding LLM work must be shifted to the auto-factory. Humans only define intent (create GitHub issues/beads) and write comments on PRs for feedback. The auto-factory autonomously processes and drives branches to green without human-interactive coding sessions.
+7. **Deprecate human interactive hat**: All coding LLM work must be shifted to the auto-factory. Humans only define intent (create GitHub issues/beads) and write comments on PRs for feedback. The auto-factory autonomously processes and drives branches to green without human-interactive coding sessions (exception: explicitly authorized factory infrastructure repair missions may diagnose and repair factory infrastructure in separate worktrees/branches, but product/pilot branches remain strictly autonomous).
 
 ## /af — ZERO direct work; monitoring only (operator hard rule)
 
-When the operator directs work through /af (or sets an /af goal), the session
+During ordinary intake (or when an /af goal directs product work), the session
 does **ZERO direct work** — no product code, no factory code, no hand-fixes,
 no coding sub-agent lanes. The session's ONLY jobs:
 
@@ -75,6 +75,15 @@ no coding sub-agent lanes. The session's ONLY jobs:
    myself" is the forbidden move: it hides factory gaps and makes the
    label→merge E2E proof unfalsifiable (2026-07-11/12 incidents: hand-driven
    PRs masked a dead coder loop for a full day).
+
+**Factory Infrastructure Repair Exception**:
+When the operator explicitly authorizes a factory repair mission (a natural-language goal to make /af work counts as explicit authorization), the session is permitted to diagnose and repair factory infrastructure/harness code in a separate worktree and branch. Operational rules for repair missions:
+- Strictly isolate infrastructure repairs from selected pilot/product PR branches; never hand-drive pilot PRs.
+- Preserve existing logs and telemetry; create and hash backups before modifying files.
+- Independently validate all repairs, then deploy only through the canonical Linux workflow (`jeff-ubuntu` via SSH).
+- After deployment, resume a clean, real /af pilot to prove end-to-end operation.
+- Infrastructure changes never count as autonomous pilot evidence.
+- Safety invariants remain absolute: no merge permissions are weakened (merges still require explicit human `MERGE APPROVED`), and AO code writes remain strictly forbidden without verbatim `AO CODE APPROVED`.
 
 ## Factory host placement (Linux-only)
 
