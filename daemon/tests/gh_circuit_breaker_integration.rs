@@ -97,6 +97,7 @@ impl Drop for TestEnvGuard {
 
 fn test_cfg() -> Config {
     Config {
+        mission_admission: None,
         target_repo: "jleechanorg/repo-a".into(),
         ao_project: None,
         base_branch: "main".into(),

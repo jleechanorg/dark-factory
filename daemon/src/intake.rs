@@ -781,6 +781,12 @@ pub fn normalize_labeled_prs_outcome(
                     continue;
                 }
             };
+        let prs: Vec<_> = prs.into_iter().filter(|pr| {
+            let id = tracker_candidates.iter().find(|b| b.external_ref.as_deref().map(to_canonical_external_ref).as_deref() == Some(to_canonical_external_ref(&pr.external_ref).as_str())).map(|b| b.id.as_str()).unwrap_or("");
+            let admitted = cfg.admits(id, Some(&pr.external_ref));
+            if !admitted { master_outcomes.push(mission_excluded(&pr.external_ref, &repo, pr.number)); }
+            admitted
+        }).collect();
         let tracker_snapshot = TrackerSweepSnapshot {
             candidates: tracker_candidates,
             known_refs,
@@ -1201,6 +1207,10 @@ pub(crate) fn normalize_labeled_prs_with_cache(
 /// function via `return Err(..)`, which propagates through `run_slow_tier`
 /// to `main()` and calls `std::process::exit(1)`, so no candidate after the
 /// failing one in the same fetch batch was ever visited, let alone logged.
+fn mission_excluded(external_ref: &str, repo: &str, number: u64) -> IntakeOutcome {
+    IntakeOutcome { external_ref: external_ref.to_owned(), verdict: IntakeVerdict::SkippedIneligible { precondition: "mission_admission_excluded".into() }, repo: Some(repo.to_owned()), pr_number: Some(number), branch: None, head_sha: None }
+}
+
 pub fn normalize(
     scm: &dyn Scm,
     tracker: &dyn Tracker,
@@ -1212,6 +1222,7 @@ pub fn normalize(
     }
 
     let known_refs = tracker.fetch_all_external_refs()?;
+    let mission_candidates = if cfg.mission_admission.is_some() { tracker.fetch_candidates()? } else { Vec::new() };
 
     let mut created = Vec::new();
     let mut outcomes = Vec::new();
@@ -1222,6 +1233,12 @@ pub fn normalize(
         // same PR (one URL-shaped, one short-shaped) hit the same dedup
         // key.
         issue.external_ref = to_canonical_external_ref(&issue.external_ref);
+        let id = mission_candidates.iter().find(|b| b.external_ref.as_deref().map(to_canonical_external_ref).as_deref() == Some(issue.external_ref.as_str())).map(|b| b.id.as_str()).unwrap_or("");
+        if !cfg.admits(id, Some(&issue.external_ref)) {
+            outcomes.push(mission_excluded(&issue.external_ref, &cfg.target_repo, issue.number));
+            continue;
+        }
+
 
         // Idempotency: already-known external_ref -> skip silently, no create_bead call.
         if known_refs.contains(&issue.external_ref) {
@@ -1373,6 +1390,12 @@ pub fn normalize_labeled_prs(
         // create_bead checks — see to_canonical_external_ref for the
         // duplicate-pair rationale.
         pr.external_ref = to_canonical_external_ref(&pr.external_ref);
+        let id = tracker_candidates.iter().find(|b| b.external_ref.as_deref().map(to_canonical_external_ref).as_deref() == Some(pr.external_ref.as_str())).map(|b| b.id.as_str()).unwrap_or("");
+        if !cfg.admits(id, Some(&pr.external_ref)) {
+            outcomes.push(mission_excluded(&pr.external_ref, &cfg.target_repo, pr.number));
+            continue;
+        }
+
 
         if pr.head_ref_name.trim().is_empty() {
             outcomes.push(IntakeOutcome {

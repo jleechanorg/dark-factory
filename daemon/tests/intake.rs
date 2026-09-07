@@ -11,6 +11,7 @@ use daemon::tools::{Bead, Issue, LabeledPr, Permission, PrSnapshot, Scm, Tracker
 
 fn test_cfg() -> Config {
     Config {
+        mission_admission: None,
         target_repo: "owner/repo".into(),
         ao_project: None,
         base_branch: "main".into(),
@@ -2269,4 +2270,26 @@ fn non_default_repository_blocked_dispositions_attribution() {
     );
     assert_eq!(empty_outcome.pr_number, Some(8003));
     assert_eq!(empty_outcome.head_sha.as_deref(), Some("sha-empty-8003"));
+}
+
+#[test]
+fn mission_two_ticks_excluded_sources_never_reach_label_recovery() {
+    let mut scm = FakeScm::new();
+    scm.issues.extend([issue(42, "alice"), issue(43, "alice")]);
+    scm.prs.extend([labeled_pr(51, "alice", "feature/51"), labeled_pr(52, "alice", "feature/52")]);
+    scm.permissions.insert("alice".into(), Permission::Write);
+    let tracker = FakeTracker::new();
+    let mut cfg = test_cfg();
+    cfg.mission_admission = Some(toml::from_str("external_refs = ['owner/repo#42', 'owner/repo#51']").unwrap());
+    let mut cache = intake::AdoptionProbeCache::default();
+    for tick in 0..2 {
+        intake::normalize_labeled_prs_outcome(&scm, &tracker, &cfg, &mut cache, 1000 + tick * 300, std::path::Path::new("/dev/null")).unwrap();
+        intake::normalize(&scm, &tracker, &cfg).unwrap();
+        intake::normalize_labeled_prs(&scm, &tracker, &cfg).unwrap();
+    }
+    let calls = tracker.calls.borrow();
+    let writes: Vec<_> = calls.iter().filter(|v| v.starts_with("create_bead(")).collect();
+    assert_eq!(writes.len(), 2, "excluded refs must never reach the adapter's duplicate/create/relabel operation: {writes:?}");
+    assert!(writes.iter().all(|v| !v.contains("#43") && !v.contains("#52")));
+    assert_eq!(tracker.candidates.borrow().len(), 2);
 }

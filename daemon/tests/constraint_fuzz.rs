@@ -39,6 +39,7 @@ use std::hash::{Hash, Hasher};
 
 fn test_cfg(spec_dir: &std::path::Path) -> Config {
     Config {
+        mission_admission: None,
         target_repo: "owner/repo".into(),
         ao_project: None,
         base_branch: "main".into(),

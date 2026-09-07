@@ -225,6 +225,7 @@ pub fn dispatch_ready_with_vcs(
 
     let mut report = DispatchReport::default();
     for (bead, verdict, drive_branch) in ready {
+        if !cfg.admits(&bead.id, bead.external_ref.as_deref()) { continue; }
         if report.success_count() >= batch {
             break;
         }
@@ -2170,8 +2171,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mission_two_ticks_excluded_queued_beads_never_spawn_or_register() {
+        let store = FakeStateStore::new();
+        let sessions = FakeSessions::new(0);
+        let mut cfg = cfg();
+        cfg.mission_admission = Some(Default::default());
+        let ready = beads(3);
+        for (bead, _, _) in &ready {
+        store
+            .save(&BeadOverlay {
+                bead_id: bead.id.clone(),
+                state: OverlayState::Queued,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 0,
+                spend_usd: 0.0,
+                pr_number: None,
+                branch: None,
+                session_id: None,
+            session_ao_project: None,
+                is_adopted: false,
+                spawn_failure_count: 0,
+                transient_error_count: 0,
+                pre_session_head_sha: None,
+                park_reason: None,
+                // jleechan-8jxr r2: a real intake-persisted overlay carries a
+                // resolved `target_repo`. The old test left this `None` and
+                // relied on the pre-fix silent default to `cfg.target_repo` —
+                // which is exactly the bug this bead's regression test
+                // (`dispatch_ready_parks_human_held_when_bead_has_no_repo_identity_at_all`)
+                // pins. Update the test fixture to reflect production reality.
+                target_repo: Some("owner/repo".to_string()),
+                attempt_started_at: None,
+            })
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let report = dispatch_ready(&sessions, &store, &cfg, &ready).unwrap();
+            assert_eq!(report.success_count(), 0);
+        }
+        assert!(store.owned_branches().unwrap().is_empty());
+        assert_eq!(store.overlays.borrow().len(), 3);
+        assert!(store.overlays.borrow().values().all(|o| o.state == OverlayState::Queued && o.attempt == 1));
+        assert!(!sessions.calls.borrow().iter().any(|c| c.starts_with("spawn(")));
+    }
+
     fn cfg() -> Config {
         Config {
+            mission_admission: None,
             target_repo: "owner/repo".into(),
             ao_project: None,
             base_branch: "main".into(),
