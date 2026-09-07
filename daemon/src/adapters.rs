@@ -3371,6 +3371,46 @@ fn process_start_ticks(_pid: u32) -> Option<u64> {
     None
 }
 
+/// True iff `pid`'s command line contains `needle` (case-insensitive).
+///
+/// A bare "is this PID alive" check cannot distinguish the real AO process
+/// from an unrelated process that has since reused the same PID -- a real
+/// risk for `probe_operator_ao_project`, which (unlike `probe_ao_project`)
+/// has no daemon-owned manifest recording the PID's expected start time to
+/// cross-check against. Requiring the live process's own command line to
+/// still look like AO is a cheap, no-new-persistent-state way to reject that
+/// case (CodeRabbit finding on PR #839).
+#[cfg(target_os = "linux")]
+fn process_command_contains(pid: u32, needle: &str) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .split('\0')
+                .any(|arg| arg.to_lowercase().contains(needle))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn process_command_contains(pid: u32, needle: &str) -> bool {
+    Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .to_lowercase()
+                .contains(needle)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_command_contains(_pid: u32, _needle: &str) -> bool {
+    false
+}
+
 fn acquire_ao_recovery_file_lock(project: &str) -> Result<AoRecoveryFileLock, String> {
     use std::os::fd::AsRawFd;
     use std::io::Write;
@@ -3500,7 +3540,10 @@ fn probe_operator_ao_project(project: &str, operator_home: &str) -> AoReadiness 
     let Some(pid) = running.get("pid").and_then(serde_json::Value::as_u64) else {
         return AoReadiness::Unavailable;
     };
-    if pid > u64::from(u32::MAX) || process_start_ticks(pid as u32).is_none() {
+    if pid > u64::from(u32::MAX)
+        || process_start_ticks(pid as u32).is_none()
+        || !process_command_contains(pid as u32, "agent-orchestrator")
+    {
         return AoReadiness::Unavailable;
     }
     let has_project = running
@@ -5111,6 +5154,27 @@ mod ao_spawn_contract_tests {
         pid
     }
 
+    /// Spawn a long-lived child whose command line contains "agent-orchestrator",
+    /// so it passes `process_command_contains`'s identity check the same way a
+    /// real AO process would. Invoked via a symlink named
+    /// `agent-orchestrator-fake` (rather than e.g. `sh -c "sleep 30 # marker"`)
+    /// because a single-command `sh -c` often `exec`s directly into the target
+    /// binary, replacing the process image and losing any comment/marker text
+    /// from the original argv. Callers must `.kill()` (and ideally `.wait()`) it.
+    fn spawn_fake_ao_process() -> std::process::Child {
+        let dir = std::env::temp_dir().join(format!("afd_fake_ao_bin_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("agent-orchestrator-fake");
+        let _ = std::fs::remove_file(&link);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/bin/sleep", &link)
+            .expect("symlink agent-orchestrator-fake -> /bin/sleep");
+        std::process::Command::new(&link)
+            .arg("30")
+            .spawn()
+            .expect("spawn fake agent-orchestrator process for test fixture")
+    }
+
     fn write_running_json(home: &std::path::Path, pid: u32, projects: &[&str]) {
         let dir = home.join(".agent-orchestrator");
         std::fs::create_dir_all(&dir).unwrap();
@@ -5134,10 +5198,13 @@ mod ao_spawn_contract_tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&home);
-        write_running_json(&home, std::process::id(), &["dark-factory", "worldarchitect"]);
+        let mut fake_ao = spawn_fake_ao_process();
+        write_running_json(&home, fake_ao.id(), &["dark-factory", "worldarchitect"]);
 
         let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
 
+        let _ = fake_ao.kill();
+        let _ = fake_ao.wait();
         let _ = std::fs::remove_dir_all(&home);
         assert!(matches!(outcome, AoReadiness::Ready(_)), "{outcome:?}");
     }
@@ -5189,10 +5256,14 @@ mod ao_spawn_contract_tests {
 
     /// The actual bug: `ensure_ao_recovery_for_target` must short-circuit to
     /// `Healthy` the moment a shared operator instance is already polling the
-    /// project, WITHOUT ever invoking the `ao` binary. Proven here by never
-    /// putting `ao` on PATH -- if the private-sandbox recovery path ran at
-    /// all, `Command::new("ao").spawn()` would fail and this would return
-    /// `Unknown`/`FailClosed`, not `Healthy`.
+    /// project, WITHOUT ever invoking the `ao` binary. Proven here with a
+    /// stub `ao` on PATH that always exits nonzero -- if the private-sandbox
+    /// recovery path ran at all, `Command::new("ao").spawn()` would succeed
+    /// (the stub exists) but the stub's failure would surface as
+    /// `Unknown`/`FailClosed`, not `Healthy`. A stub that actively fails is a
+    /// stronger negative proof than an empty PATH entry, which would pass
+    /// silently if a real `ao` happened to be reachable elsewhere on PATH in
+    /// some other environment (CodeRabbit finding on PR #839).
     #[test]
     fn ensure_ao_recovery_short_circuits_when_operator_instance_already_healthy() {
         let _guard = crate::test_env_lock()
@@ -5205,22 +5276,39 @@ mod ao_spawn_contract_tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&home);
-        write_running_json(&home, std::process::id(), &["dark-factory"]);
+        let mut fake_ao = spawn_fake_ao_process();
+        write_running_json(&home, fake_ao.id(), &["dark-factory"]);
         std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &home);
-        // Prepend an empty directory so no `ao` binary is reachable (any
-        // attempt to actually run `ao start` fails loudly), while keeping
-        // the real PATH so `ps`/`true` (used by liveness checks in this very
-        // code path) keep working on macOS test runs.
+        // Prepend a directory containing a hard-failing `ao` stub, ahead of
+        // the real PATH, so if the private-sandbox path ran at all it would
+        // hit this stub (not silently succeed via some other `ao` on PATH),
+        // while keeping the real PATH so `ps`/`true`/`sh` (used by liveness
+        // checks and the fake-AO fixture) keep working on macOS test runs.
         let empty_bin = std::env::temp_dir().join(format!(
             "afd_recovery_short_circuit_bin_{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&empty_bin).unwrap();
+        let ao_stub = empty_bin.join("ao");
+        std::fs::write(
+            &ao_stub,
+            "#!/bin/sh\necho 'stub ao: recovery must not invoke ao' >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&ao_stub).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&ao_stub, permissions).unwrap();
+        }
         let mut paths = vec![empty_bin.clone()];
         paths.extend(std::env::split_paths(&prior_path.clone().unwrap_or_default()));
         std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
 
         let outcome = ensure_ao_recovery_for_target("dark-factory", "dark-factory");
+        let _ = fake_ao.kill();
+        let _ = fake_ao.wait();
         let _ = std::fs::remove_dir_all(&empty_bin);
 
         match prior_operator_home {
@@ -5259,11 +5347,14 @@ mod ao_spawn_contract_tests {
         ));
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&controller_base);
-        write_running_json(&home, std::process::id(), &["dark-factory"]);
+        let mut fake_ao = spawn_fake_ao_process();
+        write_running_json(&home, fake_ao.id(), &["dark-factory"]);
         std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &home);
         std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", &controller_base);
 
         let env = ao_controller_env("dark-factory").unwrap();
+        let _ = fake_ao.kill();
+        let _ = fake_ao.wait();
 
         match prior_operator_home {
             Some(value) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", value),
