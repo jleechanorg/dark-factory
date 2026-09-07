@@ -27,6 +27,8 @@ pub struct RepoRouting {
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Config {
+    #[serde(default)]
+    pub mission_admission: Option<MissionAdmission>,
     pub target_repo: String,
     #[serde(default)]
     pub ao_project: Option<String>,
@@ -326,6 +328,57 @@ pub fn is_fixture_repo(repo: &str) -> bool {
     // Keep this allow-list explicit: production repositories whose names
     // happen to contain `test-` or `fake-` must still run the real gates.
     matches!(repo, "owner/repo" | "other/repo" | "myorg/myrepo")
+}
+
+
+/// Explicit mission selection. Absence is unrestricted; an empty table denies all.
+#[derive(serde::Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields, try_from = "RawMissionAdmission")]
+pub struct MissionAdmission {
+    pub bead_ids: Vec<String>,
+    pub external_refs: Vec<String>,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMissionAdmission {
+    #[serde(default)]
+    bead_ids: Vec<String>,
+    #[serde(default)]
+    external_refs: Vec<String>,
+}
+fn canonical_mission_ref(value: &str) -> Option<String> {
+    let canonical = if let Some(rest) = value.strip_prefix("https://github.com/") {
+        let parts: Vec<_> = rest.split('/').collect();
+        match parts.as_slice() {
+            [owner, repo, "pull" | "issues", number] => format!("{owner}/{repo}#{number}"),
+            _ => return None,
+        }
+    } else { value.to_owned() };
+    let (repo, number) = canonical.split_once('#')?;
+    let pieces: Vec<_> = repo.split('/').collect();
+    if pieces.len() != 2 || pieces.iter().any(|v| v.is_empty() || !v.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))) {
+        return None;
+    }
+    if number.is_empty() || !number.bytes().all(|c| c.is_ascii_digit()) || number.parse::<u64>().ok()? == 0 { return None; }
+    Some(format!("{}#{}", repo.to_ascii_lowercase(), number.parse::<u64>().ok()?))
+}
+impl TryFrom<RawMissionAdmission> for MissionAdmission {
+    type Error = String;
+    fn try_from(raw: RawMissionAdmission) -> Result<Self, Self::Error> {
+        if raw.bead_ids.iter().any(|v| v.is_empty() || !v.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))) {
+            return Err("mission_admission bead_ids must contain exact nonblank IDs".into());
+        }
+        let external_refs = raw.external_refs.iter().map(|v| canonical_mission_ref(v).ok_or_else(|| format!("invalid mission_admission external ref: {v:?}"))).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { bead_ids: raw.bead_ids, external_refs })
+    }
+}
+impl Config {
+    pub fn admits(&self, bead_id: &str, external_ref: Option<&str>) -> bool {
+        self.mission_admission.as_ref().is_none_or(|selection| {
+            selection.bead_ids.iter().any(|id| id == bead_id)
+                || external_ref.and_then(canonical_mission_ref).is_some_and(|value| selection.external_refs.contains(&value))
+        })
+    }
 }
 
 pub fn load(path: &Path) -> Result<Config, DaemonError> {
@@ -695,6 +748,7 @@ push_remote = "origin"
     #[test]
     fn relative_spec_dir_uses_runtime_state_not_target_worktree() {
         let cfg = Config {
+            mission_admission: None,
             target_repo: "owner/daemon".into(),
             ao_project: None,
             base_branch: "main".into(),
@@ -738,6 +792,7 @@ push_remote = "origin"
         let absolute_spec_dir = root.join("shared-specs");
 
         let cfg = Config {
+            mission_admission: None,
             target_repo: "owner/daemon".into(),
             ao_project: None,
             base_branch: "main".into(),
@@ -768,6 +823,7 @@ push_remote = "origin"
     #[test]
     fn explicit_production_repo_without_checkout_is_clone_eligible() {
         let cfg = Config {
+            mission_admission: None,
             target_repo: "owner/daemon".into(),
             ao_project: None,
             base_branch: "main".into(),
@@ -809,6 +865,7 @@ push_remote = "origin"
         ));
         let checkout = root.join("production");
         let cfg = Config {
+            mission_admission: None,
             target_repo: "owner/daemon".into(),
             ao_project: None,
             base_branch: "main".into(),
@@ -852,6 +909,7 @@ push_remote = "origin"
     #[test]
     fn explicit_relative_checkout_is_not_clone_eligible() {
         let cfg = Config {
+            mission_admission: None,
             target_repo: "owner/daemon".into(),
             ao_project: None,
             base_branch: "main".into(),
@@ -971,6 +1029,7 @@ spec_dir = ".factory/specs/"
     #[test]
     fn agent_worktree_path_uses_owner_repo_layout() {
         let cfg = Config {
+            mission_admission: None,
             target_repo: "owner/repo".into(),
             ao_project: None,
             base_branch: "main".into(),
@@ -1032,5 +1091,25 @@ worktree_max_count = 50
         assert_eq!(cfg.worktree_max_count, 50);
         assert!(cfg.agent_worktree_root.is_some());
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod mission_tests {
+    use super::*;
+    #[test]
+    fn mission_admission_default_empty_exact_and_invalid() {
+        let raw = include_str!("../contracts/daemon.toml.example");
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.admits("other", None));
+        let cfg: Config = toml::from_str(&format!("{raw}\n[mission_admission]\n")).unwrap();
+        assert!(!cfg.admits("other", None));
+        let cfg: Config = toml::from_str(&format!("{raw}\n[mission_admission]\nbead_ids = ['repair']\nexternal_refs = ['https://github.com/jleechanorg/dark-factory/pull/676']\n")).unwrap();
+        assert!(cfg.admits("repair", None));
+        assert!(cfg.admits("unknown", Some("jleechanorg/dark-factory#676")));
+        assert!(!cfg.admits("repair-other", Some("jleechanorg/dark-factory#6760")));
+        for suffix in ["bead_ids = ['']", "external_refs = ['wrong']", "external_refs = ['x/y#0']", "external_refs = ['https://evil.test/x/y/pull/1']", "bead_id = ['typo']"] {
+            assert!(toml::from_str::<Config>(&format!("{raw}\n[mission_admission]\n{suffix}")).is_err(), "{suffix}");
+        }
     }
 }

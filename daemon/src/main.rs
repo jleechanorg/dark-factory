@@ -971,6 +971,7 @@ mod tests {
     #[test]
     fn startup_binding_uses_canonical_legacy_worldarchitect_project_alias() {
         let cfg = Config {
+            mission_admission: None,
             target_repo: "jleechanorg/worldarchitect.ai".to_string(),
             ao_project: None,
             base_branch: "main".to_string(),
