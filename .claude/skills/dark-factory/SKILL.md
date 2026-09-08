@@ -276,7 +276,13 @@ resolve_dark_factory_home() {
 ```
 
 1. **Verify binary install**. The factory runs via the **`dark-factory` binary**
-   (not `python -m runner` from source). Check:
+   (not `python -m runner` from source). If missing, report the unmet prerequisite
+   and inspect the existing installation before cloning or reinstalling. Complete
+   setup within the current authorized scope and repository execution rules, or
+   return the limitation to the parent for other authorized work. Ask only for
+   missing authority or access; an unavailable binary is not a completed run.
+   The following check runs as a tool command; its failure ends that command,
+   then the parent follows the prerequisite guidance above:
    ```bash
    export PATH="$HOME/.local/bin:$PATH"
    resolve_dark_factory_home || exit 1
@@ -286,11 +292,6 @@ resolve_dark_factory_home() {
      exit 1
    }
    ```
-   If missing, report the unmet prerequisite and inspect the existing
-   installation before cloning or reinstalling. Complete setup within the
-   current authorized scope, or return the limitation to the parent for
-   other authorized work. Ask only for missing authority or access; an
-   unavailable binary is not a completed factory run.
 
 2. **Environment**:
    ```bash
@@ -459,9 +460,11 @@ Whenever `dark-factory review` completes, the agent MUST immediately report:
 
 - Reaching the maximum cycle budget (e.g., 3/3 cycles) without achieving `verdict: pass` constitutes a **FAILED RUN**.
 - The agent MUST report `STATUS: REVIEW FAILED / EXHAUSTED AFTER N CYCLES` and
-  end that factory invocation. Return its failure evidence to the parent task,
-  which diagnoses and continues authorized repair or independent work within
-  the mission deadline. An invocation's cycle budget is not a mission stop.
+  end that factory invocation and return its failure evidence to the parent task.
+  The parent continues authorized work within the mission deadline and the
+  active repository's role and execution rules. Where coding must run through
+  auto-factory, route repairs through a fresh or adjusted factory run.
+  An invocation's cycle budget is not a mission stop.
 - An agent must **NEVER** summarize cycle exhaustion as "addressed findings", "all gates passing", or "/ready".
 
 ## Honesty rules
