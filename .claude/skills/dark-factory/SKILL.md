@@ -454,7 +454,10 @@ Whenever `dark-factory review` completes, the agent MUST immediately report:
 ### Loop Exhaustion Invariant
 
 - Reaching the maximum cycle budget (e.g., 3/3 cycles) without achieving `verdict: pass` constitutes a **FAILED RUN**.
-- The agent MUST report `STATUS: REVIEW FAILED / EXHAUSTED AFTER N CYCLES` and halt.
+- The agent MUST report `STATUS: REVIEW FAILED / EXHAUSTED AFTER N CYCLES` and
+  end that factory invocation. Return its failure evidence to the parent task,
+  which diagnoses and continues authorized repair or independent work within
+  the mission deadline. An invocation's cycle budget is not a mission stop.
 - An agent must **NEVER** summarize cycle exhaustion as "addressed findings", "all gates passing", or "/ready".
 
 ## Honesty rules
@@ -474,16 +477,20 @@ Whenever `dark-factory review` completes, the agent MUST immediately report:
 - Do not claim a factory run based on an in-Claude workflow, `Skill()` call,
   or prose summary. The only valid proof is an actual `dark-factory` binary
   invocation plus the proof block above.
-- If the LLM decided `/fs` is needed first, **say so and stop** — do not
-  silently fall through to `gates.dot` and pretend the PR is green.
-- If no pipeline fits (e.g. docs-only PR), **say so and stop** — do not
-  silently fall through to a holdout-bearing pipeline.
+- If `/fs` is needed first, report the unmet prerequisite and perform its
+  authorized setup. Ask only for missing authority; do not silently fall
+  through to `gates.dot` and pretend the PR is green.
+- If no pipeline fits (e.g. docs-only PR), report that limitation and return to
+  the parent task for authorized diagnosis or preparation. A materially different
+  requested method needs authorization; do not silently substitute a
+  holdout-bearing pipeline.
 - Do not invent `--feature` values. If there's no holdout directory at
   `~/projects/dark-factory-holdouts/holdouts/<feature>/`, don't pass `--feature`.
 - When the goal is unrelated to the open PR (Step 0a), **ask the user** which
   mode they meant. Do not silently route to PR-mode for unrelated work.
-- When the fix loop exhausts (3 attempts), surface the diagnosis verbatim and
-  **stop** — do not auto-merge.
+- When the fix loop exhausts (3 attempts), surface its failure diagnosis and
+  return control to the parent as above. Preserve the failed verdict; never
+  auto-merge or retry an unchanged failing approach merely to get a pass.
 
 ## Known limits
 
