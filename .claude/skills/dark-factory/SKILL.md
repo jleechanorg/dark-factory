@@ -66,7 +66,7 @@ echoed in the run evidence.
 
 | `pipelines/factory/level5_feature.dot` | full reference pipeline | Full Level-5 reference pipeline with hard-tier gates wired in |
 | **dynamic DOT via binary** | binary-owned graph builder | A static graph can't express the needed phase/fanout; the binary saves/echoes the generated graph in run evidence |
-| **no pipeline** | — | Docs-only / test-only / config-only PRs have no behavioral surface for the holdout to grade — say so and stop |
+| **no pipeline** | — | When no available pipeline fits the inspected PR, report the limitation and return to the parent for authorized work; do not force an inapplicable holdout pipeline |
 
 You can also write your own `.dot` and pass it via `--pipeline`.
 
@@ -113,8 +113,9 @@ task, not a deterministic rule table (no `if is_draft then X`, no
 3. **Reason about**: what kind of work this is (new feature / bug fix /
    refactor / docs / test-only / infra — from diff+body+files, never
    pre-bucketed by label alone); whether a spec already covers the
-   change (if so, `/fs` is skippable — deciding `/fs` is needed first
-   and stopping is a valid terminal state, do not force a run); holdout
+   change (if so, `/fs` is skippable; if needed, report the prerequisite
+   and carry out its already-authorized preparation or return it to the
+   parent task. Do not force a pipeline run before it is ready); holdout
    eligibility (pass `--feature <name>` only if
    `~/projects/dark-factory-holdouts/holdouts/<feature>/` actually
    exists — never invent one); and what evidence mix (`/es` + `/er` +
@@ -285,8 +286,11 @@ resolve_dark_factory_home() {
      exit 1
    }
    ```
-   If missing, tell the user to clone
-   `https://github.com/jleechanorg/dark-factory` and run `./install.sh`, then stop.
+   If missing, report the unmet prerequisite and inspect the existing
+   installation before cloning or reinstalling. Complete setup within the
+   current authorized scope, or return the limitation to the parent for
+   other authorized work. Ask only for missing authority or access; an
+   unavailable binary is not a completed factory run.
 
 2. **Environment**:
    ```bash
