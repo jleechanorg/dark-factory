@@ -286,7 +286,8 @@ resolve_dark_factory_home() {
    ```bash
    export PATH="$HOME/.local/bin:$PATH"
    resolve_dark_factory_home || exit 1
-   command -v dark-factory && dark-factory --help 2>/dev/null || true
+   command -v dark-factory || exit 1
+   dark-factory --help || exit 1
    test -x "$DARK_FACTORY_HOME/bin/dark-factory" || {
      echo "ERROR: run $DARK_FACTORY_HOME/install.sh first"
      exit 1
