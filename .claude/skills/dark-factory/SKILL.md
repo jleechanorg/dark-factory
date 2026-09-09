@@ -405,8 +405,15 @@ default; passing `--backend claude` for the run itself does not change how
 
 ## Output contract
 
-End every `/f`/`/factory` invocation with this proof block. Missing any
-required line means the run is unproven and must be reported as such:
+When a pipeline ran, end the `/f`/`/factory` invocation with this proof block
+(missing any required line means the run is unproven and must be reported as
+such). When no pipeline ran because a prerequisite was unmet or no applicable
+pipeline fits, report the unmet prerequisite or no-fitting-pipeline limitation
+and return to the parent task without fabricated run metadata (no fabricated
+run ID, exit code, or review verdict), preserving authorized parent
+continuation.
+
+For executed pipeline runs, provide this proof block:
 
 ```bash
 # CLI backend: <detected-or-override> (source: <BASH_FUNC_X%%|explicit --backend|default>)
