@@ -115,7 +115,8 @@ task, not a deterministic rule table (no `if is_draft then X`, no
    pre-bucketed by label alone); whether a spec already covers the
    change (if so, `/fs` is skippable; if needed, report the prerequisite
    and carry out its already-authorized preparation or return it to the
-   parent task. Do not force a pipeline run before it is ready); holdout
+   parent task under active repository role and execution constraints.
+   Do not force a pipeline run before it is ready); holdout
    eligibility (pass `--feature <name>` only if
    `~/projects/dark-factory-holdouts/holdouts/<feature>/` actually
    exists — never invent one); and what evidence mix (`/es` + `/er` +
@@ -128,7 +129,11 @@ task, not a deterministic rule table (no `if is_draft then X`, no
    says otherwise), then construct, show, and run the command — same
    shape as Step 0c below but `cd` into the PR's target repo, not
    `dark-factory`.
-5. Report the verdict per **Output contract** below.
+5. Report the outcome: when a pipeline ran, report the verdict per
+   **Output contract** below; otherwise report the unmet prerequisite or
+   no-fitting-pipeline limitation and return to the parent task with no
+   fabricated run ID, exit code, or review verdict, preserving authorized
+   parent continuation.
 
 `/f-pr` honesty rules (in addition to the shared ones under **Honesty
 rules**): the `gate_er` priority queue (`codex > minimax > agy >
@@ -487,10 +492,10 @@ Whenever `dark-factory review` completes, the agent MUST immediately report:
 - Do not claim a factory run based on an in-Claude workflow, `Skill()` call,
   or prose summary. The only valid proof is an actual `dark-factory` binary
   invocation plus the proof block above.
-- If `/fs` is needed first, follow `/f-pr` Step 3: report the prerequisite and
-  carry out its already-authorized preparation or return it to the parent task.
-  Ask only for missing authority; do not silently fall through to `gates.dot`
-  and pretend the PR is green.
+- If `/fs` is needed first, follow `/f-pr` item 3: report the prerequisite and
+  carry out its already-authorized preparation or return it to the parent task
+  under active repository role and execution constraints. Ask only for missing
+  authority; do not silently fall through to `gates.dot` and pretend the PR is green.
 - If no pipeline fits (e.g. docs-only PR), report that limitation and return to
   the parent task for authorized diagnosis or preparation. A materially different
   requested method needs authorization; do not silently substitute a
