@@ -66,7 +66,7 @@ echoed in the run evidence.
 
 | `pipelines/factory/level5_feature.dot` | full reference pipeline | Full Level-5 reference pipeline with hard-tier gates wired in |
 | **dynamic DOT via binary** | binary-owned graph builder | A static graph can't express the needed phase/fanout; the binary saves/echoes the generated graph in run evidence |
-| **no pipeline** | — | When no available pipeline fits the inspected PR, report the limitation and return to the parent for authorized work; do not force an inapplicable holdout pipeline |
+| **no pipeline** | — | When no available pipeline fits the inspected PR, follow canonical **Honesty rules** below: report the limitation and return to the parent for authorized work; do not force an inapplicable holdout pipeline |
 
 You can also write your own `.dot` and pass it via `--pipeline`.
 
@@ -121,11 +121,13 @@ task, not a deterministic rule table (no `if is_draft then X`, no
    exists — never invent one); and what evidence mix (`/es` + `/er` +
    `/code_standards` minimum, `holdout_eval` for behavior-grade) the
    pipeline needs to deliver without over-running.
-4. Pick the pipeline from **Available pipelines** above using that
-   reasoning, pick the backend (`echo` for wiring smoke; `claude` unless
-   the PR's reviewer queue or `gate_er` priority queue says otherwise),
-   then construct, show, and run the command — same shape as Step 0c
-   below but `cd` into the PR's target repo, not `dark-factory`.
+4. Execute only after needed preparation is complete and a pipeline
+   actually fits: pick the pipeline from **Available pipelines** above
+   using that reasoning, pick the backend (`echo` for wiring smoke;
+   `claude` unless the PR's reviewer queue or `gate_er` priority queue
+   says otherwise), then construct, show, and run the command — same
+   shape as Step 0c below but `cd` into the PR's target repo, not
+   `dark-factory`.
 5. Report the verdict per **Output contract** below.
 
 `/f-pr` honesty rules (in addition to the shared ones under **Honesty
@@ -485,9 +487,10 @@ Whenever `dark-factory review` completes, the agent MUST immediately report:
 - Do not claim a factory run based on an in-Claude workflow, `Skill()` call,
   or prose summary. The only valid proof is an actual `dark-factory` binary
   invocation plus the proof block above.
-- If `/fs` is needed first, report the unmet prerequisite and perform its
-  authorized setup. Ask only for missing authority; do not silently fall
-  through to `gates.dot` and pretend the PR is green.
+- If `/fs` is needed first, follow `/f-pr` Step 3: report the prerequisite and
+  carry out its already-authorized preparation or return it to the parent task.
+  Ask only for missing authority; do not silently fall through to `gates.dot`
+  and pretend the PR is green.
 - If no pipeline fits (e.g. docs-only PR), report that limitation and return to
   the parent task for authorized diagnosis or preparation. A materially different
   requested method needs authorization; do not silently substitute a
