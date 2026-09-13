@@ -85,6 +85,13 @@ When the operator explicitly authorizes a factory repair mission (a natural-lang
 - Infrastructure changes never count as autonomous pilot evidence.
 - Safety invariants remain absolute: existing repository-specific merge authorization gates remain unchanged, and AO code writes still require verbatim `AO CODE APPROVED`.
 
+**Outside /af** (ad hoc repo work, audits, reviews), follow
+`~/.claude/skills/parallelize-to-ceiling/SKILL.md`: fan out independent
+read-only and audit work concurrently, and route actual coding to subagents or
+cheaper-tier lanes rather than the main session. **Inside /af**, that policy is
+superseded — no in-session coding sub-agent lanes; all coding routes through
+the external bead → daemon → AO pipeline per the ZERO-direct-work rule above.
+
 ## Factory host placement (Linux-only)
 
 `jeff-ubuntu` is the sole Auto-Factory host. Start, stop, inspect, and deploy
