@@ -10,17 +10,20 @@ The auto-factory is the agent-orchestrator-style system that drives worldai PRs 
 ## 0. Execution host + Bead authority preflight
 
 Distinguish host capability, service liveness, Bead freshness, integrity, and authority:
-- **Host capability**: The invocation host is the candidate factory host. For this repository, `jeff-ubuntu` via SSH Linux is the sole supported factory execution host; macOS is an operator client (do not start LaunchAgents, local daemons, or local AO workers on Darwin). Continue factory intake on the candidate host only when a local factory supervisor checkout is present and its daemon configuration supports `target_repo` (as the top-level target or in `[repos]`). An unsupported host stops intake there; continue canonical Linux diagnosis/recovery within authorized scope via `/linux` (`ssh jeff-ubuntu ...`).
+- **Host capability**: The invocation host is the candidate factory host. Linux with a user systemd supervisor is the only supported factory execution platform; macOS is an operator client (do not start LaunchAgents, local daemons, or local AO workers on Darwin). Continue factory intake on the candidate host only when a local factory supervisor checkout is present and its daemon configuration supports `target_repo` (as the top-level target or in `[repos]`). An unsupported host stops intake there; continue canonical Linux diagnosis/recovery within authorized scope via `/linux`. The repository's own `CLAUDE.md` names which Linux host is canonical for that repository; this skill never hardcodes one.
 - **Service liveness**: Service liveness is an observational check (`SERVICE_ACTIVE`), not an entry barrier for inspecting configuration or executing authorized recovery. A stopped service gates automated dispatch, but does NOT gate reading supervisor metadata/configuration nor authorized recovery.
 
 Before any intake mutation, resolve the exact Bead DB and checkout from the
 local factory supervisor. Bind `br`, the overlay, and any manual tick to
 that same installation; ambient `br where` discovery is not authority. The
-known Linux systemd supervisor on `jeff-ubuntu` is the canonical adapter.
+resolved Linux user systemd supervisor is the canonical adapter.
 Preflight `where`, `sync`, and `doctor` invocations must use both
 `--no-auto-flush` and `--no-auto-import` with `--db "$BR_DB"` to disable
-implicit export/import. Unsupported operating systems reject intake and
-route operational control, diagnostics, and recovery to `jeff-ubuntu` via SSH (`/linux`):
+implicit export/import. macOS rejects intake outright and routes operational
+control, diagnostics, and recovery to the repository's configured Linux factory
+host via SSH (`/linux`). Any other host rejects intake unless it is explicitly
+registered through both `DARK_FACTORY_ROOT` and `DARK_FACTORY_BR_DB`; neither
+value is ever inferred:
 
 ```bash
 case "$(uname -s)" in
@@ -36,14 +39,18 @@ case "$(uname -s)" in
       tr ' ' '\n' | sed -n 's/^DARK_FACTORY_BR_DB=//p' | tail -1)"
     ;;
   Darwin)
-    # macOS is an operator client; jeff-ubuntu via SSH Linux is the sole factory execution host.
-    # An unsupported host stops intake here; route diagnosis/recovery to jeff-ubuntu via SSH.
-    echo "macOS is an operator client: no local factory launches on Darwin; route to jeff-ubuntu via SSH (/linux)" >&2
+    # macOS is an operator client; Linux systemd is the sole factory execution platform.
+    # Never load or start the `ai.dark-factory.af-tick` LaunchAgent, a local
+    # daemon, or local AO workers on Darwin. An unsupported host stops intake
+    # here; route diagnosis/recovery to the configured Linux factory host via SSH.
+    echo "macOS is an operator client: no local factory launches on Darwin; route to the configured Linux factory host via SSH (/linux)" >&2
     exit 1
     ;;
   *)
-    echo "Unsupported OS $(uname -s): jeff-ubuntu (Linux) is the sole Auto-Factory host; route via SSH (/linux)" >&2
-    exit 1
+    # Another registered Linux host may supply explicit overrides instead of
+    # systemd discovery. Both must be set; neither is inferred.
+    FACTORY_ROOT="${DARK_FACTORY_ROOT:?registered factory checkout required}"
+    BR_DB="${DARK_FACTORY_BR_DB:?registered factory Bead DB required}"
     ;;
 esac
 [ -n "$BR_DB" ] && [ "${BR_DB#/}" != "$BR_DB" ] && [ -f "$BR_DB" ] || exit 1
@@ -72,9 +79,12 @@ if target != cfg.get("target_repo") and target not in cfg.get("repos", {}):
 PY
 export BR_DB CONFIG TARGET_REPO
 command -v br >/dev/null
-br --no-auto-flush --no-auto-import --db "$BR_DB" where
-br --no-auto-flush --no-auto-import --db "$BR_DB" sync --status --json
-br --no-auto-flush --no-auto-import --db "$BR_DB" doctor --robot-triage --json
+br --db "$BR_DB" where --no-auto-flush --no-auto-import
+br --db "$BR_DB" sync --status --json --no-auto-flush --no-auto-import
+# First pass only. `--quick` cannot prove reconciliation safety (see below).
+br --db "$BR_DB" doctor --quick --no-auto-flush --no-auto-import
+# Authoritative integrity read; this is the one that gates intake mutation.
+br --db "$BR_DB" doctor --robot-triage --json --no-auto-flush --no-auto-import
 ```
 
 Distinguish Bead freshness, integrity, and authority:
@@ -313,12 +323,12 @@ result (cooldown handling is unchanged from the original 7-gate design).
 
 - **GH API rate-limited**: skip GH pickup, use beads-only mode; continue.
 - **Daemon DOWN** (no auto-factory tick loop running): inspect the selected
-  host's local supervisor (`systemctl --user status ai.dark-factory.daemon.service` on `jeff-ubuntu`).
+  host's local supervisor (`systemctl --user status ai.dark-factory.daemon.service`).
   Daemon DOWN recovery must not require the service to be already active: verify host
   capability and known store integrity/authority before executing a manual tick or restart.
   Invoke `BR_DB="$BR_DB" bash daemon/factory-af-tick.sh` for one host-local tick on Linux only
   after capability and store integrity/authority pass. Restore/restart the daemon through
-  the canonical Linux deployment workflow (`ssh jeff-ubuntu systemctl --user start ai.dark-factory.daemon.service`
+  the canonical Linux deployment workflow (`ssh <configured-linux-factory-host> systemctl --user start ai.dark-factory.daemon.service`
   or repository deployment script). Do not broaden unrelated held queue or change selected pilot scope.
 - **Bead stuck HUMAN_HELD**: In a selected-pilot mission, bulk recover must not release unrelated held items. Explicitly inspect the held scope first (e.g. via `$H list HUMAN_HELD`). Because `$H recover-held` processes every eligible `HUMAN_HELD` row (`attempt < 10`) without a bead filter, you cannot run global recover if unrelated held rows are eligible; retain holds on unrelated items and only use supported scoped recovery. Only when inspection confirms no unrelated held items exist (or only the intended pilot bead is eligible) may `$H recover-held` be invoked to requeue back to `QUEUED` (incrementing `attempt`, resetting `autonomy_secs`). Never mutate `bead_overlay` with a raw `sqlite3` command.
 - **PR ci_green stuck on pre-existing infra**: document in PR comment, treat as known-issue; do NOT block readiness.
