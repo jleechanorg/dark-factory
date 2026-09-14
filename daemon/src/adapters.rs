@@ -4784,8 +4784,17 @@ impl CliSessions {
                         "ao spawn --agent {agent} returned session {} with branch {:?}, expected {:?}; refusing to dispatch a branch-mismatched worker",
                         session.0, observed_branch, spec.branch
                     )))
-                } else if let Err(err) = crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), workspace_path) {
-                    Some(err)
+                } else if !is_go_ao() && crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), workspace_path).is_err() {
+                    Some(crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), workspace_path).unwrap_err())
+                } else if is_go_ao() {
+                    if !workspace_path.is_absolute() || !workspace_path.is_dir() {
+                        Some(DaemonError::Config(format!(
+                            "Go AO worker workspace path is not a directory: {}",
+                            workspace_path.display()
+                        )))
+                    } else {
+                        None
+                    }
                 } else {
                     match validate_target_identity_if_expected(
                         &spec.repo,
