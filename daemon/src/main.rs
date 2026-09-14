@@ -434,7 +434,8 @@ fn ao_runtime_binding(cfg: &Config) -> Result<(String, String), DaemonError> {
             ))
         })?
         .ao_project;
-    let default_agent = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT")
+    let default_agent = std::env::var("DARK_FACTORY_CODER_DEFAULT")
+        .or_else(|_| std::env::var("DARK_FACTORY_REVIEWER_DEFAULT"))
         .unwrap_or_else(|_| "agy".to_string());
     Ok((ao_project, default_agent))
 }

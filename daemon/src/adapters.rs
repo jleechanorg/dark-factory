@@ -4091,11 +4091,17 @@ fn ao_spawn_command_with_mode(
     }
 
     if is_go_ao {
+        let harness = match agent {
+            "antigravity" | "agy" => "agy",
+            "claude" | "claude-code" => "claude-code",
+            "codex" => "codex",
+            other => other,
+        };
         cmd.arg("spawn")
             .arg("--project")
             .arg(&spec.ao_project)
             .arg("--harness")
-            .arg(agent)
+            .arg(harness)
             .arg("--branch")
             .arg(&spec.branch)
             .arg("--prompt")
@@ -4721,8 +4727,14 @@ impl CliSessions {
                 })
                 .ok_or_else(|| {
                     if !output.status.success() {
+                        let harness = match agent {
+                            "antigravity" | "agy" => "agy",
+                            "claude" | "claude-code" => "claude-code",
+                            "codex" => "codex",
+                            other => other,
+                        };
                         DaemonError::Tool {
-                            tool: format!("ao-go spawn --agent {agent}"),
+                            tool: format!("ao-go spawn --harness {harness}"),
                             rc: output.status.code().unwrap_or(-1),
                             stderr: err_msg.clone(),
                         }
@@ -4955,27 +4967,56 @@ impl CliSessions {
 /// canonical form so a config that names both `agy` and `antigravity`
 /// doesn't try the same plugin twice.
 fn build_runtime_fallback_chain(default_agent: &str, fallback_str: &str) -> Vec<String> {
-    let canonicalize = |vendor: &str| -> String {
-        canonical_for_alias(vendor)
-            .map(str::to_string)
-            .unwrap_or_else(|| vendor.to_string())
-    };
-    let mut chain: Vec<String> = Vec::new();
-    let default_canonical = canonicalize(default_agent);
-    if !default_canonical.is_empty() {
-        chain.push(default_canonical);
-    }
-    for part in fallback_str.split("->") {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
+    if is_go_ao() {
+        let canonicalize = |vendor: &str| -> Option<String> {
+            let normalized = vendor.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "antigravity" | "agy" => Some("agy".to_string()),
+                "claude" | "claude-code" => Some("claude-code".to_string()),
+                "codex" => Some("codex".to_string()),
+                "minimax" | "claudem" | "aow" => None,
+                _ => None,
+            }
+        };
+        let mut chain: Vec<String> = Vec::new();
+        if let Some(default_canonical) = canonicalize(default_agent) {
+            chain.push(default_canonical);
         }
-        let canonical = canonicalize(trimmed);
-        if !canonical.is_empty() && !chain.contains(&canonical) {
-            chain.push(canonical);
+        for part in fallback_str.split("->") {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(canonical) = canonicalize(trimmed) {
+                if !chain.contains(&canonical) {
+                    chain.push(canonical);
+                }
+            }
         }
+        chain
+    } else {
+        let canonicalize = |vendor: &str| -> String {
+            canonical_for_alias(vendor)
+                .map(str::to_string)
+                .unwrap_or_else(|| vendor.to_string())
+        };
+        let mut chain: Vec<String> = Vec::new();
+        let default_canonical = canonicalize(default_agent);
+        if !default_canonical.is_empty() {
+            chain.push(default_canonical);
+        }
+        for part in fallback_str.split("->") {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let canonical = canonicalize(trimmed);
+            if !canonical.is_empty() && !chain.contains(&canonical) {
+                chain.push(canonical);
+            }
+        }
+        chain
     }
-    chain
 }
 
 /// Walks `agents` in order, calling `attempt_spawn` for each until one
@@ -6693,7 +6734,7 @@ export const isTerminalSession = () => false;
         assert!(args.contains(&"--project".to_string()));
         assert!(args.contains(&"dark-factory".to_string()));
         assert!(args.contains(&"--harness".to_string()));
-        assert!(args.contains(&"antigravity".to_string()));
+        assert!(args.contains(&"agy".to_string()));
         assert!(args.contains(&"--branch".to_string()));
         assert!(args.contains(&"factory/go-ao-branch".to_string()));
         assert!(args.contains(&"--prompt".to_string()));
@@ -6712,6 +6753,56 @@ export const isTerminalSession = () => false;
         match prior_holdouts {
             Some(v) => std::env::set_var("DARK_FACTORY_HOLDOUTS", v),
             None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
+        }
+    }
+
+    #[test]
+    fn go_ao_build_runtime_fallback_chain() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+
+        // 1. antigravity and agy canonicalize to "agy", duplicates deduped, minimax/claudem/aow omitted
+        let chain = super::build_runtime_fallback_chain("agy", "antigravity->agy->aow->minimax->claudem");
+        assert_eq!(chain, vec!["agy".to_string()]);
+
+        // 2. claude and claude-code canonicalize to "claude-code", codex to "codex", minimax omitted
+        let chain = super::build_runtime_fallback_chain("antigravity", "claude->codex->minimax->claude-code");
+        assert_eq!(
+            chain,
+            vec![
+                "agy".to_string(),
+                "claude-code".to_string(),
+                "codex".to_string(),
+            ]
+        );
+
+        // 3. unsupported default agent (minimax) is omitted from chain
+        let chain = super::build_runtime_fallback_chain("minimax", "claude-code->antigravity->agy");
+        assert_eq!(
+            chain,
+            vec![
+                "claude-code".to_string(),
+                "agy".to_string(),
+            ]
+        );
+
+        // 4. codex default with agy and claude in fallback
+        let chain = super::build_runtime_fallback_chain("codex", "agy->claude");
+        assert_eq!(
+            chain,
+            vec![
+                "codex".to_string(),
+                "agy".to_string(),
+                "claude-code".to_string(),
+            ]
+        );
+
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
         }
     }
 
