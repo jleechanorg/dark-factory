@@ -802,6 +802,11 @@ pub fn validate_task_scope(
     let overlay = store.load(task_bead_id)?.ok_or_else(|| {
         DaemonError::Config(format!("task_bead_id {task_bead_id:?} has no overlay row"))
     })?;
+    if overlay.state == OverlayState::Dispatching {
+        return Err(DaemonError::Config(format!(
+            "task_bead_id {task_bead_id:?} is in orphaned/ambiguous DISPATCHING state after crash; redrive by resetting state to QUEUED or park explicitly"
+        )));
+    }
     let repo = overlay.repo(cfg);
     let routing = cfg.resolve_repo(repo).ok_or_else(|| {
         DaemonError::Config(format!(

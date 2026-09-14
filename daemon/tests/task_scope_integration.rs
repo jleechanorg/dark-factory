@@ -5,7 +5,7 @@ use common::{FakeLlm, FakeScm, FakeSessions, FakeTracker, FakeVcs};
 use daemon::config::{Config, RepoConfig};
 use daemon::errors::DaemonError;
 use daemon::state::{BeadOverlay, OverlayState, SqliteStateStore, StateStore};
-use daemon::tick::{run_tick, TickDeps};
+use daemon::tick::{run_tick, validate_task_scope, TickDeps};
 use daemon::tools::Bead;
 use rusqlite::Connection;
 use std::collections::HashMap;
@@ -303,4 +303,134 @@ fn active_and_ready_scopes_run_without_open_tracker_candidates() {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
+}
+
+#[test]
+fn task_scope_dispatching_after_crash_fails_closed_and_redrive_recovers() {
+    let target = "crash-target";
+    let unrelated_disp = "unrelated-dispatching";
+    let unrelated_queued = "unrelated-queued";
+    let unrelated_held = "unrelated-held";
+
+    let path = sqlite_path("crash-dispatching");
+    let store = SqliteStateStore::open(&path).unwrap();
+
+    store.save(&overlay(target, OverlayState::Dispatching)).unwrap();
+    store.save(&overlay(unrelated_disp, OverlayState::Dispatching)).unwrap();
+    store.save(&overlay(unrelated_queued, OverlayState::Queued)).unwrap();
+    let mut held = overlay(unrelated_held, OverlayState::HumanHeld);
+    held.park_reason = Some("operator_scope_hold_20260907_three_prs".into());
+    store.save(&held).unwrap();
+
+    let inspect = Connection::open(&path).unwrap();
+    let initial_all_rows = logical_rows(&inspect, None);
+    let initial_unrelated_rows = logical_rows(&inspect, Some(target));
+
+    let tracker = FakeTracker::new();
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    sessions.set_worktree_remote("https://github.com/owner/production.git");
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"STANDARD_PATH","justification":"scoped test"}"#.into(),
+    ));
+    let mut vcs = FakeVcs::new();
+    vcs.heads.insert("main".into(), "base-sha".into());
+
+    let checkout = matching_checkout();
+    let mut scoped_cfg = cfg(Some(target));
+    scoped_cfg
+        .repos
+        .get_mut("owner/production")
+        .unwrap()
+        .local_checkout = Some(checkout.clone());
+    let telemetry = path.with_extension("jsonl");
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &scoped_cfg,
+        telemetry_log: &telemetry,
+        vendor_health: None,
+    };
+
+    let expected_diag = format!(
+        "task_bead_id {target:?} is in orphaned/ambiguous DISPATCHING state after crash; redrive by resetting state to QUEUED or park explicitly"
+    );
+
+    // 1. Startup validation boundary fails closed with exact diagnostic
+    let startup_err = validate_task_scope(&store, &scoped_cfg, &tracker, target).unwrap_err();
+    match startup_err {
+        DaemonError::Config(msg) => assert_eq!(msg, expected_diag),
+        other => panic!("expected DaemonError::Config, got {other:?}"),
+    }
+    assert_eq!(
+        logical_rows(&inspect, None),
+        initial_all_rows,
+        "startup boundary failure must leave all rows untouched"
+    );
+
+    // 2. run_tick boundary fails closed with exact diagnostic without touching rows or calling adapters
+    let tick_err = run_tick(&deps, 0, 0).unwrap_err();
+    match tick_err {
+        DaemonError::Config(msg) => assert_eq!(msg, expected_diag),
+        other => panic!("expected DaemonError::Config, got {other:?}"),
+    }
+    assert!(scm.calls.borrow().is_empty());
+    assert!(tracker.calls.borrow().is_empty());
+    assert!(sessions.calls.borrow().is_empty());
+    assert_eq!(
+        logical_rows(&inspect, None),
+        initial_all_rows,
+        "tick boundary failure must leave all rows untouched"
+    );
+
+    // 3. Exact redrive: reset state to QUEUED and ensure candidate is admitted in tracker
+    let mut redriven = store.load(target).unwrap().unwrap();
+    redriven.state = OverlayState::Queued;
+    store.save(&redriven).unwrap();
+
+    tracker.candidates.borrow_mut().push(Bead {
+        id: target.into(),
+        title: target.into(),
+        description: "target_repo: owner/production".into(),
+        ..Bead::default()
+    });
+    tracker.ready_ids.borrow_mut().replace([target.into()].into_iter().collect());
+
+    // Startup boundary now succeeds
+    assert!(validate_task_scope(&store, &scoped_cfg, &tracker, target).is_ok());
+
+    // run_tick now succeeds and dispatches target
+    let summary = run_tick(&deps, 0, 0).unwrap();
+    assert_eq!(summary.beads_dispatched, 1);
+    assert_eq!(store.load(target).unwrap().unwrap().state, OverlayState::Dispatched);
+
+    // Unrelated rows remain completely untouched
+    assert_eq!(
+        store.load(unrelated_disp).unwrap().unwrap().state,
+        OverlayState::Dispatching
+    );
+    assert_eq!(
+        store.load(unrelated_queued).unwrap().unwrap().state,
+        OverlayState::Queued
+    );
+    assert_eq!(
+        store.load(unrelated_held).unwrap().unwrap().state,
+        OverlayState::HumanHeld
+    );
+    assert_eq!(
+        logical_rows(&inspect, Some(target)),
+        initial_unrelated_rows,
+        "redrive and dispatch of target must leave all unrelated rows completely untouched"
+    );
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    let _ = std::fs::remove_file(&telemetry);
+    let _ = std::fs::remove_dir_all(checkout);
 }
