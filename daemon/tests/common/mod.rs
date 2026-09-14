@@ -1432,6 +1432,7 @@ pub struct FakeStateStore {
     pub adopted_bindings: RefCell<HashMap<String, (String, u64, String, String)>>,
     pub rejections: RefCell<HashMap<(String, u32), RejectionRecord>>,
     pub fail_save_for_state: RefCell<Vec<(String, OverlayState)>>,
+    pub register_branch_error: RefCell<Option<DaemonError>>,
     /// Bead jleechan-zeij / issue #322 r2: consecutive re-roll deferral count
     /// per bead. Persisted independently of `BeadOverlay` (mirrors the real
     /// `reroll_deferral_count` SQLite column), so the fail-closed defer/cap
@@ -1540,6 +1541,9 @@ impl StateStore for FakeStateStore {
         self.calls
             .borrow_mut()
             .push(format!("register_branch({bead_id},{branch})"));
+        if let Some(error) = self.register_branch_error.borrow_mut().take() {
+            return Err(error);
+        }
         self.branches.borrow_mut().push(branch.to_string());
         self.branch_beads
             .borrow_mut()
