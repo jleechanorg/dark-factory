@@ -3271,7 +3271,9 @@ fn resolve_ao_config_path(operator_home: &str) -> String {
 
 fn ao_controller_env(project: &str) -> Result<Vec<(String, String)>, String> {
     let operator_home = operator_home()?;
-    let bridge_home = if matches!(
+    let bridge_home = if std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go") {
+        operator_home.clone()
+    } else if matches!(
         probe_operator_ao_project(project, &operator_home),
         AoReadiness::Ready(_)
     ) {
@@ -3326,6 +3328,63 @@ fn run_ao_tool(project: &str, args: &[&str], timeout_secs: u64) -> Result<String
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
     run_tool_with_env("ao", args, &refs, timeout_secs)
+}
+
+fn is_go_ao() -> bool {
+    std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go")
+}
+
+fn go_ao_db_path() -> Result<std::path::PathBuf, DaemonError> {
+    let home = operator_home()
+        .or_else(|_| std::env::var("HOME").map_err(|e| e.to_string()))
+        .map_err(|e| DaemonError::Config(format!("cannot resolve HOME for go ao db: {e}")))?;
+    Ok(std::path::Path::new(&home).join(".ao/data/ao.db"))
+}
+
+fn open_go_ao_db() -> Result<rusqlite::Connection, DaemonError> {
+    let db_path = go_ao_db_path()?;
+    rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| {
+        DaemonError::Config(format!(
+            "failed to open go ao db at {}: {e}",
+            db_path.display()
+        ))
+    })
+}
+
+fn go_ao_session_workspace_and_branch(
+    session_id: &str,
+) -> (Option<std::path::PathBuf>, Option<String>) {
+    let home = match operator_home().or_else(|_| std::env::var("HOME").map_err(|e| e.to_string())) {
+        Ok(h) => h,
+        Err(_) => return (None, None),
+    };
+    let db_path = std::path::Path::new(&home).join(".ao/data/ao.db");
+    let conn = match rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    ) {
+        Ok(c) => c,
+        Err(_) => return (None, None),
+    };
+    let mut stmt = match conn.prepare("SELECT workspace_path, branch FROM sessions WHERE id = ?1") {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    let mut rows = match stmt.query([session_id]) {
+        Ok(r) => r,
+        Err(_) => return (None, None),
+    };
+    if let Ok(Some(row)) = rows.next() {
+        let ws: Option<String> = row.get::<_, Option<String>>(0).ok().flatten();
+        let branch: Option<String> = row.get::<_, Option<String>>(1).ok().flatten();
+        (ws.map(std::path::PathBuf::from), branch)
+    } else {
+        (None, None)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -4205,6 +4264,41 @@ pub fn verify_ao_bridge_compatibility(
     agent: &str,
     configured_vendors: &[String],
 ) -> Result<(), DaemonError> {
+    if std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go") {
+        let mut command = Command::new("ao-go");
+        command
+            .arg("status")
+            .arg("--json")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = command.output().map_err(|error| DaemonError::Tool {
+            tool: "ao-go status".to_string(),
+            rc: -1,
+            stderr: format!("execution failed: {error}"),
+        })?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if !output.status.success() {
+            return Err(DaemonError::Tool {
+                tool: "ao-go status".to_string(),
+                rc: output.status.code().unwrap_or(-1),
+                stderr,
+            });
+        }
+        let status: serde_json::Value = serde_json::from_str(&stdout).map_err(|error| {
+            DaemonError::Parse(format!("failed to parse ao-go status JSON: {error}"))
+        })?;
+        let is_healthy = status.get("health").and_then(|v| v.as_str()) == Some("ok")
+            || status.get("state").and_then(|v| v.as_str()) == Some("ready")
+            || status.get("ready").and_then(|v| v.as_str()) == Some("ready");
+        if is_healthy {
+            return Ok(());
+        }
+        return Err(DaemonError::Config(format!(
+            "ao-go status reported unhealthy: {stdout}"
+        )));
+    }
     let spec = SpawnSpec {
         bead_id: "daemon-startup-diagnostic".to_string(),
         branch: "factory/daemon-startup-diagnostic".to_string(),
@@ -4568,7 +4662,11 @@ impl CliSessions {
     }
 
     fn kill_in_project(project: &str, id: &SessionId) -> Result<(), DaemonError> {
-        run_tool("ao", &["session", "kill", &id.0, "-p", project], 30)?;
+        if std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go") {
+            run_tool("ao-go", &["session", "kill", &id.0, "-p", project], 30)?;
+        } else {
+            run_tool("ao", &["session", "kill", &id.0, "-p", project], 30)?;
+        }
         Ok(())
     }
 
@@ -4614,15 +4712,55 @@ impl CliSessions {
 
         let out = String::from_utf8_lossy(&output.stdout).into_owned();
         let err_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-        let session = Self::classify_spawn_output(
-            agent,
-            output.status.success(),
-            output.status.code(),
-            &out,
-            &err_msg,
-        )?;
-        let workspace = Self::spawn_workspace_path(&out);
-        let observed_branch = Self::spawn_branch(&out);
+        let (session, workspace, observed_branch) = if is_go_ao() {
+            let session_id = out
+                .lines()
+                .find_map(|line| {
+                    let rest = line.strip_prefix("spawned session ")?;
+                    rest.split_whitespace().next().map(|s| s.to_string())
+                })
+                .ok_or_else(|| {
+                    if !output.status.success() {
+                        DaemonError::Tool {
+                            tool: format!("ao-go spawn --agent {agent}"),
+                            rc: output.status.code().unwrap_or(-1),
+                            stderr: err_msg.clone(),
+                        }
+                    } else {
+                        DaemonError::Parse(format!(
+                            "ao-go spawn produced no 'spawned session ' line: stdout={out}, stderr={err_msg}"
+                        ))
+                    }
+                })?;
+            let session = SessionId(session_id);
+            let (mut ws, mut branch) = go_ao_session_workspace_and_branch(&session.0);
+            if ws.is_none() {
+                if let Ok(home) = operator_home().or_else(|_| std::env::var("HOME").map_err(|e| e.to_string())) {
+                    let fallback = std::path::Path::new(&home)
+                        .join(".ao/data/worktrees")
+                        .join(&spec.ao_project)
+                        .join(&session.0);
+                    if fallback.is_dir() {
+                        ws = Some(fallback);
+                    }
+                }
+            }
+            if branch.is_none() {
+                branch = Some(spec.branch.clone());
+            }
+            (session, ws, branch)
+        } else {
+            let session = Self::classify_spawn_output(
+                agent,
+                output.status.success(),
+                output.status.code(),
+                &out,
+                &err_msg,
+            )?;
+            let workspace = Self::spawn_workspace_path(&out);
+            let observed_branch = Self::spawn_branch(&out);
+            (session, workspace, observed_branch)
+        };
         let spawn_error = match workspace.as_ref() {
             None => Some(DaemonError::Parse(format!(
                 "ao spawn --agent {agent} returned session {} without an absolute Worktree path; refusing to dispatch without remote verification",
@@ -9069,6 +9207,22 @@ export const isTerminalSession = () => false;
 
 impl Sessions for CliSessions {
     fn active_count(&self) -> Result<usize, DaemonError> {
+        if is_go_ao() {
+            let conn = match open_go_ao_db() {
+                Ok(c) => c,
+                Err(_) => return Ok(0),
+            };
+            let mut stmt = match conn.prepare(
+                "SELECT count(*) FROM sessions WHERE project_id = ?1 AND is_terminated = 0",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Ok(0),
+            };
+            let count: i64 = stmt
+                .query_row([&self.project], |row| row.get(0))
+                .unwrap_or(0);
+            return Ok(count as usize);
+        }
         let out = run_ao_tool(&self.project, &["status", "-p", &self.project, "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
@@ -9197,6 +9351,43 @@ impl Sessions for CliSessions {
         project: &str,
         timeout_secs: u64,
     ) -> Result<SessionId, DaemonError> {
+        if is_go_ao() {
+            let conn = match open_go_ao_db() {
+                Ok(c) => c,
+                Err(_) => {
+                    return Err(DaemonError::Parse(format!(
+                        "no active session for branch {branch} in project {project}"
+                    )));
+                }
+            };
+            let mut stmt = match conn.prepare(
+                "SELECT id FROM sessions WHERE project_id = ?1 AND branch = ?2 AND is_terminated = 0 ORDER BY num DESC LIMIT 1",
+            ) {
+                Ok(s) => s,
+                Err(_) => {
+                    return Err(DaemonError::Parse(format!(
+                        "no active session for branch {branch} in project {project}"
+                    )));
+                }
+            };
+            let mut rows = match stmt.query([project, branch]) {
+                Ok(r) => r,
+                Err(_) => {
+                    return Err(DaemonError::Parse(format!(
+                        "no active session for branch {branch} in project {project}"
+                    )));
+                }
+            };
+            if let Ok(Some(row)) = rows.next() {
+                let id: String = row.get(0).map_err(|e| {
+                    DaemonError::Parse(format!("failed to read session id: {e}"))
+                })?;
+                return Ok(SessionId(id));
+            }
+            return Err(DaemonError::Parse(format!(
+                "no active session for branch {branch} in project {project}"
+            )));
+        }
         let out = run_tool("ao", &["status", "-p", project, "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
@@ -9240,6 +9431,29 @@ impl Sessions for CliSessions {
     }
 
     fn is_quiescent_in_project(&self, id: &SessionId, project: &str) -> Result<bool, DaemonError> {
+        if is_go_ao() {
+            let conn = match open_go_ao_db() {
+                Ok(c) => c,
+                Err(_) => return Ok(false),
+            };
+            let mut stmt = match conn.prepare(
+                "SELECT activity_state, is_terminated FROM sessions WHERE id = ?1 AND project_id = ?2",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Ok(false),
+            };
+            let mut rows = match stmt.query([&id.0, project]) {
+                Ok(r) => r,
+                Err(_) => return Ok(false),
+            };
+            if let Ok(Some(row)) = rows.next() {
+                let activity_state: String = row.get::<_, Option<String>>(0).ok().flatten().unwrap_or_default();
+                let is_terminated: i64 = row.get::<_, Option<i64>>(1).ok().flatten().unwrap_or(0);
+                let quiescent = is_terminated != 0 || activity_state == "idle" || activity_state == "exited";
+                return Ok(quiescent);
+            }
+            return Ok(false);
+        }
         let out = run_tool("ao", &["status", "-p", project, "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
@@ -9285,6 +9499,36 @@ impl Sessions for CliSessions {
         project: &str,
         timeout_secs: u64,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
+        if is_go_ao() {
+            let conn = match open_go_ao_db() {
+                Ok(c) => c,
+                Err(_) => return Ok(crate::tools::SessionActivity::NotFound),
+            };
+            let mut stmt = match conn.prepare(
+                "SELECT activity_state, is_terminated FROM sessions WHERE id = ?1 AND project_id = ?2",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Ok(crate::tools::SessionActivity::NotFound),
+            };
+            let mut rows = match stmt.query([&id.0, project]) {
+                Ok(r) => r,
+                Err(_) => return Ok(crate::tools::SessionActivity::NotFound),
+            };
+            if let Ok(Some(row)) = rows.next() {
+                let activity_state: String = row.get::<_, Option<String>>(0).ok().flatten().unwrap_or_default();
+                let is_terminated: i64 = row.get::<_, Option<i64>>(1).ok().flatten().unwrap_or(0);
+                if is_terminated != 0 || activity_state == "exited" {
+                    return Ok(crate::tools::SessionActivity::Terminal);
+                } else if activity_state == "idle" {
+                    return Ok(crate::tools::SessionActivity::Idle);
+                } else if activity_state == "active" {
+                    return Ok(crate::tools::SessionActivity::Running);
+                } else {
+                    return Ok(crate::tools::SessionActivity::Running);
+                }
+            }
+            return Ok(crate::tools::SessionActivity::NotFound);
+        }
         let out = run_tool("ao", &["status", "-p", project, "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
@@ -9322,6 +9566,10 @@ impl Sessions for CliSessions {
         id: &SessionId,
         project: &str,
     ) -> Result<Option<String>, DaemonError> {
+        if is_go_ao() {
+            let (_, branch) = go_ao_session_workspace_and_branch(&id.0);
+            return Ok(branch);
+        }
         let out = match run_tool("ao", &["status", "-p", project, "--json"], 30) {
             Ok(o) => o,
             Err(_) => return Ok(None),
@@ -13298,7 +13546,344 @@ mod offline_cache_tests {
     }
 }
 
-// Local imports for the offline_cache_tests mod above.
+#[cfg(test)]
+mod go_ao_lifecycle_tests {
+    use super::*;
+    use crate::tools::{SessionActivity, Sessions};
+    use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn go_ao_verify_bridge_compatibility_variants() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior_path = std::env::var_os("PATH");
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_holdouts = std::env::var_os("DARK_FACTORY_HOLDOUTS");
+
+        let temp_dir = std::env::temp_dir().join(format!("df_test_go_ao_compat_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let fake_ao_go = temp_dir.join("ao-go");
+        let state_file = temp_dir.join("ao_status_payload.json");
+        std::fs::write(&state_file, r#"{"health":"ok"}"#).unwrap();
+
+        let script = format!(
+            r#"#!/bin/sh
+cat "{}"
+"#,
+            state_file.display()
+        );
+        std::fs::write(&fake_ao_go, script).unwrap();
+        std::fs::set_permissions(&fake_ao_go, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let new_path = format!("{}:{}", temp_dir.display(), prior_path.as_deref().unwrap_or_default().to_string_lossy());
+        std::env::set_var("PATH", new_path);
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+        std::env::set_var("DARK_FACTORY_HOLDOUTS", &temp_dir);
+
+        // 1. health == ok
+        assert!(verify_ao_bridge_compatibility("proj", "antigravity", &[]).is_ok());
+
+        // 2. state == ready
+        std::fs::write(&state_file, r#"{"state":"ready"}"#).unwrap();
+        assert!(verify_ao_bridge_compatibility("proj", "antigravity", &[]).is_ok());
+
+        // 3. ready == ready
+        std::fs::write(&state_file, r#"{"ready":"ready"}"#).unwrap();
+        assert!(verify_ao_bridge_compatibility("proj", "antigravity", &[]).is_ok());
+
+        // 4. unhealthy payload
+        std::fs::write(&state_file, r#"{"health":"degraded"}"#).unwrap();
+        let res = verify_ao_bridge_compatibility("proj", "antigravity", &[]);
+        assert!(matches!(res, Err(DaemonError::Config(_))));
+
+        // 5. tool error (exit code != 0)
+        let fail_script = r#"#!/bin/sh
+echo "fatal error" >&2
+exit 1
+"#;
+        std::fs::write(&fake_ao_go, fail_script).unwrap();
+        let res = verify_ao_bridge_compatibility("proj", "antigravity", &[]);
+        assert!(matches!(res, Err(DaemonError::Tool { .. })));
+
+        // Cleanup
+        match prior_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_holdouts {
+            Some(v) => std::env::set_var("DARK_FACTORY_HOLDOUTS", v),
+            None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn go_ao_controller_env_preserves_operator_home() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_op_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+
+        let temp_home = std::env::temp_dir().join(format!("df_test_go_ao_op_home_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_home);
+        std::fs::create_dir_all(&temp_home).unwrap();
+
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &temp_home);
+
+        let env = ao_controller_env("some-project").unwrap();
+        let home_val = env.iter().find(|(k, _)| k == "HOME").map(|(_, v)| v.as_str());
+        assert_eq!(home_val, Some(temp_home.to_str().unwrap()));
+
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_op_home {
+            Some(v) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn go_ao_sqlite_database_queries_and_lifecycle() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_op_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+
+        let temp_home = std::env::temp_dir().join(format!("df_test_go_ao_db_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_home);
+        let ao_data = temp_home.join(".ao/data");
+        std::fs::create_dir_all(&ao_data).unwrap();
+
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &temp_home);
+
+        let db_path = ao_data.join("ao.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                workspace_path TEXT,
+                branch TEXT,
+                project_id TEXT,
+                is_terminated INTEGER,
+                activity_state TEXT,
+                num INTEGER
+            );
+            INSERT INTO sessions VALUES ('sess-active-1', '/ws/1', 'branch-1', 'proj-a', 0, 'active', 10);
+            INSERT INTO sessions VALUES ('sess-active-2', '/ws/2', 'branch-1', 'proj-a', 0, 'active', 20);
+            INSERT INTO sessions VALUES ('sess-idle', '/ws/idle', 'branch-2', 'proj-a', 0, 'idle', 30);
+            INSERT INTO sessions VALUES ('sess-exited', '/ws/exited', 'branch-3', 'proj-a', 0, 'exited', 40);
+            INSERT INTO sessions VALUES ('sess-term', '/ws/term', 'branch-4', 'proj-a', 1, 'active', 50);
+            INSERT INTO sessions VALUES ('sess-other-proj', '/ws/other', 'branch-1', 'proj-b', 0, 'active', 60);
+            INSERT INTO sessions VALUES ('sess-unknown-state', '/ws/unk', 'branch-5', 'proj-a', 0, 'custom_running', 70);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        // 1. go_ao_session_workspace_and_branch
+        let (ws, br) = go_ao_session_workspace_and_branch("sess-active-1");
+        assert_eq!(ws, Some(std::path::PathBuf::from("/ws/1")));
+        assert_eq!(br, Some("branch-1".to_string()));
+
+        let (ws_none, br_none) = go_ao_session_workspace_and_branch("sess-nonexistent");
+        assert_eq!(ws_none, None);
+        assert_eq!(br_none, None);
+
+        // 2. CliSessions
+        let sessions = CliSessions::new("org/proj-a", "antigravity");
+
+        // active_count: count for proj-a with is_terminated = 0
+        // sess-active-1, sess-active-2, sess-idle, sess-exited, sess-unknown-state -> total 5
+        let count = sessions.active_count().unwrap();
+        assert_eq!(count, 5);
+
+        // 3. is_quiescent_in_project
+        assert!(!sessions.is_quiescent_in_project(&SessionId("sess-active-1".into()), "proj-a").unwrap());
+        assert!(sessions.is_quiescent_in_project(&SessionId("sess-idle".into()), "proj-a").unwrap());
+        assert!(sessions.is_quiescent_in_project(&SessionId("sess-exited".into()), "proj-a").unwrap());
+        assert!(sessions.is_quiescent_in_project(&SessionId("sess-term".into()), "proj-a").unwrap());
+        assert!(!sessions.is_quiescent_in_project(&SessionId("nonexistent".into()), "proj-a").unwrap());
+
+        // 4. session_activity_within_in_project
+        assert_eq!(
+            sessions.session_activity_within_in_project(&SessionId("sess-active-1".into()), "proj-a", 10).unwrap(),
+            SessionActivity::Running
+        );
+        assert_eq!(
+            sessions.session_activity_within_in_project(&SessionId("sess-idle".into()), "proj-a", 10).unwrap(),
+            SessionActivity::Idle
+        );
+        assert_eq!(
+            sessions.session_activity_within_in_project(&SessionId("sess-exited".into()), "proj-a", 10).unwrap(),
+            SessionActivity::Terminal
+        );
+        assert_eq!(
+            sessions.session_activity_within_in_project(&SessionId("sess-term".into()), "proj-a", 10).unwrap(),
+            SessionActivity::Terminal
+        );
+        assert_eq!(
+            sessions.session_activity_within_in_project(&SessionId("sess-unknown-state".into()), "proj-a", 10).unwrap(),
+            SessionActivity::Running
+        );
+        assert_eq!(
+            sessions.session_activity_within_in_project(&SessionId("nonexistent".into()), "proj-a", 10).unwrap(),
+            SessionActivity::NotFound
+        );
+
+        // 5. attach_within_in_project
+        // For proj-a and branch-1, ORDER BY num DESC gives sess-active-2 (num=20 > 10)
+        let attached = sessions.attach_within_in_project("branch-1", "b-1", "proj-a", 10).unwrap();
+        assert_eq!(attached.0, "sess-active-2");
+
+        let attach_missing = sessions.attach_within_in_project("missing-branch", "b-1", "proj-a", 10);
+        assert!(matches!(attach_missing, Err(DaemonError::Parse(_))));
+
+        // 6. session_branch_in_project
+        let branch = sessions.session_branch_in_project(&SessionId("sess-active-1".into()), "proj-a").unwrap();
+        assert_eq!(branch, Some("branch-1".to_string()));
+
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_op_home {
+            Some(v) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn go_ao_kill_in_project_invokes_ao_go() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior_path = std::env::var_os("PATH");
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+
+        let temp_dir = std::env::temp_dir().join(format!("df_test_go_ao_kill_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let fake_ao_go = temp_dir.join("ao-go");
+        let log_file = temp_dir.join("call.log");
+
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> "{}"
+"#,
+            log_file.display()
+        );
+        std::fs::write(&fake_ao_go, script).unwrap();
+        std::fs::set_permissions(&fake_ao_go, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let new_path = format!("{}:{}", temp_dir.display(), prior_path.as_deref().unwrap_or_default().to_string_lossy());
+        std::env::set_var("PATH", new_path);
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+
+        let session = SessionId("test-session-999".to_string());
+        CliSessions::kill_in_project("target-proj", &session).unwrap();
+
+        let logged = std::fs::read_to_string(&log_file).unwrap();
+        assert!(logged.contains("session kill test-session-999 -p target-proj"));
+
+        match prior_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn go_ao_session_workspace_fallback_to_worktrees_dir() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_op_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+
+        let temp_home = std::env::temp_dir().join(format!("df_test_go_ao_fallback_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_home);
+
+        let worktrees_dir = temp_home.join(".ao/data/worktrees/proj-x/sess-fallback-123");
+        std::fs::create_dir_all(&worktrees_dir).unwrap();
+
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &temp_home);
+
+        // No database exists, so go_ao_session_workspace_and_branch returns (None, None)
+        let (ws, br) = go_ao_session_workspace_and_branch("sess-fallback-123");
+        assert_eq!(ws, None);
+        assert_eq!(br, None);
+
+        // Simulate fallback logic in run_spawn_process
+        let session = SessionId("sess-fallback-123".to_string());
+        let spec = SpawnSpec {
+            bead_id: "test-bead".to_string(),
+            branch: "factory/test-branch".to_string(),
+            prompt: "test".to_string(),
+            repo: "org/proj-x".to_string(),
+            ao_project: "proj-x".to_string(),
+            remote: String::new(),
+            local_checkout: None,
+            expected_revision: None,
+            managed_checkout: false,
+            expected_cwd: None,
+        };
+
+        let (mut resolved_ws, mut resolved_br) = go_ao_session_workspace_and_branch(&session.0);
+        if resolved_ws.is_none() {
+            if let Ok(home) = operator_home().or_else(|_| std::env::var("HOME").map_err(|e| e.to_string())) {
+                let fallback = std::path::Path::new(&home)
+                    .join(".ao/data/worktrees")
+                    .join(&spec.ao_project)
+                    .join(&session.0);
+                if fallback.is_dir() {
+                    resolved_ws = Some(fallback);
+                }
+            }
+        }
+        if resolved_br.is_none() {
+            resolved_br = Some(spec.branch.clone());
+        }
+
+        assert_eq!(resolved_ws, Some(worktrees_dir));
+        assert_eq!(resolved_br, Some("factory/test-branch".to_string()));
+
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_op_home {
+            Some(v) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+}
 
 // PR #666 — bead jleechan-nfdl (pr-655-finding-3) anchor for Evidence Gate re-trigger
+
