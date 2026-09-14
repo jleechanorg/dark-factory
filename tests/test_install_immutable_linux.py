@@ -6,6 +6,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -19,7 +21,8 @@ def _write_executable(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def test_linux_install_keeps_all_runtime_payloads_outside_git_checkout(tmp_path):
+@pytest.mark.parametrize("keep_live_jsonl", [True, False])
+def test_linux_install_keeps_all_runtime_payloads_outside_git_checkout(tmp_path, keep_live_jsonl):
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     shutil.copy2(ROOT / "install.sh", checkout / "install.sh")
@@ -203,7 +206,14 @@ touch "$db"
         f"sync --db {state_db} --import-only",
     ]
 
-    # Verify migration on upgrade / re-run with existing DB
+    # An upgrade must not replace the supervisor's live store with repo seeds.
+    live_beads = '{"id":"factory-local-only","labels":[]}\n'
+    live_jsonl = state_root / ".beads" / "issues.jsonl"
+    if keep_live_jsonl:
+        live_jsonl.write_text(live_beads)
+    else:
+        live_jsonl.unlink()
+    state_db.write_bytes(b"existing canonical database")
     migrated_beads = '{"id":"factory-tdd"}\n{"id":"factory-migrated"}\n'
     seed_beads.write_text(migrated_beads)
     head_file = tmp_path / "head.txt"
@@ -219,10 +229,13 @@ touch "$db"
         check=False,
     )
     assert migrate_proc.returncode == 0, migrate_proc.stdout + migrate_proc.stderr
-    assert (state_root / ".beads" / "issues.jsonl").read_text() == migrated_beads
+    if keep_live_jsonl:
+        assert live_jsonl.read_text() == live_beads
+    else:
+        assert not live_jsonl.exists()
+    assert state_db.read_bytes() == b"existing canonical database"
     assert br_log.read_text().splitlines() == [
         f"init --db {state_db}",
-        f"sync --db {state_db} --import-only",
         f"sync --db {state_db} --import-only",
     ]
 

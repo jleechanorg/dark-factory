@@ -3934,21 +3934,29 @@ fn ao_spawn_command_with_mode(
     spec: &SpawnSpec,
     diagnostic: bool,
 ) -> Result<Command, DaemonError> {
-    let bridge = ao_spawn_bridge_path();
-    if !bridge.is_file() {
-        return Err(DaemonError::Config(format!(
-            "AO v0.1.3 spawn bridge is missing at {}; rebuild/reinstall the daemon from a complete checkout",
-            bridge.display()
-        )));
-    }
-    let bridge_arg = format!("--import={}", bridge.display());
-    if bridge_arg.chars().any(char::is_whitespace) {
-        return Err(DaemonError::Config(format!(
-            "AO v0.1.3 spawn bridge path contains whitespace and cannot be represented safely in NODE_OPTIONS: {}",
-            bridge.display()
-        )));
-    }
+    let is_go_ao = std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go");
 
+    let bridge_arg = if !is_go_ao {
+        let bridge = ao_spawn_bridge_path();
+        if !bridge.is_file() {
+            return Err(DaemonError::Config(format!(
+                "AO v0.1.3 spawn bridge is missing at {}; rebuild/reinstall the daemon from a complete checkout",
+                bridge.display()
+            )));
+        }
+        let b_arg = format!("--import={}", bridge.display());
+        if b_arg.chars().any(char::is_whitespace) {
+            return Err(DaemonError::Config(format!(
+                "AO v0.1.3 spawn bridge path contains whitespace and cannot be represented safely in NODE_OPTIONS: {}",
+                bridge.display()
+            )));
+        }
+        Some(b_arg)
+    } else {
+        None
+    };
+
+    let bin_name = if is_go_ao { "ao-go" } else { "ao" };
     let mut cmd = if std::env::consts::OS == "macos" {
         let holdouts = resolve_holdouts_path_or_fail()?;
         let profile = format!(
@@ -3956,10 +3964,10 @@ fn ao_spawn_command_with_mode(
             holdouts, holdouts
         );
         let mut command = Command::new("sandbox-exec");
-        command.arg("-p").arg(&profile).arg("ao");
+        command.arg("-p").arg(&profile).arg(bin_name);
         command
     } else {
-        Command::new("ao")
+        Command::new(bin_name)
     };
     apply_ao_controller_env(&mut cmd, &spec.ao_project).map_err(DaemonError::Config)?;
 
@@ -4023,50 +4031,58 @@ fn ao_spawn_command_with_mode(
         }
     }
 
-    // This is the complete AO v0.1.3 public spawn argv: no --prompt,
-    // --name, or --branch. The preload validates this shape independently.
-    cmd.arg("spawn")
-        .arg("--project")
-        .arg(&spec.ao_project)
-        .arg("--agent")
-        .arg(agent);
-    if diagnostic {
-        // If the preload fails to execute, AO v0.1.3 rejects this unknown
-        // option before dispatch. That makes the supposedly read-only probe
-        // fail safe instead of accidentally creating a worker.
-        cmd.arg("--dark-factory-read-only-diagnostic");
-    }
-    cmd.arg("--")
-        .arg(&spec.prompt)
-        .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
-        .env("DARK_FACTORY_AO_SPAWN_BRANCH", &spec.branch)
-        // Marks this worker (and anything it runs, e.g. a Python
-        // dark-factory pipeline invocation) as /af-daemon-dispatched, so
-        // `runner/reviewer_priority.py::skeptic_reviewer_priority()`
-        // resolves the claudem-first /af list instead of the manual
-        // codex-first default. Every caller of `ao_spawn_command_with_mode`
-        // IS /af-driven automated bead dispatch by construction, so this is
-        // unconditional.
-        .env("DARK_FACTORY_VIA_AF", "1");
-    if diagnostic {
-        cmd.env("DARK_FACTORY_AO_BRIDGE_DIAGNOSTIC", "1");
+    if is_go_ao {
+        cmd.arg("spawn")
+            .arg("--project")
+            .arg(&spec.ao_project)
+            .arg("--harness")
+            .arg(agent)
+            .arg("--branch")
+            .arg(&spec.branch)
+            .arg("--prompt")
+            .arg(&spec.prompt);
+    } else {
+        // This is the complete AO v0.1.3 public spawn argv: no --prompt,
+        // --name, or --branch. The preload validates this shape independently.
+        cmd.arg("spawn")
+            .arg("--project")
+            .arg(&spec.ao_project)
+            .arg("--agent")
+            .arg(agent);
+        if diagnostic {
+            // If the preload fails to execute, AO v0.1.3 rejects this unknown
+            // option before dispatch. That makes the supposedly read-only probe
+            // fail safe instead of accidentally creating a worker.
+            cmd.arg("--dark-factory-read-only-diagnostic");
+        }
+        cmd.arg("--")
+            .arg(&spec.prompt)
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env("DARK_FACTORY_AO_SPAWN_BRANCH", &spec.branch);
+        if diagnostic {
+            cmd.env("DARK_FACTORY_AO_BRIDGE_DIAGNOSTIC", "1");
+        }
+
+        let node_options = std::env::var("NODE_OPTIONS").unwrap_or_default();
+        let bridge_options = format!("--experimental-import-meta-resolve {}", bridge_arg.as_ref().unwrap());
+        let bridged_node_options = if node_options.trim().is_empty() {
+            bridge_options
+        } else {
+            format!("{node_options} {bridge_options}")
+        };
+        cmd.env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", &node_options)
+            .env("NODE_OPTIONS", bridged_node_options);
     }
 
-    let node_options = std::env::var("NODE_OPTIONS").unwrap_or_default();
-    let bridge_options = format!("--experimental-import-meta-resolve {bridge_arg}");
-    let bridged_node_options = if node_options.trim().is_empty() {
-        bridge_options
-    } else {
-        format!("{node_options} {bridge_options}")
-    };
-    cmd.env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", &node_options)
-        .env("NODE_OPTIONS", bridged_node_options);
+    cmd.env("DARK_FACTORY_VIA_AF", "1");
 
     for (key, _) in std::env::vars() {
         if key == "DARK_FACTORY_HOLDOUTS" || key.to_uppercase().contains("HOLDOUT") {
             cmd.env_remove(key);
         }
     }
+
+    crate::account_scope::validate_ao_worker_agent_scope(agent, &mut cmd)?;
 
     Ok(cmd)
 }
@@ -5155,6 +5171,7 @@ mod ao_spawn_contract_tests {
                 "FAKE_GIT_EXPECTED_ORIGIN",
                 "FAKE_GIT_LOCAL_SOURCE",
                 "FAKE_GIT_REAL_BIN",
+                "MINIMAX_API_KEY",
             ];
             let saved = KEYS
                 .iter()
@@ -5166,6 +5183,9 @@ mod ao_spawn_contract_tests {
             std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
             std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", bindings.to_string());
             std::env::set_var("AO_FAKE_LOG", log);
+            if std::env::var_os("MINIMAX_API_KEY").is_none() {
+                std::env::set_var("MINIMAX_API_KEY", "test-fake-minimax-key");
+            }
             Self {
                 saved,
                 cleanup_dir: dir.to_path_buf(),
@@ -6501,6 +6521,95 @@ export const isTerminalSession = () => false;
             !logged.contains("SPAWN_CALLED"),
             "AO must not be invoked when origin ref diverges from expected revision: {logged}"
         );
+    }
+
+    #[test]
+    fn go_ao_dispatch_arguments_and_binary() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_holdouts = std::env::var_os("DARK_FACTORY_HOLDOUTS");
+
+        let temp_holdouts = std::env::temp_dir().join(format!("df_test_holdouts_go_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_holdouts);
+        std::env::set_var("DARK_FACTORY_HOLDOUTS", &temp_holdouts);
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+
+        let test_spec = spec("test prompt message", "factory/go-ao-branch");
+        let cmd = super::ao_spawn_command_with_mode("antigravity", &test_spec, false)
+            .expect("ao_spawn_command_with_mode must succeed for strongdm-go");
+
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+
+        // Binary check
+        if std::env::consts::OS == "macos" {
+            assert_eq!(cmd.get_program(), "sandbox-exec");
+            assert!(args.contains(&"ao-go".to_string()));
+        } else {
+            assert_eq!(cmd.get_program(), "ao-go");
+        }
+
+        // Arguments check: spawn --project <proj> --harness <agent> --branch <branch> --prompt <prompt>
+        assert!(args.contains(&"spawn".to_string()));
+        assert!(args.contains(&"--project".to_string()));
+        assert!(args.contains(&"dark-factory".to_string()));
+        assert!(args.contains(&"--harness".to_string()));
+        assert!(args.contains(&"antigravity".to_string()));
+        assert!(args.contains(&"--branch".to_string()));
+        assert!(args.contains(&"factory/go-ao-branch".to_string()));
+        assert!(args.contains(&"--prompt".to_string()));
+        assert!(args.contains(&"test prompt message".to_string()));
+
+        // Ensure NODE_OPTIONS and preload bridge are NOT set in env
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(!envs.iter().any(|(k, v)| k.to_str() == Some("NODE_OPTIONS") && v.is_some()));
+        assert!(!envs.iter().any(|(k, v)| k.to_str() == Some("DARK_FACTORY_AO_V013_BRIDGE") && v.is_some()));
+
+        let _ = std::fs::remove_dir_all(&temp_holdouts);
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_holdouts {
+            Some(v) => std::env::set_var("DARK_FACTORY_HOLDOUTS", v),
+            None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
+        }
+    }
+
+    #[test]
+    fn ao_spawn_agent_scope_validation() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_holdouts = std::env::var_os("DARK_FACTORY_HOLDOUTS");
+        let temp_holdouts = std::env::temp_dir().join(format!("df_test_holdouts_val_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_holdouts);
+        std::env::set_var("DARK_FACTORY_HOLDOUTS", &temp_holdouts);
+
+        let test_spec = spec("test prompt", "factory/val-branch");
+
+        // Unknown agent fails closed
+        let res = super::ao_spawn_command_with_mode("unsupported-agent", &test_spec, false);
+        assert!(res.is_err());
+        assert!(format!("{}", res.unwrap_err()).contains("Unsupported AO worker agent"));
+
+        // Claude without DARK_FACTORY_CLAUDE_CONFIG_DIR fails closed
+        let prior_claude = std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR");
+        std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR");
+        let res = super::ao_spawn_command_with_mode("claude", &test_spec, false);
+        assert!(res.is_err());
+
+        // Restore
+        match prior_claude {
+            Some(v) => std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR"),
+        }
+        match prior_holdouts {
+            Some(v) => std::env::set_var("DARK_FACTORY_HOLDOUTS", v),
+            None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_holdouts);
     }
 
     #[test]
@@ -10664,20 +10773,12 @@ const FALLBACK_CWD: &str = ".";
 /// does (bead `jleechan-g1k`) — MiniMax is still driving the `claude` CLI, so
 /// it still reads AGENTS.md / `.claude/` from the invocation cwd.
 fn run_minimax_judge(claude_bin: &str, prompt: &str) -> Result<String, DaemonError> {
-    let minimax_key = std::env::var("MINIMAX_API_KEY").map_err(|e| {
-        DaemonError::Tool {
-            tool: "minimax".into(),
-            rc: -1,
-            stderr: format!("MINIMAX_API_KEY not set: {e}"),
-        }
-    })?;
-
     let mut cmd = std::process::Command::new(claude_bin);
     cmd.args(["--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt])
         .current_dir(FALLBACK_CWD)
-        .stdin(std::process::Stdio::null())
-        .env("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
-        .env("ANTHROPIC_API_KEY", minimax_key);
+        .stdin(std::process::Stdio::null());
+
+    crate::account_scope::apply_minimax_scope(&mut cmd)?;
 
     let output = cmd.output().map_err(|e| DaemonError::Tool {
         tool: "minimax".into(),
