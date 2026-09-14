@@ -1578,48 +1578,46 @@ fn run_cargo_tests(
             .and_then(|s| s.to_str())
             .ok_or_else(|| RedGreenError::Git(format!("bad test file path: {}", tf.display())))?;
 
-        let mut args: Vec<String> = vec![
-            "test".to_string(),
-            "--quiet".to_string(),
-            "--test".to_string(),
-            basename.to_string(),
-        ];
-        if let Some(m) = manifest {
-            args.push("--manifest-path".to_string());
-            args.push(m.to_string_lossy().into_owned());
-        }
         for name in targeted_tests {
+            let mut args: Vec<String> = vec![
+                "test".to_string(),
+                "--quiet".to_string(),
+                "--test".to_string(),
+                basename.to_string(),
+            ];
+            if let Some(m) = manifest {
+                args.push("--manifest-path".to_string());
+                args.push(m.to_string_lossy().into_owned());
+            }
             args.push("--".to_string());
             args.push(name.clone());
             args.push("--exact".to_string());
-        }
 
-        let out = Command::new(&cargo_bin)
-            .current_dir(repo_root)
-            .args(&args)
-            .output()
-            .map_err(|e| {
-                RedGreenError::CargoNotFound(format!(
-                    "spawn {}: {e}; cargo binary not usable from this environment",
-                    cargo_bin.display()
-                ))
-            })?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
+            let out = Command::new(&cargo_bin)
+                .current_dir(repo_root)
+                .args(&args)
+                .output()
+                .map_err(|e| {
+                    RedGreenError::CargoNotFound(format!(
+                        "spawn {}: {e}; cargo binary not usable from this environment",
+                        cargo_bin.display()
+                    ))
+                })?;
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
 
-        // Cargo surfaces compile errors as `error[E0...]:` on stderr or
-        // stdout. If we see one AND exit was non-zero AND no per-test PASS
-        // lines were emitted, the test never compiled — which is the
-        // strongest possible "production code is being exercised" signal.
-        if !out.status.success()
-            && (stderr.contains("error[E") || stdout.contains("error[E"))
-            && !stdout.contains(" ... ok")
-        {
-            compile_errored = true;
-        }
+            // Cargo surfaces compile errors as `error[E0...]:` on stderr or
+            // stdout. If we see one AND exit was non-zero AND no per-test PASS
+            // lines were emitted, the test never compiled — which is the
+            // strongest possible "production code is being exercised" signal.
+            if !out.status.success()
+                && (stderr.contains("error[E") || stdout.contains("error[E"))
+                && !stdout.contains(" ... ok")
+            {
+                compile_errored = true;
+            }
 
-        // Parse cargo test's per-test PASS/FAIL summary lines.
-        for name in targeted_tests {
+            // Parse cargo test's per-test PASS/FAIL summary lines.
             let passed_marker = format!("test {name} ... ok");
             let failed_marker = format!("test {name} ... FAILED");
             let ignored_marker = format!("test {name} ... ignored");
