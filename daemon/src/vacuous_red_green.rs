@@ -792,6 +792,7 @@ pub fn check_red_green_with_manifest(
     // future-extension seam).
     let mut targeted: BTreeSet<String> = BTreeSet::new();
     let mut pytest_targets: Vec<PytestTarget> = Vec::new();
+    let mut cargo_targets: Vec<CargoTarget> = Vec::new();
     let mut skipped: Vec<TestFnInfo> = Vec::new();
     for path in &test_files {
         let head_src = std::fs::read_to_string(path).map_err(|e| {
@@ -817,12 +818,19 @@ pub fn check_red_green_with_manifest(
                     path: path.clone(),
                     name: name.clone(),
                 });
+            } else if backend == Backend::Cargo {
+                cargo_targets.push(CargoTarget {
+                    path: path.clone(),
+                    name: name.clone(),
+                });
             }
             targeted.insert(name);
         }
     }
     pytest_targets.sort_by(|a, b| a.path.cmp(&b.path).then(a.name.cmp(&b.name)));
     pytest_targets.dedup();
+    cargo_targets.sort_by(|a, b| a.path.cmp(&b.path).then(a.name.cmp(&b.name)));
+    cargo_targets.dedup();
     let targeted_tests: Vec<String> = targeted.iter().cloned().collect();
 
     // Phase (a) — green-on-PR-head. If the targeted tests don't pass
@@ -830,8 +838,7 @@ pub fn check_red_green_with_manifest(
     let head_pass = match backend {
         Backend::Cargo => run_cargo_tests(
             repo_root,
-            &test_files,
-            &targeted_tests,
+            &cargo_targets,
             resolved_manifest.as_deref(),
             cargo_loc.clone(),
         )?,
@@ -866,8 +873,7 @@ pub fn check_red_green_with_manifest(
         Backend::Cargo => run_baseline_check(
             repo_root,
             base_ref,
-            &test_files,
-            &targeted_tests,
+            &cargo_targets,
             resolved_manifest.as_deref(),
             cargo_loc.clone(),
         )?,
@@ -912,8 +918,7 @@ pub fn check_red_green_with_manifest(
     let revert_outcome = match backend {
         Backend::Cargo => run_cargo_tests(
             repo_root,
-            &test_files,
-            &targeted_tests,
+            &cargo_targets,
             resolved_manifest.as_deref(),
             cargo_loc.clone(),
         ),
@@ -1424,6 +1429,12 @@ struct PytestTarget {
     name: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CargoTarget {
+    pub path: PathBuf,
+    pub name: String,
+}
+
 impl CargoOutcome {
     fn all_passed(&self) -> bool {
         // A compile failure on the reverted tree is the strongest
@@ -1544,12 +1555,11 @@ pub fn find_cargo_manifest_recursive(repo_root: &Path, max_depth: usize) -> Opti
 /// directory` (the previous failure mode).
 fn run_cargo_tests(
     repo_root: &Path,
-    test_files: &[PathBuf],
-    targeted_tests: &[String],
+    cargo_targets: &[CargoTarget],
     manifest: Option<&Path>,
     cargo_loc: CargoLocation,
 ) -> Result<CargoOutcome, RedGreenError> {
-    if targeted_tests.is_empty() {
+    if cargo_targets.is_empty() {
         return Ok(CargoOutcome {
             failing: vec![],
             compile_errored: false,
@@ -1572,66 +1582,58 @@ fn run_cargo_tests(
     let mut failing: Vec<String> = Vec::new();
     let mut compile_errored = false;
 
-    for tf in test_files {
-        let basename = tf
+    for target in cargo_targets {
+        let basename = target
+            .path
             .file_stem()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| RedGreenError::Git(format!("bad test file path: {}", tf.display())))?;
+            .ok_or_else(|| RedGreenError::Git(format!("bad test file path: {}", target.path.display())))?;
 
-        for name in targeted_tests {
-            let mut args: Vec<String> = vec![
-                "test".to_string(),
-                "--quiet".to_string(),
-                "--test".to_string(),
-                basename.to_string(),
-            ];
-            if let Some(m) = manifest {
-                args.push("--manifest-path".to_string());
-                args.push(m.to_string_lossy().into_owned());
-            }
-            args.push("--".to_string());
-            args.push(name.clone());
-            args.push("--exact".to_string());
+        if basename == "mod" {
+            continue;
+        }
 
-            let out = Command::new(&cargo_bin)
-                .current_dir(repo_root)
-                .args(&args)
-                .output()
-                .map_err(|e| {
-                    RedGreenError::CargoNotFound(format!(
-                        "spawn {}: {e}; cargo binary not usable from this environment",
-                        cargo_bin.display()
-                    ))
-                })?;
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut args: Vec<String> = vec![
+            "test".to_string(),
+            "--test".to_string(),
+            basename.to_string(),
+        ];
+        if let Some(m) = manifest {
+            args.push("--manifest-path".to_string());
+            args.push(m.to_string_lossy().into_owned());
+        }
+        args.push("--".to_string());
+        args.push(target.name.clone());
+        args.push("--exact".to_string());
 
-            // Cargo surfaces compile errors as `error[E0...]:` on stderr or
-            // stdout. If we see one AND exit was non-zero AND no per-test PASS
-            // lines were emitted, the test never compiled — which is the
-            // strongest possible "production code is being exercised" signal.
-            if !out.status.success()
-                && (stderr.contains("error[E") || stdout.contains("error[E"))
-                && !stdout.contains(" ... ok")
-            {
-                compile_errored = true;
-            }
+        let out = Command::new(&cargo_bin)
+            .current_dir(repo_root)
+            .args(&args)
+            .output()
+            .map_err(|e| {
+                RedGreenError::CargoNotFound(format!(
+                    "spawn {}: {e}; cargo binary not usable from this environment",
+                    cargo_bin.display()
+                ))
+            })?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
 
-            // Parse cargo test's per-test PASS/FAIL summary lines.
-            let passed_marker = format!("test {name} ... ok");
-            let failed_marker = format!("test {name} ... FAILED");
-            let ignored_marker = format!("test {name} ... ignored");
-            if stdout.contains(&failed_marker) || stderr.contains(&failed_marker) {
-                failing.push(name.clone());
-            } else if !(stdout.contains(&passed_marker) || stdout.contains(&ignored_marker)) {
-                // If neither PASS nor FAIL nor IGNORED is present, the test
-                // didn't run at all — treat that as a hard fail signal so
-                // the gate doesn't accidentally approve a test that was
-                // skipped. Issue #387 r5 finding 3: this used to be
-                // treated as a real pass on the dark-factory layout when
-                // --manifest-path was omitted.
-                failing.push(format!("{name}:NEVER_RAN"));
-            }
+        if !out.status.success()
+            && (stderr.contains("error[E") || stdout.contains("error[E"))
+            && !stdout.contains(" ... ok")
+        {
+            compile_errored = true;
+        }
+
+        let name = &target.name;
+        let passed_marker = format!("test {name} ... ok");
+        let failed_marker = format!("test {name} ... FAILED");
+        let ignored_marker = format!("test {name} ... ignored");
+        if stdout.contains(&failed_marker) || stderr.contains(&failed_marker) {
+            failing.push(name.clone());
+        } else if !(stdout.contains(&passed_marker) || stdout.contains(&ignored_marker)) {
+            failing.push(format!("{name}:NEVER_RAN"));
         }
     }
 
@@ -1650,8 +1652,7 @@ fn run_cargo_tests(
 fn run_baseline_check(
     repo_root: &Path,
     base_ref: &str,
-    test_files: &[PathBuf],
-    targeted_tests: &[String],
+    cargo_targets: &[CargoTarget],
     manifest: Option<&Path>,
     cargo_loc: CargoLocation,
 ) -> Result<CargoOutcome, RedGreenError> {
@@ -1698,7 +1699,7 @@ fn run_baseline_check(
         }
     });
 
-    let result = run_cargo_tests(&tmp, test_files, targeted_tests, baseline_manifest.as_deref(), cargo_loc);
+    let result = run_cargo_tests(&tmp, cargo_targets, baseline_manifest.as_deref(), cargo_loc);
 
     // Always clean up the worktree, even on error. We swallow cleanup
     // errors — the test outcome is the primary signal; a stale /tmp
@@ -2688,6 +2689,33 @@ fn b() {
                     || failure.contains("test_invalid.py::test_same")),
             "failure must identify process/invalid target, not be masked by same-name pass: {outcome:?}"
         );
+    }
+
+    #[test]
+    fn cargo_targets_skips_mod_rs_and_empty_targets() {
+        let empty_outcome = run_cargo_tests(
+            Path::new("."),
+            &[],
+            None,
+            CargoLocation::OnPath,
+        )
+        .expect("empty cargo targets should succeed immediately");
+        assert!(empty_outcome.all_passed());
+        assert!(empty_outcome.failing.is_empty());
+
+        let mod_targets = vec![CargoTarget {
+            path: PathBuf::from("tests/common/mod.rs"),
+            name: "setup".to_string(),
+        }];
+        let mod_outcome = run_cargo_tests(
+            Path::new("."),
+            &mod_targets,
+            None,
+            CargoLocation::OnPath,
+        )
+        .expect("skipping mod.rs should succeed without running cargo");
+        assert!(mod_outcome.all_passed());
+        assert!(mod_outcome.failing.is_empty());
     }
 
     /// Create a unique temp directory under `std::env::temp_dir()`. The
