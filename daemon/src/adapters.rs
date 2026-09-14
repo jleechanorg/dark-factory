@@ -9455,9 +9455,10 @@ impl Sessions for CliSessions {
             let conn = match open_go_ao_db() {
                 Ok(c) => c,
                 Err(_) => {
-                    return Err(DaemonError::Parse(format!(
-                        "no active session for branch {branch} in project {project}"
-                    )));
+                    return Err(DaemonError::SessionNotFound {
+                        branch: branch.to_string(),
+                        bead_id: bead_id.to_string(),
+                    });
                 }
             };
             let mut stmt = match conn.prepare(
@@ -9465,17 +9466,19 @@ impl Sessions for CliSessions {
             ) {
                 Ok(s) => s,
                 Err(_) => {
-                    return Err(DaemonError::Parse(format!(
-                        "no active session for branch {branch} in project {project}"
-                    )));
+                    return Err(DaemonError::SessionNotFound {
+                        branch: branch.to_string(),
+                        bead_id: bead_id.to_string(),
+                    });
                 }
             };
             let mut rows = match stmt.query([project, branch]) {
                 Ok(r) => r,
                 Err(_) => {
-                    return Err(DaemonError::Parse(format!(
-                        "no active session for branch {branch} in project {project}"
-                    )));
+                    return Err(DaemonError::SessionNotFound {
+                        branch: branch.to_string(),
+                        bead_id: bead_id.to_string(),
+                    });
                 }
             };
             if let Ok(Some(row)) = rows.next() {
@@ -9484,9 +9487,10 @@ impl Sessions for CliSessions {
                 })?;
                 return Ok(SessionId(id));
             }
-            return Err(DaemonError::Parse(format!(
-                "no active session for branch {branch} in project {project}"
-            )));
+            return Err(DaemonError::SessionNotFound {
+                branch: branch.to_string(),
+                bead_id: bead_id.to_string(),
+            });
         }
         let out = run_tool("ao", &["status", "-p", project, "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
@@ -13853,7 +13857,11 @@ exit 1
         assert_eq!(attached.0, "sess-active-2");
 
         let attach_missing = sessions.attach_within_in_project("missing-branch", "b-1", "proj-a", 10);
-        assert!(matches!(attach_missing, Err(DaemonError::Parse(_))));
+        assert!(matches!(
+            attach_missing,
+            Err(DaemonError::SessionNotFound { ref branch, ref bead_id })
+            if branch == "missing-branch" && bead_id == "b-1"
+        ));
 
         // 6. session_branch_in_project
         let branch = sessions.session_branch_in_project(&SessionId("sess-active-1".into()), "proj-a").unwrap();
@@ -13972,6 +13980,88 @@ echo "$@" >> "{}"
 
         assert_eq!(resolved_ws, Some(worktrees_dir));
         assert_eq!(resolved_br, Some("factory/test-branch".to_string()));
+
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_op_home {
+            Some(v) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn go_ao_attach_within_in_project_returns_session_not_found_when_no_session() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_op_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+
+        let temp_home = std::env::temp_dir().join(format!("df_test_go_ao_not_found_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_home);
+        let ao_data = temp_home.join(".ao/data");
+        std::fs::create_dir_all(&ao_data).unwrap();
+
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &temp_home);
+
+        let db_path = ao_data.join("ao.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                workspace_path TEXT,
+                branch TEXT,
+                project_id TEXT,
+                is_terminated INTEGER,
+                activity_state TEXT,
+                num INTEGER
+            );
+            INSERT INTO sessions VALUES ('sess-term', '/ws/term', 'feature/terminated', 'proj-a', 1, 'active', 10);
+            INSERT INTO sessions VALUES ('sess-other', '/ws/other', 'feature/other-branch', 'proj-b', 0, 'active', 20);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let sessions = CliSessions::new("org/proj-a", "antigravity");
+
+        // 1. Branch completely absent
+        let res_missing = sessions.attach_within_in_project("feature/absent", "bead-absent-1", "proj-a", 10);
+        assert!(matches!(
+            res_missing,
+            Err(DaemonError::SessionNotFound { ref branch, ref bead_id })
+            if branch == "feature/absent" && bead_id == "bead-absent-1"
+        ));
+
+        // 2. Branch exists only for another project
+        let res_other_proj = sessions.attach_within_in_project("feature/other-branch", "bead-other-2", "proj-a", 10);
+        assert!(matches!(
+            res_other_proj,
+            Err(DaemonError::SessionNotFound { ref branch, ref bead_id })
+            if branch == "feature/other-branch" && bead_id == "bead-other-2"
+        ));
+
+        // 3. Branch exists in project but is terminated (is_terminated = 1)
+        let res_term = sessions.attach_within_in_project("feature/terminated", "bead-term-3", "proj-a", 10);
+        assert!(matches!(
+            res_term,
+            Err(DaemonError::SessionNotFound { ref branch, ref bead_id })
+            if branch == "feature/terminated" && bead_id == "bead-term-3"
+        ));
+
+        // 4. DB file is absent entirely
+        let _ = std::fs::remove_file(&db_path);
+        let res_no_db = sessions.attach_within_in_project("feature/any", "bead-no-db-4", "proj-a", 10);
+        assert!(matches!(
+            res_no_db,
+            Err(DaemonError::SessionNotFound { ref branch, ref bead_id })
+            if branch == "feature/any" && bead_id == "bead-no-db-4"
+        ));
 
         match prior_engine {
             Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
