@@ -206,7 +206,7 @@ pub fn is_minimax_api_url(url_str: &str) -> bool {
 /// - `codex` -> `AiProvider::Codex`
 /// - `claude`, `claude-sonnet` -> `AiProvider::MiniMax` if explicitly indicated by `extra_env`,
 ///   otherwise `AiProvider::Claude`.
-/// Normal non-AI commands (e.g. `git`, `br`, `gh`, `sh`, `cargo`) return `None`.
+///   Normal non-AI commands (e.g. `git`, `br`, `gh`, `sh`, `cargo`) return `None`.
 pub fn detect_direct_cli_provider(cmd: &str, extra_env: &[(&str, &str)]) -> Option<AiProvider> {
     let bin = Path::new(cmd)
         .file_name()
@@ -239,7 +239,14 @@ pub fn apply_direct_cli_scope(
     extra_env: &[(&str, &str)],
     command: &mut Command,
 ) -> Result<(), DaemonError> {
-    if let Some(provider) = detect_direct_cli_provider(cmd, extra_env) {
+    let bin = Path::new(cmd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(cmd);
+    if bin == "agy" || bin == "antigravity" {
+        // Reuse the AO account boundary for direct AGY children.
+        validate_ao_worker_agent_scope("agy", command)
+    } else if let Some(provider) = detect_direct_cli_provider(cmd, extra_env) {
         apply_provider_scope(provider, command)
     } else {
         Ok(())
@@ -254,7 +261,7 @@ pub fn apply_direct_cli_scope(
 /// - `claude` / `claude-code` / `claude-sonnet`: applies direct Claude scoping
 /// - `codex`: applies direct Codex scoping
 /// - `minimax` / `claudem`: applies direct MiniMax scoping
-/// - `antigravity` / `agy`: scrubs all auth, forwards validated `CLAUDE_CONFIG_DIR` and `CODEX_HOME` if set
+/// - `antigravity` / `agy`: requires `CODEX_HOME`, validates optional Claude scope, and scrubs auth
 /// - any other agent: scrubs all auth and returns `Err(DaemonError::Config(...))` so unknown agents fail closed.
 pub fn validate_ao_worker_agent_scope(
     agent: &str,
@@ -268,12 +275,16 @@ pub fn validate_ao_worker_agent_scope(
     } else if normalized == "minimax" || normalized == "claudem" {
         apply_minimax_scope(command)
     } else if normalized == "antigravity" || normalized == "agy" {
+        let home = validate_codex_home()?;
+        let claude_dir = if std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR").is_some() {
+            Some(validate_claude_config_dir()?)
+        } else {
+            None
+        };
         scrub_all_ai_provider_auth(command);
-        if let Ok(dir) = validate_claude_config_dir() {
+        command.env("CODEX_HOME", home);
+        if let Some(dir) = claude_dir {
             command.env("CLAUDE_CONFIG_DIR", dir);
-        }
-        if let Ok(home) = validate_codex_home() {
-            command.env("CODEX_HOME", home);
         }
         Ok(())
     } else {
@@ -313,6 +324,29 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct EnvRestore {
+        values: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvRestore {
+        fn new(keys: &[&'static str]) -> Self {
+            Self {
+                values: keys.iter().map(|key| (*key, std::env::var_os(key))).collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in self.values.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
         }
     }
 
@@ -495,9 +529,11 @@ mod tests {
     #[test]
     fn test_validate_ao_worker_agent_scope() {
         let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let prior_claude = std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR");
-        let prior_codex = std::env::var_os("CODEX_HOME");
-        let prior_minimax = std::env::var_os("MINIMAX_API_KEY");
+        let _restore = EnvRestore::new(&[
+            "DARK_FACTORY_CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "MINIMAX_API_KEY",
+        ]);
 
         // Clean env
         std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR");
@@ -567,19 +603,21 @@ mod tests {
         let envs: Vec<_> = cmd.get_envs().collect();
         assert!(envs.iter().any(|(k, v)| k.to_str() == Some("OPENAI_API_KEY") && v.is_none()));
 
-        // Restore
-        match prior_claude {
-            Some(v) => std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", v),
-            None => std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR"),
-        }
-        match prior_codex {
-            Some(v) => std::env::set_var("CODEX_HOME", v),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
-        match prior_minimax {
-            Some(v) => std::env::set_var("MINIMAX_API_KEY", v),
-            None => std::env::remove_var("MINIMAX_API_KEY"),
-        }
+    }
+
+    #[test]
+    fn direct_agy_rejects_missing_invalid_and_conflicting_scope() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::new(&["CODEX_HOME", "DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
+        std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR");
+        assert!(apply_direct_cli_scope("agy", &[], &mut Command::new("sh")).is_err());
+        let temp = TempDir::new("agy_invalid_scope");
+        std::env::set_var("CODEX_HOME", temp.path.join("missing"));
+        assert!(apply_direct_cli_scope("/synthetic/bin/agy", &[], &mut Command::new("sh")).is_err());
+        std::env::set_var("CODEX_HOME", &temp.path);
+        std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", temp.path.join("missing"));
+        assert!(apply_direct_cli_scope("agy", &[], &mut Command::new("sh")).is_err());
     }
 
     #[cfg(unix)]
@@ -640,6 +678,17 @@ mod tests {
         assert!(minimax_env.contains("ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic\n"));
         assert!(minimax_env.contains("ANTHROPIC_MODEL=MiniMax-M3\n"));
         assert!(minimax_env.contains("MINIMAX_API_KEY=\n"), "MiniMax child inherited provider-specific key: {minimax_env}");
+
+        // AGY is commonly launched through a path-qualified executable name;
+        // prove that the direct-dispatch path still scrubs inherited auth.
+        let mut agy = Command::new("sh");
+        for var in SCRUBBED_AUTH_VARS {
+            agy.env(var, "SYNTHETIC_AUTH_SENTINEL");
+        }
+        apply_direct_cli_scope("/opt/antigravity/bin/agy", &[], &mut agy).unwrap();
+        let agy_env = child_scope_env(&mut agy);
+        assert!(agy_env.lines().all(|line| !line.ends_with("=SYNTHETIC_AUTH_SENTINEL")), "AGY child leaked scoped auth: {agy_env}");
+        assert!(agy_env.contains("MINIMAX_API_KEY=\n"), "AGY child inherited MiniMax auth: {agy_env}");
 
         match prior_claude {
             Some(value) => std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", value),
