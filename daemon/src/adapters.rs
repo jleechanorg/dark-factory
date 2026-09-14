@@ -4271,6 +4271,8 @@ pub fn verify_ao_bridge_compatibility(
     configured_vendors: &[String],
 ) -> Result<(), DaemonError> {
     if std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go") {
+        // Upstream Go AO `status` reports daemon health via healthz/readyz and
+        // exposes only `--json`; project scoping belongs to session commands.
         let mut command = Command::new("ao-go");
         command
             .arg("status")
@@ -4724,26 +4726,37 @@ impl CliSessions {
                 .find_map(|line| {
                     let rest = line.strip_prefix("spawned session ")?;
                     rest.split_whitespace().next().map(|s| s.to_string())
-                })
-                .ok_or_else(|| {
-                    if !output.status.success() {
-                        let harness = match agent {
-                            "antigravity" | "agy" => "agy",
-                            "claude" | "claude-code" => "claude-code",
-                            "codex" => "codex",
-                            other => other,
-                        };
-                        DaemonError::Tool {
-                            tool: format!("ao-go spawn --harness {harness}"),
-                            rc: output.status.code().unwrap_or(-1),
-                            stderr: err_msg.clone(),
-                        }
-                    } else {
-                        DaemonError::Parse(format!(
-                            "ao-go spawn produced no 'spawned session ' line: stdout={out}, stderr={err_msg}"
-                        ))
-                    }
-                })?;
+                });
+            let harness = match agent {
+                "antigravity" | "agy" => "agy",
+                "claude" | "claude-code" => "claude-code",
+                "codex" => "codex",
+                other => other,
+            };
+            if !output.status.success() {
+                let spawn_error = DaemonError::Tool {
+                    tool: format!("ao-go spawn --harness {harness}"),
+                    rc: output.status.code().unwrap_or(-1),
+                    stderr: err_msg.clone(),
+                };
+                if let Some(session_id) = session_id {
+                    let session = SessionId(session_id);
+                    return match Self::kill_in_project(&spec.ao_project, &session) {
+                        Ok(()) => Err(spawn_error),
+                        Err(cleanup_error) => Err(DaemonError::SpawnCleanupFailed {
+                            session: session.0,
+                            spawn_error: Box::new(spawn_error),
+                            cleanup_error: Box::new(cleanup_error),
+                        }),
+                    };
+                }
+                return Err(spawn_error);
+            }
+            let session_id = session_id.ok_or_else(|| {
+                DaemonError::Parse(format!(
+                    "ao-go spawn produced no 'spawned session ' line: stdout={out}, stderr={err_msg}"
+                ))
+            })?;
             let session = SessionId(session_id);
             let (mut ws, mut branch) = go_ao_session_workspace_and_branch(&session.0);
             if ws.is_none() {
@@ -4758,7 +4771,19 @@ impl CliSessions {
                 }
             }
             if branch.is_none() {
-                branch = Some(spec.branch.clone());
+                if let Some(workspace_path) = ws.as_ref() {
+                    if let Ok(actual_branch) = run_tool_in_dir(
+                        "git",
+                        &["branch", "--show-current"],
+                        &workspace_path.to_string_lossy(),
+                        30,
+                    ) {
+                        let actual_branch = actual_branch.trim();
+                        if !actual_branch.is_empty() {
+                            branch = Some(actual_branch.to_string());
+                        }
+                    }
+                }
             }
             (session, ws, branch)
         } else {
@@ -4793,7 +4818,19 @@ impl CliSessions {
                             workspace_path.display()
                         )))
                     } else {
-                        None
+                        match crate::target_worktree::validate_existing_target_worktree(
+                            &spec.repo,
+                            workspace_path,
+                            spec.expected_revision.as_deref(),
+                        ) {
+                            Ok(_) => None,
+                            Err(error) => Some(DaemonError::Config(format!(
+                                "Go AO worker workspace for session {} is not bound to repo {} at expected revision {}: {error}",
+                                session.0,
+                                spec.repo,
+                                spec.expected_revision.as_deref().unwrap_or("?"),
+                            ))),
+                        }
                     }
                 } else {
                     match validate_target_identity_if_expected(
@@ -5360,8 +5397,9 @@ mod ao_spawn_contract_tests {
                 "FAKE_GIT_LOCAL_SOURCE",
                 "FAKE_GIT_REAL_BIN",
                 "MINIMAX_API_KEY",
+                "DARK_FACTORY_CODER_FALLBACK_CHAIN",
             ];
-            let saved = KEYS
+            let saved: Vec<(&'static str, Option<std::ffi::OsString>)> = KEYS
                 .iter()
                 .map(|key| (*key, std::env::var_os(key)))
                 .collect();
@@ -5371,12 +5409,51 @@ mod ao_spawn_contract_tests {
             std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
             std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", bindings.to_string());
             std::env::set_var("AO_FAKE_LOG", log);
-            if std::env::var_os("MINIMAX_API_KEY").is_none() {
-                std::env::set_var("MINIMAX_API_KEY", "test-fake-minimax-key");
-            }
+            std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
             Self {
                 saved,
                 cleanup_dir: dir.to_path_buf(),
+            }
+        }
+    }
+
+    /// Synthetic account configuration for subprocess fixtures.  Tests must
+    /// never inherit an operator credential or account directory merely
+    /// because the host running the suite happens to provide one.
+    struct SyntheticAccountScopeEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl SyntheticAccountScopeEnv {
+        fn install(root: &std::path::Path) -> Self {
+            const KEYS: &[&str] = &[
+                "DARK_FACTORY_CLAUDE_CONFIG_DIR",
+                "CODEX_HOME",
+                "MINIMAX_API_KEY",
+                "DARK_FACTORY_CODER_FALLBACK_CHAIN",
+            ];
+            let saved: Vec<(&'static str, Option<std::ffi::OsString>)> = KEYS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            let claude_dir = root.join("synthetic-claude-config");
+            let codex_home = root.join("synthetic-codex-home");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            std::fs::create_dir_all(&codex_home).unwrap();
+            std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", claude_dir);
+            std::env::set_var("CODEX_HOME", codex_home);
+            std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
+            Self { saved }
+        }
+    }
+
+    impl Drop for SyntheticAccountScopeEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
             }
         }
     }
@@ -7781,6 +7858,7 @@ os.execv(real_git, [real_git] + args)
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let _scope = SyntheticAccountScopeEnv::install(&root);
 
         let repo = "jleechanorg/dark-factory";
         let init_checkout = |name: &str| -> std::path::PathBuf {
@@ -8002,6 +8080,7 @@ sys.exit(99)
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let _scope = SyntheticAccountScopeEnv::install(&root);
         let _ready_controller = ReadyAoControllerEnv::seed(&root);
         let log = root.join("calls.jsonl");
         let fake_ao = root.join("ao");
@@ -8070,6 +8149,7 @@ raise SystemExit(9)
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let _scope = SyntheticAccountScopeEnv::install(&root);
         let _ready_controller = ReadyAoControllerEnv::seed(&root);
         let log = root.join("calls.jsonl");
         let fake_ao = root.join("ao");
@@ -8517,6 +8597,7 @@ export const isTerminalSession = () => false;
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
+        let _scope = SyntheticAccountScopeEnv::install(&root);
         let bin = root.join("bin");
         let cli = root.join("node_modules/@jleechanorg/ao-cli");
         let core = root.join("node_modules/@jleechanorg/ao-core");
@@ -11736,6 +11817,52 @@ mod chain_llm_fallback_argv_tests {
         crate::test_env_lock()
     }
 
+    struct ScopedChainEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ScopedChainEnv {
+        fn install(dir: &std::path::Path) -> Self {
+            const KEYS: &[&str] = &[
+                "PATH",
+                "HOME",
+                "DARK_FACTORY_CLAUDE_CONFIG_DIR",
+                "CODEX_HOME",
+                "MINIMAX_API_KEY",
+            ];
+            let saved: Vec<(&'static str, Option<std::ffi::OsString>)> = KEYS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            let claude_dir = dir.join("synthetic-claude-config");
+            let codex_home = dir.join("synthetic-codex-home");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            std::fs::create_dir_all(&codex_home).unwrap();
+            let mut path = std::ffi::OsString::from(dir.join("bin"));
+            if let Some(prior) = saved[0].1.as_ref() {
+                path.push(":");
+                path.push(prior);
+            }
+            std::env::set_var("PATH", path);
+            std::env::set_var("HOME", dir);
+            std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", claude_dir);
+            std::env::set_var("CODEX_HOME", codex_home);
+            std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
+            Self { saved }
+        }
+    }
+
+    impl Drop for ScopedChainEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     /// Write an executable shell script at `path` that prints every element
     /// of its argv, one per line, on stdout. argv[0] (the script path) is
     /// preserved as the first line so tests can assert the child was
@@ -11792,45 +11919,20 @@ mod chain_llm_fallback_argv_tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let dir = make_argv_dump_dir(&format!("argv_{nanos}"), "codex");
-        let bin = dir.join("bin");
 
         // Make ChainLlm resolve `codex` from our shim. Other backends
         // (`claude`, `agy`) must NOT be reachable from PATH so the chain
         // stops at the shim — this pins the argv of the FIRST link rather
         // than accidentally exercising the fallback.
-        let prior_path = std::env::var_os("PATH");
-        let mut new_path = std::ffi::OsString::from(bin.to_str().unwrap());
-        if let Some(prior) = prior_path.as_ref() {
-            new_path.push(":");
-            new_path.push(prior);
-        }
         // SAFETY: tests mutate env vars sequentially here. ENV_LOCK above
         // ensures no parallel test from this module can interleave; the
         // per-test temp dir + `nanos` suffix is defense-in-depth in case
         // a future contributor adds a test that does NOT take the lock.
-        unsafe { std::env::set_var("PATH", &new_path) };
-        let prior_home = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", dir.to_str().unwrap()) };
+        let env = ScopedChainEnv::install(&dir);
 
         let result = ChainLlm.judge("hello-router-prompt");
 
-        // Restore env first so a failed assertion leaves the test run
-        // hygienic for the next case. Drop the guard explicitly after
-        // restoration so a panic in the assertions does not skip the
-        // env restore (Drop for MutexGuard would not run, but the
-        // restore is the test's responsibility regardless).
-        unsafe {
-            if let Some(prior) = prior_home {
-                std::env::set_var("HOME", prior);
-            } else {
-                std::env::remove_var("HOME");
-            }
-            if let Some(prior) = prior_path {
-                std::env::set_var("PATH", prior);
-            } else {
-                std::env::remove_var("PATH");
-            }
-        }
+        drop(env);
         drop(_guard);
 
         let captured = result.expect("codex shim should succeed");
@@ -11878,32 +11980,12 @@ mod chain_llm_fallback_argv_tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let dir = make_argv_dump_dir(&format!("bnd_{nanos}"), "codex");
-        let bin = dir.join("bin");
 
-        let prior_path = std::env::var_os("PATH");
-        let mut new_path = std::ffi::OsString::from(bin.to_str().unwrap());
-        if let Some(prior) = prior_path.as_ref() {
-            new_path.push(":");
-            new_path.push(prior);
-        }
-        unsafe { std::env::set_var("PATH", &new_path) };
-        let prior_home = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", dir.to_str().unwrap()) };
+        let env = ScopedChainEnv::install(&dir);
 
         let result = ChainLlm.judge("boundary-check");
 
-        unsafe {
-            if let Some(prior) = prior_home {
-                std::env::set_var("HOME", prior);
-            } else {
-                std::env::remove_var("HOME");
-            }
-            if let Some(prior) = prior_path {
-                std::env::set_var("PATH", prior);
-            } else {
-                std::env::remove_var("PATH");
-            }
-        }
+        drop(env);
         drop(_guard);
 
         let captured = result.expect("codex shim should succeed");
@@ -13676,6 +13758,10 @@ mod go_ao_lifecycle_tests {
 
         let script = format!(
             r#"#!/bin/sh
+if [ "$1" != "status" ] || [ "$2" != "--json" ] || [ "$3" != "" ]; then
+  echo "unexpected ao-go status argv: $*" >&2
+  exit 9
+fi
 cat "{}"
 "#,
             state_file.display()
@@ -13727,6 +13813,229 @@ exit 1
             None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    struct GoSpawnEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl GoSpawnEnv {
+        fn install(root: &std::path::Path, kill_fails: bool) -> Self {
+            const KEYS: &[&str] = &[
+                "PATH",
+                "DARK_FACTORY_AO_ENGINE",
+                "DARK_FACTORY_OPERATOR_HOME",
+                "DARK_FACTORY_AO_CONFIG_PATH",
+                "GO_SPAWN_NONZERO",
+                "GO_KILL_FAIL",
+                "DARK_FACTORY_CLAUDE_CONFIG_DIR",
+                "CODEX_HOME",
+                "MINIMAX_API_KEY",
+                "DARK_FACTORY_CODER_FALLBACK_CHAIN",
+            ];
+            let saved: Vec<(&'static str, Option<std::ffi::OsString>)> = KEYS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            let mut path = std::ffi::OsString::from(root);
+            if let Some(prior) = saved[0].1.as_ref() {
+                path.push(":");
+                path.push(prior);
+            }
+            std::env::set_var("PATH", path);
+            std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+            std::env::set_var("DARK_FACTORY_OPERATOR_HOME", root.join("operator-home"));
+            std::env::set_var("DARK_FACTORY_AO_CONFIG_PATH", root.join("operator-home/config.yaml"));
+            std::fs::create_dir_all(root.join("synthetic-claude-config")).unwrap();
+            std::fs::create_dir_all(root.join("synthetic-codex-home")).unwrap();
+            std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", root.join("synthetic-claude-config"));
+            std::env::set_var("CODEX_HOME", root.join("synthetic-codex-home"));
+            std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
+            std::env::set_var("GO_SPAWN_NONZERO", "0");
+            if kill_fails {
+                std::env::set_var("GO_KILL_FAIL", "1");
+            } else {
+                std::env::remove_var("GO_KILL_FAIL");
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for GoSpawnEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn init_go_test_repo(path: &std::path::Path, repo: &str, branch: &str) -> String {
+        std::fs::create_dir_all(path).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "-b", branch])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["remote", "add", "origin", &format!("https://github.com/{repo}.git")])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["-c", "user.email=test@example.invalid", "-c", "user.name=synthetic", "commit", "--allow-empty", "-m", "synthetic"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+        String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(path)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    }
+
+    fn make_go_spawn_fixture(tag: &str, kill_fails: bool) -> (std::path::PathBuf, GoSpawnEnv, SpawnSpec, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("df_go_spawn_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("ao-go.log");
+        std::fs::write(
+            root.join("ao-go"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = session ]; then\n  if [ \"$GO_KILL_FAIL\" = 1 ]; then echo 'synthetic kill failure' >&2; exit 8; fi\n  exit 0\nfi\nprintf 'spawned session go-synthetic\\n'\nif [ \"$GO_SPAWN_NONZERO\" = 1 ]; then exit 7; fi\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(root.join("ao-go"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env = GoSpawnEnv::install(&root, kill_fails);
+        let repo = "owner/repo";
+        let branch = "factory/go-synthetic-r1";
+        let target = root.join("target");
+        init_go_test_repo(&target, repo, "main");
+        let workspace = root.join("operator-home/.ao/data/worktrees/go-project/go-synthetic");
+        init_go_test_repo(&workspace, repo, branch);
+        let spec = SpawnSpec {
+            bead_id: "synthetic-go-bead".to_string(),
+            branch: branch.to_string(),
+            prompt: "synthetic go spawn".to_string(),
+            repo: repo.to_string(),
+            ao_project: "go-project".to_string(),
+            remote: "origin".to_string(),
+            local_checkout: Some(target),
+            expected_revision: None,
+            managed_checkout: false,
+            expected_cwd: None,
+        };
+        (root, env, spec, log)
+    }
+
+    #[test]
+    fn go_spawn_nonzero_valid_stdout_cleans_up_before_error() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, spec, log) = make_go_spawn_fixture("nonzero", false);
+        std::env::set_var("GO_SPAWN_NONZERO", "1");
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.run_spawn_process("antigravity", &spec);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(matches!(result, Err(DaemonError::Tool { .. })), "nonzero Go spawn must fail: {result:?}");
+        assert!(calls.contains("spawn --project"));
+        assert!(calls.contains("session kill go-synthetic -p go-project"), "session cleanup missing: {calls}");
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn go_spawn_cleanup_failure_halts_fallback_contract() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, spec, _log) = make_go_spawn_fixture("cleanup-fail", true);
+        std::env::set_var("GO_SPAWN_NONZERO", "1");
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.run_spawn_process("antigravity", &spec);
+        assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })), "cleanup failure must be typed: {result:?}");
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn go_spawn_cleanup_failure_does_not_try_next_vendor() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, spec, log) = make_go_spawn_fixture("fallback-stop", true);
+        std::env::set_var("GO_SPAWN_NONZERO", "1");
+        std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", "codex");
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.spawn_with_fallback(&spec);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })), "cleanup failure must halt fallback: {result:?}");
+        assert_eq!(calls.matches("spawn --project").count(), 1, "fallback vendor must not run after cleanup failure: {calls}");
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn go_spawn_rejects_wrong_origin_and_stale_revision() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, mut spec, log) = make_go_spawn_fixture("identity", false);
+        let target_revision = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["-C", root.join("target").to_str().unwrap(), "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let workspace = root.join("operator-home/.ao/data/worktrees/go-project/go-synthetic");
+        std::fs::write(workspace.join("different.txt"), "stale workspace").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["-C", workspace.to_str().unwrap(), "add", "different.txt"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["-C", workspace.to_str().unwrap(), "-c", "user.email=test@example.invalid", "-c", "user.name=synthetic", "commit", "-m", "stale"])
+            .status()
+            .unwrap()
+            .success());
+        spec.expected_revision = Some(target_revision);
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.run_spawn_process("antigravity", &spec);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(result.is_err(), "stale Go workspace revision must fail closed");
+        assert!(calls.contains("session kill go-synthetic -p go-project"), "identity failure must clean up: {calls}");
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn go_spawn_rejects_wrong_origin_and_cleans_up_session() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, spec, log) = make_go_spawn_fixture("wrong-origin", false);
+        let workspace = root.join("operator-home/.ao/data/worktrees/go-project/go-synthetic");
+        assert!(std::process::Command::new("git")
+            .args(["-C", workspace.to_str().unwrap(), "remote", "set-url", "origin", "https://github.com/other/repo.git"])
+            .status()
+            .unwrap()
+            .success());
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.run_spawn_process("antigravity", &spec);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(result.is_err(), "wrong-origin Go workspace must fail closed");
+        assert!(calls.contains("session kill go-synthetic -p go-project"), "wrong-origin failure must clean up: {calls}");
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

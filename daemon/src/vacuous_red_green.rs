@@ -1561,7 +1561,11 @@ fn run_cargo_tests(
 ) -> Result<CargoOutcome, RedGreenError> {
     if cargo_targets.is_empty() {
         return Ok(CargoOutcome {
-            failing: vec![],
+            // No cargo process ran, so this cannot prove a green test. Keep
+            // the same explicit marker used when a named target is not
+            // collected, rather than allowing an empty target list to look
+            // like a successful phase.
+            failing: vec!["<no-cargo-targets>:NEVER_RAN".to_string()],
             compile_errored: false,
         });
     }
@@ -1590,6 +1594,10 @@ fn run_cargo_tests(
             .ok_or_else(|| RedGreenError::Git(format!("bad test file path: {}", target.path.display())))?;
 
         if basename == "mod" {
+            // Helper modules under tests/ are not Cargo integration-test
+            // targets. Record that this target was never executed so a PR
+            // containing only mod.rs discoveries cannot earn a green phase.
+            failing.push(format!("{}:NEVER_RAN", target.name));
             continue;
         }
 
@@ -1632,7 +1640,12 @@ fn run_cargo_tests(
         let ignored_marker = format!("test {name} ... ignored");
         if stdout.contains(&failed_marker) || stderr.contains(&failed_marker) {
             failing.push(name.clone());
-        } else if !(stdout.contains(&passed_marker) || stdout.contains(&ignored_marker)) {
+        } else if stdout.contains(&ignored_marker) {
+            // Cargo's default test mode reports #[ignore] tests as
+            // "ignored" without executing their assertions. They therefore
+            // cannot establish either head-green or red-on-revert evidence.
+            failing.push(format!("{name}:NEVER_RAN"));
+        } else if !stdout.contains(&passed_marker) {
             failing.push(format!("{name}:NEVER_RAN"));
         }
     }
@@ -2692,30 +2705,71 @@ fn b() {
     }
 
     #[test]
-    fn cargo_targets_skips_mod_rs_and_empty_targets() {
-        let empty_outcome = run_cargo_tests(
-            Path::new("."),
-            &[],
-            None,
-            CargoLocation::OnPath,
-        )
-        .expect("empty cargo targets should succeed immediately");
-        assert!(empty_outcome.all_passed());
-        assert!(empty_outcome.failing.is_empty());
+    fn cargo_targets_without_executable_tests_fail_closed_as_never_ran() {
+        let empty_outcome = run_cargo_tests(Path::new("."), &[], None, CargoLocation::OnPath)
+            .expect("empty cargo targets should classify without spawning cargo");
+        assert!(!empty_outcome.all_passed());
+        assert_eq!(
+            empty_outcome.failing,
+            vec!["<no-cargo-targets>:NEVER_RAN".to_string()]
+        );
 
         let mod_targets = vec![CargoTarget {
             path: PathBuf::from("tests/common/mod.rs"),
             name: "setup".to_string(),
         }];
-        let mod_outcome = run_cargo_tests(
-            Path::new("."),
-            &mod_targets,
-            None,
-            CargoLocation::OnPath,
+        let mod_outcome =
+            run_cargo_tests(Path::new("."), &mod_targets, None, CargoLocation::OnPath)
+                .expect("mod.rs should classify without spawning cargo");
+        assert!(!mod_outcome.all_passed());
+        assert_eq!(
+            mod_outcome.failing,
+            vec!["setup:NEVER_RAN".to_string()]
+        );
+    }
+
+    #[test]
+    fn cargo_ignored_test_does_not_prove_an_executed_assertion() {
+        // Use a real, dependency-free Cargo integration-test fixture so the
+        // assertion is pinned at the cargo output boundary. Cargo reports an
+        // #[ignore] test as "ignored" with exit 0, but its body never runs.
+        let dir = tempdir_unique("cargo-ignored");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"cargo-ignored-fixture\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
         )
-        .expect("skipping mod.rs should succeed without running cargo");
-        assert!(mod_outcome.all_passed());
-        assert!(mod_outcome.failing.is_empty());
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+        std::fs::write(
+            dir.join("tests/scenario.rs"),
+            "#[test]\n#[ignore = \"fixture only\"]\nfn ignored_case() { assert_eq!(2 + 2, 4); }\n",
+        )
+        .unwrap();
+
+        let cargo_loc = resolve_cargo(cargo_home_from_env().as_deref());
+        assert_ne!(
+            cargo_loc,
+            CargoLocation::NotFound,
+            "cargo is required for this fixture"
+        );
+        let outcome = run_cargo_tests(
+            &dir,
+            &[CargoTarget {
+                path: dir.join("tests/scenario.rs"),
+                name: "ignored_case".to_string(),
+            }],
+            Some(&dir.join("Cargo.toml")),
+            cargo_loc,
+        )
+        .expect("cargo fixture should execute");
+
+        assert!(
+            !outcome.all_passed(),
+            "ignored tests must not count as green: {outcome:?}"
+        );
+        assert_eq!(outcome.failing, vec!["ignored_case:NEVER_RAN".to_string()]);
     }
 
     /// Create a unique temp directory under `std::env::temp_dir()`. The

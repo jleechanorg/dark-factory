@@ -58,9 +58,17 @@ Operational rules:
    graph shape, specs, holdouts, and scoring contracts are the important assets.
 7. **Deprecate human interactive hat**: All coding LLM work must be shifted to the auto-factory. Humans only define intent (create GitHub issues/beads) and write comments on PRs for feedback. The auto-factory autonomously processes and drives branches to green without human-interactive coding sessions (exception: explicitly authorized factory infrastructure repair missions may diagnose and repair factory infrastructure in separate worktrees/branches, but product/pilot branches remain strictly autonomous).
 
-## /af — ZERO direct work; monitoring only (operator hard rule)
+## `/af` product runs — ZERO direct work; monitoring only
 
-During ordinary intake (or when an /af goal directs product work), the session
+When the requested object is to make `/af` work, that is a factory-infrastructure
+repair mission, not a product run through `/af`. The repair request authorizes
+normal scoped coding, testing, and deployment of factory infrastructure,
+including direct or delegated coding as needed. Keep intake quiesced, isolate
+the repair in its own worktree/branch, and do not count repair evidence as pilot
+evidence. This boundary does not authorize hand-driving selected product or
+pilot branches.
+
+During ordinary intake (or when an `/af` goal directs product work), the session
 does **ZERO direct work** — no product code, no factory code, no hand-fixes,
 no coding sub-agent lanes. The session's ONLY jobs:
 

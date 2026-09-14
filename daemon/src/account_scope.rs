@@ -17,6 +17,7 @@ pub const SCRUBBED_AUTH_VARS: &[&str] = &[
     "OPENAI_API_KEY",
     "CODEX_ACCESS_TOKEN",
     "CODEX_HOME",
+    "MINIMAX_API_KEY",
 ];
 
 /// Scrub all inherited AI provider authentication, configuration, and token variables
@@ -577,6 +578,79 @@ mod tests {
         }
         match prior_minimax {
             Some(v) => std::env::set_var("MINIMAX_API_KEY", v),
+            None => std::env::remove_var("MINIMAX_API_KEY"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn child_scope_env(command: &mut Command) -> String {
+        let output = command
+            .arg("-c")
+            .arg("printf '%s\\n' \"ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY-}\" \"ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN-}\" \"ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL-}\" \"ANTHROPIC_MODEL=${ANTHROPIC_MODEL-}\" \"CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR-}\" \"CODEX_HOME=${CODEX_HOME-}\" \"MINIMAX_API_KEY=${MINIMAX_API_KEY-}\"")
+            .output()
+            .expect("synthetic scope child must spawn");
+        assert!(output.status.success(), "synthetic scope child failed: {output:?}");
+        String::from_utf8(output.stdout).expect("synthetic scope child output must be UTF-8")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scoped_provider_environment_is_scrubbed_at_child_process_boundary() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = TempDir::new("child_scope");
+        let claude_dir = temp.path.join("claude");
+        let codex_dir = temp.path.join("codex");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::create_dir_all(&codex_dir).unwrap();
+
+        let prior_claude = std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR");
+        let prior_codex = std::env::var_os("CODEX_HOME");
+        let prior_minimax = std::env::var_os("MINIMAX_API_KEY");
+        std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_dir);
+        std::env::set_var("CODEX_HOME", &codex_dir);
+        std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_SENTINEL");
+
+        let mut claude = Command::new("sh");
+        for var in SCRUBBED_AUTH_VARS {
+            claude.env(var, "SYNTHETIC_AUTH_SENTINEL");
+        }
+        apply_claude_scope(&mut claude).unwrap();
+        let claude_env = child_scope_env(&mut claude);
+        assert!(claude_env.contains(&format!("CLAUDE_CONFIG_DIR={}", claude_dir.canonicalize().unwrap().display())), "Claude child env: {claude_env}");
+        assert!(claude_env.lines().filter(|line| line.ends_with("=SYNTHETIC_AUTH_SENTINEL")).count() == 0, "Claude child leaked scoped auth: {claude_env}");
+        assert!(claude_env.contains("MINIMAX_API_KEY=\n"), "Claude child inherited MiniMax auth: {claude_env}");
+
+        let mut codex = Command::new("sh");
+        for var in SCRUBBED_AUTH_VARS {
+            codex.env(var, "SYNTHETIC_AUTH_SENTINEL");
+        }
+        apply_codex_scope(&mut codex).unwrap();
+        let codex_env = child_scope_env(&mut codex);
+        assert!(codex_env.contains(&format!("CODEX_HOME={}", codex_dir.canonicalize().unwrap().display())), "Codex child env: {codex_env}");
+        assert!(codex_env.lines().filter(|line| line.ends_with("=SYNTHETIC_AUTH_SENTINEL")).count() == 0, "Codex child leaked scoped auth: {codex_env}");
+        assert!(codex_env.contains("MINIMAX_API_KEY=\n"), "Codex child inherited MiniMax auth: {codex_env}");
+
+        let mut minimax = Command::new("sh");
+        for var in SCRUBBED_AUTH_VARS {
+            minimax.env(var, "SYNTHETIC_AUTH_SENTINEL");
+        }
+        apply_minimax_scope(&mut minimax).unwrap();
+        let minimax_env = child_scope_env(&mut minimax);
+        assert!(minimax_env.contains("ANTHROPIC_API_KEY=SYNTHETIC_MINIMAX_SENTINEL\n"), "MiniMax child did not receive its synthetic key: {minimax_env}");
+        assert!(minimax_env.contains("ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic\n"));
+        assert!(minimax_env.contains("ANTHROPIC_MODEL=MiniMax-M3\n"));
+        assert!(minimax_env.contains("MINIMAX_API_KEY=\n"), "MiniMax child inherited provider-specific key: {minimax_env}");
+
+        match prior_claude {
+            Some(value) => std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR"),
+        }
+        match prior_codex {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        match prior_minimax {
+            Some(value) => std::env::set_var("MINIMAX_API_KEY", value),
             None => std::env::remove_var("MINIMAX_API_KEY"),
         }
     }

@@ -5,6 +5,17 @@ description: End-to-end auto-factory driver — picks up beads + GH issues tagge
 
 # /auto-factory — one end-to-end drive tick
 
+## Invocation boundary: repair versus running `/af`
+
+A request to make `/af` work is a factory-infrastructure repair request, not a
+product run through `/af`. It authorizes normal scoped coding, testing, and
+deployment of factory infrastructure, including
+direct or delegated coding when needed. Keep intake quiesced and isolate repair
+changes in their own worktree/branch; repair evidence does not count as pilot
+evidence. When the user invokes `/af` to process a product or pilot task, the
+repository's zero-direct-work rule applies: monitor the factory and use its bead to
+daemon to worker path, without hand-driving product or pilot branches.
+
 The auto-factory is the agent-orchestrator-style system that drives worldai PRs to merge. This skill is its orchestrator: it picks up work (beads + GH issues), dispatches coder subagents, runs verifier ticks, and iterates until gates pass.
 
 ## 0. Execution host + Bead authority preflight
