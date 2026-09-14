@@ -2801,6 +2801,26 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 }
                 continue;
             }
+            if failure.phase == "register_branch" && !failure.transient {
+                // dispatch::dispatch_ready durably parked this bead HUMAN_HELD before returning
+                // this collision; park-save failures use another phase or return without a report.
+                let reason = HumanHoldReason::BranchRegistrationConflict.value();
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": reason,
+                        "branch": failure.branch.as_deref(),
+                        "error": failure.error.as_str(),
+                    }),
+                )?;
+                continue;
+            }
 
             if failure.phase == "worktree_remote_mismatch" {
                 // jleechan-bqdv Stage C: mirrors the `unmapped_target_repo`
