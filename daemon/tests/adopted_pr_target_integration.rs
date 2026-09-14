@@ -332,6 +332,7 @@ sys.exit(1)
     let repo = "jleechanorg/worldarchitect.ai";
     let branch = "factory/adopted-pr-head";
     let cfg = Config {
+        task_bead_id: None,
         target_repo: repo.to_string(),
         ao_project: None,
         base_branch: "main".to_string(),

@@ -5958,24 +5958,40 @@ mod ao_spawn_contract_tests {
         std::fs::create_dir_all(&root).unwrap();
         let git = system_git();
         for args in [
-            vec!["init", "-q"],
+            vec!["init", "-q", "-b", "main"],
             vec!["-c", "user.email=test@example.invalid", "-c", "user.name=synthetic", "commit", "--allow-empty", "-m", "base"],
         ] {
-            assert!(std::process::Command::new(&git).args(&args).current_dir(&root).status().unwrap().success());
-        }
-        let sha = String::from_utf8(
-            std::process::Command::new(&git)
-                .args(["rev-parse", "HEAD"])
+            let status = std::process::Command::new(&git)
+                .args(&args)
                 .current_dir(&root)
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
-        assert!(super::resolve_go_source_ref(&root, "factory/new", "main", &sha).is_ok());
-        assert!(super::resolve_go_source_ref(&root, "factory/new", "main", "0".repeat(40).as_str()).is_err());
+                .status()
+                .unwrap();
+            assert!(status.success(), "fixture git command failed: {args:?}");
+        }
+        let rev_parse = std::process::Command::new(&git)
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            rev_parse.status.success(),
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&rev_parse.stderr)
+        );
+        let sha = String::from_utf8(rev_parse.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let resolved = super::resolve_go_source_ref(&root, "factory/new", "main", &sha);
+        assert!(
+            resolved.is_ok(),
+            "expected resolve_go_source_ref to accept valid revision pin, got: {resolved:?}"
+        );
+        let stale = super::resolve_go_source_ref(&root, "factory/new", "main", "0".repeat(40).as_str());
+        assert!(
+            stale.is_err(),
+            "expected resolve_go_source_ref to reject invalid revision pin, got: {stale:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

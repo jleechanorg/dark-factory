@@ -301,6 +301,15 @@ fn load_config(path: &Path) -> Result<Config, DaemonError> {
     config::load(path)
 }
 
+fn validate_task_scope(
+    store: &dyn StateStore,
+    cfg: &Config,
+    tracker: &dyn Tracker,
+    task_bead_id: &str,
+) -> Result<(), DaemonError> {
+    daemon::tick::validate_task_scope(store, cfg, tracker, task_bead_id)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TickLoopAction {
     Success {
@@ -556,7 +565,13 @@ fn verify_startup_pytest_capability(args: Args) {
 
 fn run(args: Args) -> Result<(), DaemonError> {
     let cfg_path = default_config_path();
-    let cfg = load_config(&cfg_path)?;
+    let mut cfg = load_config(&cfg_path)?;
+    let env_task_bead_id = std::env::var_os("DARK_FACTORY_TASK_BEAD_ID")
+        .map(|value| value.to_string_lossy().into_owned());
+    cfg.task_bead_id = config::resolve_task_bead_id(
+        cfg.task_bead_id.as_deref(),
+        env_task_bead_id.as_deref(),
+    )?;
     let (ao_project, default_agent) = ao_runtime_binding(&cfg)?;
     let configured_vendors = configured_vendor_list(&default_agent);
     // Fail before opening/reconciling state, advertising READY, or polling a
@@ -593,10 +608,40 @@ fn run(args: Args) -> Result<(), DaemonError> {
         Box::new(SqliteStateStore::open(&db_path)?)
     };
 
-    store.reconcile_dispatching()?;
+    if cfg.task_bead_id.is_some() {
+        let tracker: Box<dyn Tracker> = if args.dry_run {
+            #[cfg(any(test, debug_assertions))]
+            { Box::new(NoopAdapters) }
+            #[cfg(not(any(test, debug_assertions)))]
+            { return Err(DaemonError::Config("--dry-run is unavailable in this build".into())); }
+        } else {
+            Box::new(daemon::adapters::CliTracker)
+        };
+        validate_task_scope(store.as_ref(), &cfg, tracker.as_ref(), cfg.task_bead_id.as_deref().unwrap())?;
+    } else {
+        store.reconcile_dispatching()?;
+    }
 
-    let restored_session_projects = store.session_routing_bindings()?
-        .into_iter()
+    let task_scope = cfg.task_bead_id.as_deref();
+    let restored_session_projects = if let Some(task_bead_id) = task_scope {
+        let overlay = store.load(task_bead_id)?.ok_or_else(|| {
+            DaemonError::Config(format!("task_bead_id {task_bead_id:?} has no overlay row"))
+        })?;
+        match (overlay.session_id.clone(), overlay.branch.clone()) {
+            (Some(session_id), Some(branch)) => {
+                let project = overlay
+                    .session_ao_project
+                    .clone()
+                    .or_else(|| cfg.resolve_repo(overlay.repo(&cfg)).map(|r| r.ao_project))
+                    .ok_or_else(|| DaemonError::Config("scoped overlay has no AO project".into()))?;
+                vec![(Some(session_id), Some(branch), project)]
+            }
+            _ => Vec::new(),
+        }
+    } else {
+        store
+            .session_routing_bindings()?
+            .into_iter()
         .map(|binding| {
             let project = if let Some(project) = binding.ao_project {
                 project
@@ -609,7 +654,8 @@ fn run(args: Args) -> Result<(), DaemonError> {
             };
             Ok((binding.session_id, binding.branch, project))
         })
-        .collect::<Result<Vec<_>, DaemonError>>()?;
+        .collect::<Result<Vec<_>, DaemonError>>()?
+    };
 
     let (scm, tracker, sessions, llm, vcs): DaemonAdapters = if args.dry_run {
         #[cfg(any(test, debug_assertions))]
@@ -972,6 +1018,7 @@ mod tests {
     #[test]
     fn startup_binding_uses_canonical_legacy_worldarchitect_project_alias() {
         let cfg = Config {
+            task_bead_id: None,
             target_repo: "jleechanorg/worldarchitect.ai".to_string(),
             ao_project: None,
             base_branch: "main".to_string(),

@@ -787,6 +787,64 @@ pub(crate) fn should_skip_existing_pr_adoption_emit(
     )
 }
 
+/// Validate a configured task scope before any lifecycle side effect. Existing
+/// overlay identity and routing are always required; tracker admission is
+/// required only while a queued bead is about to be selected. Active/READY
+/// overlays remain monitorable after their tracker candidate is closed or
+/// unlabeled.
+pub fn validate_task_scope(
+    store: &dyn StateStore,
+    cfg: &Config,
+    tracker: &dyn Tracker,
+    task_bead_id: &str,
+) -> Result<(), DaemonError> {
+    crate::config::validate_task_bead_id(task_bead_id)?;
+    let overlay = store.load(task_bead_id)?.ok_or_else(|| {
+        DaemonError::Config(format!("task_bead_id {task_bead_id:?} has no overlay row"))
+    })?;
+    let repo = overlay.repo(cfg);
+    let routing = cfg.resolve_repo(repo).ok_or_else(|| {
+        DaemonError::Config(format!(
+            "task_bead_id {task_bead_id:?} targets unmapped repository {repo:?}"
+        ))
+    })?;
+    if let Some(project) = overlay.session_ao_project.as_deref() {
+        if project != routing.ao_project {
+            return Err(DaemonError::Config(format!(
+                "task_bead_id {task_bead_id:?} session AO project {project:?} conflicts with routed project {:?}",
+                routing.ao_project
+            )));
+        }
+    }
+    if overlay.pr_number.is_some() && overlay.branch.as_deref().unwrap_or("").is_empty() {
+        return Err(DaemonError::Config(format!(
+            "task_bead_id {task_bead_id:?} has a PR without a branch identity"
+        )));
+    }
+    if matches!(overlay.state, OverlayState::Queued | OverlayState::Redispatched) {
+        let present = tracker
+            .fetch_candidates()?
+            .into_iter()
+            .find(|bead| bead.id == task_bead_id);
+        let bead = present.ok_or_else(|| {
+            DaemonError::Config(format!(
+                "task_bead_id {task_bead_id:?} queued overlay is not an admitted tracker candidate"
+            ))
+        })?;
+        if let Some(target_repo) = intake::resolve_target_repo(
+            &bead.description,
+            bead.external_ref.as_deref(),
+        ) {
+            if target_repo != repo {
+                return Err(DaemonError::Config(format!(
+                    "task_bead_id {task_bead_id:?} tracker repository {target_repo:?} conflicts with overlay repository {repo:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn run_tick(
     deps: &TickDeps,
     tick_index: u64,
@@ -800,6 +858,10 @@ pub fn run_tick(
     }
 
     let mut summary = TickSummary::default();
+    let task_bead_id = deps.cfg.task_bead_id.as_deref();
+    if let Some(task_bead_id) = task_bead_id {
+        validate_task_scope(deps.store, deps.cfg, deps.tracker, task_bead_id)?;
+    }
 
     let slow_tier_due = {
         let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
@@ -810,7 +872,17 @@ pub fn run_tick(
     // every active row" into list + per-row bump so we can pause the autonomy
     // clock for ATTESTED rows whose PR has ci_pending=true (CI wait time is
     // operator/CI wall-clock, not coder session time we are budgeting against).
-    let active_overlays = deps.store.list_active_overlays()?;
+    let active_overlays = if let Some(task_bead_id) = task_bead_id {
+        deps.store
+            .load(task_bead_id)?
+            .into_iter()
+            .filter(|overlay| {
+                matches!(overlay.state, OverlayState::Dispatched | OverlayState::Attested)
+            })
+            .collect()
+    } else {
+        deps.store.list_active_overlays()?
+    };
     for mut overlay in active_overlays {
         if tick_index == 0 && overlay.state == OverlayState::Attested && overlay.session_id.is_none() {
             let _ = emit(
@@ -1483,14 +1555,14 @@ pub fn run_tick(
     // is never re-parked by it; placing recovery after the wedge loop is safe.
     // Recovery only fires when the slow tier is due (matches the shell
     // overlay's cadence — `recover-held` was never per-fast-tick).
-    if slow_tier_due {
+    if slow_tier_due && task_bead_id.is_none() {
         run_recovery_step(deps, &mut summary)?;
     }
 
     // rev-4ou1z: slow-tier cadence matches the hours-long Gemini quota
     // reset window — no need to poll for a wake-due session every fast
     // tick.
-    if slow_tier_due {
+    if slow_tier_due && task_bead_id.is_none() {
         run_quota_watchdog_wake(deps, &mut summary)?;
     }
 
@@ -1813,16 +1885,28 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // the rate-limit-aware variant. The cache is rewritten at the end of
     // every slow pass (see below) so a daemon restart doesn't re-probe
     // the entire factory-labeled PR set on its first tick.
-    let mut adoption_cache = intake::AdoptionProbeCache::load_or_default();
-    let slow_tick_now = now_epoch_secs();
-    let intake_outcome = intake::normalize_labeled_prs_outcome(
-        deps.scm,
-        deps.tracker,
-        deps.cfg,
-        &mut adoption_cache,
-        slow_tick_now,
-        deps.telemetry_log,
-    )?;
+    let task_bead_id = deps.cfg.task_bead_id.as_deref();
+    let mut adoption_cache = task_bead_id
+        .is_none()
+        .then(intake::AdoptionProbeCache::load_or_default);
+    let intake_outcome = if task_bead_id.is_some() {
+        intake::LabeledPrsIntakeOutcome {
+            adopted: Vec::new(),
+            outcomes: Vec::new(),
+            rate_limited: false,
+            metrics: intake::IntakeProbeMetrics::default(),
+        }
+    } else {
+        let slow_tick_now = now_epoch_secs();
+        intake::normalize_labeled_prs_outcome(
+            deps.scm,
+            deps.tracker,
+            deps.cfg,
+            adoption_cache.as_mut().expect("global intake cache"),
+            slow_tick_now,
+            deps.telemetry_log,
+        )?
+    };
     // jtg8-r4 acceptance #3: warn when per-tick gh call count exceeds the
     // slow-tier budget. The threshold (20) is generous — well below what
     // the 2026-07-22 incident burned per tick (~50+), so a hit means
@@ -2093,15 +2177,19 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         }
     }
 
-    let (created, issue_skip_outcomes) = match intake::normalize(deps.scm, deps.tracker, deps.cfg) {
-        Ok(outcome) => outcome,
-        Err(error) if error.is_gh_rate_limit() => {
-            eprintln!(
-                "auto-factory daemon: GitHub issue intake rate-limited; continuing with local bead routing and dispatch"
-            );
-            (Vec::new(), Vec::new())
+    let (created, issue_skip_outcomes) = if task_bead_id.is_some() {
+        (Vec::new(), Vec::new())
+    } else {
+        match intake::normalize(deps.scm, deps.tracker, deps.cfg) {
+            Ok(outcome) => outcome,
+            Err(error) if error.is_gh_rate_limit() => {
+                eprintln!(
+                    "auto-factory daemon: GitHub issue intake rate-limited; continuing with local bead routing and dispatch"
+                );
+                (Vec::new(), Vec::new())
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
     };
     // jleechan-eazj: same unconditional per-candidate guarantee as the PR
     // path above — every factory-labeled issue that did NOT result in a
@@ -2109,8 +2197,12 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     for outcome in &issue_skip_outcomes {
         emit_intake_outcome(deps.telemetry_log, outcome)?;
     }
-    let tracker_candidates = deps.tracker.fetch_candidates()?;
-    let dependency_ready_ids = deps.tracker.fetch_ready_ids()?;
+    let mut tracker_candidates = deps.tracker.fetch_candidates()?;
+    let mut dependency_ready_ids = deps.tracker.fetch_ready_ids()?;
+    if let Some(task_bead_id) = task_bead_id {
+        tracker_candidates.retain(|bead| bead.id == task_bead_id);
+        dependency_ready_ids.retain(|bead_id| bead_id == task_bead_id);
+    }
     let mut routing_candidates: Vec<Bead> = Vec::new();
     for bead_id in &created {
         let mut pr_number = None;
@@ -3457,10 +3549,12 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // factory-labeled PR set on its first tick. Best-effort: a failed
     // write logs but does not abort the tick (a missing cache file is
     // the same as a cold cache).
-    if let Err(e) = adoption_cache.persist() {
-        eprintln!(
-            "auto-factory daemon: WARNING failed to persist adoption-probe cache: {e}"
-        );
+    if let Some(adoption_cache) = adoption_cache {
+        if let Err(e) = adoption_cache.persist() {
+            eprintln!(
+                "auto-factory daemon: WARNING failed to persist adoption-probe cache: {e}"
+            );
+        }
     }
 
     Ok(())
@@ -5015,21 +5109,27 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // restart cycles immediately queue all ATTESTED beads for gate assessment
     // rather than waiting for next organic tick.
     let mut bead_ids: Vec<String> = Vec::new();
-    if let Ok(branches) = deps.store.owned_branches() {
+    if let Some(task_bead_id) = deps.cfg.task_bead_id.as_deref() {
+        if deps.store.load(task_bead_id)?.is_some() {
+            bead_ids.push(task_bead_id.to_string());
+        }
+    } else if let Ok(branches) = deps.store.owned_branches() {
         for branch in &branches {
             if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
                 bead_ids.push(bead_id);
             }
         }
     }
-    if let Ok(active_overlays) = deps.store.list_active_overlays() {
-        for overlay in active_overlays {
-            if let Some(ref branch) = overlay.branch {
-                if let Ok(None) = deps.store.bead_id_for_branch(branch) {
-                    let _ = deps.store.register_branch(&overlay.bead_id, branch);
+    if deps.cfg.task_bead_id.is_none() {
+        if let Ok(active_overlays) = deps.store.list_active_overlays() {
+            for overlay in active_overlays {
+                if let Some(ref branch) = overlay.branch {
+                    if let Ok(None) = deps.store.bead_id_for_branch(branch) {
+                        let _ = deps.store.register_branch(&overlay.bead_id, branch);
+                    }
                 }
+                bead_ids.push(overlay.bead_id);
             }
-            bead_ids.push(overlay.bead_id);
         }
     }
     bead_ids.sort();
