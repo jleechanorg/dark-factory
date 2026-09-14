@@ -1450,6 +1450,7 @@ sys.exit(1)
         ("DARK_FACTORY_AO_RECOVERY_POLL_MS", "10"),
         ("DARK_FACTORY_AO_RECOVERY_SUSTAIN_MS", "10"),
         ("DARK_FACTORY_AO_RECOVERY_COOLDOWN_MS", "0"),
+        ("MINIMAX_API_KEY", "test-synthetic-minimax-key-fixture"),
     ]);
 
     let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
@@ -1552,6 +1553,7 @@ sys.exit(1)
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
         ("DARK_FACTORY_CODER_FALLBACK_CHAIN", "minimax"),
+        ("MINIMAX_API_KEY", "test-synthetic-minimax-key-fixture"),
     ]);
 
     let repo = "jleechanorg/dark-factory";

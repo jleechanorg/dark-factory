@@ -34,6 +34,7 @@ pub enum AiProvider {
     Claude,
     MiniMax,
     Codex,
+    Antigravity,
 }
 
 /// Validate that `DARK_FACTORY_CLAUDE_CONFIG_DIR` is set to a non-blank,
@@ -164,12 +165,141 @@ pub fn apply_codex_scope(command: &mut Command) -> Result<(), DaemonError> {
     Ok(())
 }
 
+/// Validate that `DARK_FACTORY_AGY_HOME` is set to a non-blank, existing directory,
+/// inspects actual Antigravity settings if present, and returns its absolute canonicalized path.
+/// Fails closed before any child process can be spawned.
+pub fn validate_agy_home() -> Result<PathBuf, DaemonError> {
+    let raw = std::env::var("DARK_FACTORY_AGY_HOME").map_err(|_| {
+        DaemonError::Config(
+            "DARK_FACTORY_AGY_HOME is not set; direct Antigravity launch requires explicit profile home directory".to_string(),
+        )
+    })?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(DaemonError::Config(
+            "DARK_FACTORY_AGY_HOME is blank; direct Antigravity launch requires explicit profile home directory".to_string(),
+        ));
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.exists() {
+        return Err(DaemonError::Config(format!(
+            "DARK_FACTORY_AGY_HOME directory does not exist: {}",
+            path.display()
+        )));
+    }
+    let canonical = path.canonicalize().map_err(|e| {
+        DaemonError::Config(format!(
+            "failed to canonicalize DARK_FACTORY_AGY_HOME {}: {e}",
+            path.display()
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(DaemonError::Config(format!(
+            "DARK_FACTORY_AGY_HOME path is not a directory: {}",
+            canonical.display()
+        )));
+    }
+    validate_agy_settings(&canonical)?;
+    Ok(canonical)
+}
+
+/// Validate Antigravity configuration directory and settings file if present.
+/// The canonical location per official Antigravity CLI documentation is:
+/// `<HOME>/.gemini/antigravity-cli/settings.json`.
+/// Default authentication uses OS keyring / native OAuth and requires omitting `modelProvider`.
+/// API mode is supported ONLY when `settings.modelProvider` is the exact string `"gemini"`
+/// and `GEMINI_API_KEY` is nonblank.
+/// All unsupported explicit values, aliases, and malformed non-object settings fail closed.
+pub fn validate_agy_settings(home: &Path) -> Result<(), DaemonError> {
+    let settings_path = home.join(".gemini").join("antigravity-cli").join("settings.json");
+    if !settings_path.exists() {
+        return Ok(());
+    }
+    if !settings_path.is_file() {
+        return Err(DaemonError::Config(format!(
+            "Antigravity settings path is not a file: {}",
+            settings_path.display()
+        )));
+    }
+    let content = std::fs::read_to_string(&settings_path).map_err(|e| {
+        DaemonError::Config(format!(
+            "failed to read Antigravity settings at {}: {e}",
+            settings_path.display()
+        ))
+    })?;
+    let json: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        DaemonError::Config(format!(
+            "Antigravity settings at {} is not valid JSON: {e}",
+            settings_path.display()
+        ))
+    })?;
+    let obj = json.as_object().ok_or_else(|| {
+        DaemonError::Config(format!(
+            "Antigravity settings at {} must be a JSON object",
+            settings_path.display()
+        ))
+    })?;
+    if let Some(provider_val) = obj.get("modelProvider") {
+        match provider_val.as_str() {
+            Some("gemini") => {
+                let key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+                if key.trim().is_empty() {
+                    return Err(DaemonError::Config(
+                        "Antigravity settings specify modelProvider 'gemini' but GEMINI_API_KEY is not set or blank".to_string(),
+                    ));
+                }
+            }
+            Some(other) => {
+                return Err(DaemonError::Config(format!(
+                    "unsupported Antigravity modelProvider '{other}'; only exact 'gemini' is supported or the field must be omitted for default auth"
+                )));
+            }
+            None => {
+                return Err(DaemonError::Config(format!(
+                    "unsupported Antigravity modelProvider value '{provider_val}'; must be exact string 'gemini' or omitted"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply Antigravity scoping to a Command:
+/// 1. Validates `DARK_FACTORY_AGY_HOME` exists, is a directory, inspects settings, and canonicalizes it.
+/// 2. Validates optional `CODEX_HOME` and/or `DARK_FACTORY_CLAUDE_CONFIG_DIR` if present in environment.
+/// 3. Scrubs conflicting AI provider authentication.
+/// 4. Pins child `HOME` to the validated native AGY home directory.
+/// 5. Pins optional validated `CODEX_HOME` and/or `CLAUDE_CONFIG_DIR` if present.
+pub fn apply_agy_scope(command: &mut Command) -> Result<(), DaemonError> {
+    let agy_home = validate_agy_home()?;
+    let codex_home = if std::env::var_os("CODEX_HOME").is_some() {
+        Some(validate_codex_home()?)
+    } else {
+        None
+    };
+    let claude_dir = if std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR").is_some() {
+        Some(validate_claude_config_dir()?)
+    } else {
+        None
+    };
+    scrub_all_ai_provider_auth(command);
+    command.env("HOME", agy_home);
+    if let Some(dir) = codex_home {
+        command.env("CODEX_HOME", dir);
+    }
+    if let Some(dir) = claude_dir {
+        command.env("CLAUDE_CONFIG_DIR", dir);
+    }
+    Ok(())
+}
+
 /// Apply scoping for the given `AiProvider`.
 pub fn apply_provider_scope(provider: AiProvider, command: &mut Command) -> Result<(), DaemonError> {
     match provider {
         AiProvider::Claude => apply_claude_scope(command),
         AiProvider::MiniMax => apply_minimax_scope(command),
         AiProvider::Codex => apply_codex_scope(command),
+        AiProvider::Antigravity => apply_agy_scope(command),
     }
 }
 
@@ -215,6 +345,8 @@ pub fn detect_direct_cli_provider(cmd: &str, extra_env: &[(&str, &str)]) -> Opti
 
     if bin == "codex" {
         Some(AiProvider::Codex)
+    } else if bin == "agy" || bin == "antigravity" {
+        Some(AiProvider::Antigravity)
     } else if bin == "claude" || bin == "claude-sonnet" {
         // If extra_env explicitly indicates MiniMax, route through MiniMax scope
         if extra_env.iter().any(|(k, v)| {
@@ -245,7 +377,7 @@ pub fn apply_direct_cli_scope(
         .unwrap_or(cmd);
     if bin == "agy" || bin == "antigravity" {
         // Reuse the AO account boundary for direct AGY children.
-        validate_ao_worker_agent_scope("agy", command)
+        apply_agy_scope(command)
     } else if let Some(provider) = detect_direct_cli_provider(cmd, extra_env) {
         apply_provider_scope(provider, command)
     } else {
@@ -261,7 +393,7 @@ pub fn apply_direct_cli_scope(
 /// - `claude` / `claude-code` / `claude-sonnet`: applies direct Claude scoping
 /// - `codex`: applies direct Codex scoping
 /// - `minimax` / `claudem`: applies direct MiniMax scoping
-/// - `antigravity` / `agy`: requires `CODEX_HOME`, validates optional Claude scope, and scrubs auth
+/// - `antigravity` / `agy`: requires `DARK_FACTORY_AGY_HOME`, validates optional Codex/Claude scope, and scrubs auth
 /// - any other agent: scrubs all auth and returns `Err(DaemonError::Config(...))` so unknown agents fail closed.
 pub fn validate_ao_worker_agent_scope(
     agent: &str,
@@ -275,18 +407,7 @@ pub fn validate_ao_worker_agent_scope(
     } else if normalized == "minimax" || normalized == "claudem" {
         apply_minimax_scope(command)
     } else if normalized == "antigravity" || normalized == "agy" {
-        let home = validate_codex_home()?;
-        let claude_dir = if std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR").is_some() {
-            Some(validate_claude_config_dir()?)
-        } else {
-            None
-        };
-        scrub_all_ai_provider_auth(command);
-        command.env("CODEX_HOME", home);
-        if let Some(dir) = claude_dir {
-            command.env("CLAUDE_CONFIG_DIR", dir);
-        }
-        Ok(())
+        apply_agy_scope(command)
     } else {
         scrub_all_ai_provider_auth(command);
         Err(DaemonError::Config(format!(
@@ -492,6 +613,10 @@ mod tests {
         assert_eq!(detect_direct_cli_provider("codex", &[]), Some(AiProvider::Codex));
         assert_eq!(detect_direct_cli_provider("/opt/bin/codex", &[]), Some(AiProvider::Codex));
 
+        assert_eq!(detect_direct_cli_provider("agy", &[]), Some(AiProvider::Antigravity));
+        assert_eq!(detect_direct_cli_provider("/opt/bin/agy", &[]), Some(AiProvider::Antigravity));
+        assert_eq!(detect_direct_cli_provider("antigravity", &[]), Some(AiProvider::Antigravity));
+
         assert_eq!(detect_direct_cli_provider("claude", &[]), Some(AiProvider::Claude));
         assert_eq!(detect_direct_cli_provider("/home/user/.nvm/versions/node/v22.22.0/bin/claude", &[]), Some(AiProvider::Claude));
         assert_eq!(detect_direct_cli_provider("claude-sonnet", &[]), Some(AiProvider::Claude));
@@ -527,18 +652,132 @@ mod tests {
     }
 
     #[test]
+    fn test_agy_scope_validation() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::new(&["DARK_FACTORY_AGY_HOME", "GEMINI_API_KEY"]);
+
+        // Missing
+        std::env::remove_var("DARK_FACTORY_AGY_HOME");
+        assert!(validate_agy_home().is_err());
+
+        // Blank
+        std::env::set_var("DARK_FACTORY_AGY_HOME", "   ");
+        assert!(validate_agy_home().is_err());
+
+        // Non-existent
+        std::env::set_var("DARK_FACTORY_AGY_HOME", "/nonexistent/path/for/test/agy12345");
+        assert!(validate_agy_home().is_err());
+
+        // Path is a file, not directory
+        let temp = TempDir::new("agy_file_not_dir");
+        let file_path = temp.path.join("a_file");
+        std::fs::write(&file_path, "content").unwrap();
+        std::env::set_var("DARK_FACTORY_AGY_HOME", &file_path);
+        assert!(validate_agy_home().is_err());
+
+        // Valid directory without settings.json (default native OAuth mode)
+        let dir_path = temp.path.join("valid_agy_dir");
+        std::fs::create_dir_all(&dir_path).unwrap();
+        std::env::set_var("DARK_FACTORY_AGY_HOME", &dir_path);
+        let res = validate_agy_home();
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), dir_path.canonicalize().unwrap());
+
+        // Valid directory with settings.json omitting modelProvider (default native OAuth mode)
+        let settings_dir = dir_path.join(".gemini").join("antigravity-cli");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        let settings_file = settings_dir.join("settings.json");
+        std::fs::write(&settings_file, r#"{"theme":"dark"}"#).unwrap();
+        assert!(validate_agy_home().is_ok());
+        let mut cmd = Command::new("dummy");
+        assert!(apply_agy_scope(&mut cmd).is_ok());
+
+        // Valid directory with settings.json specifying gemini API mode without GEMINI_API_KEY fails before child construction
+        std::env::remove_var("GEMINI_API_KEY");
+        std::fs::write(&settings_file, r#"{"modelProvider":"gemini"}"#).unwrap();
+        assert!(validate_agy_home().is_err());
+        let mut cmd = Command::new("dummy");
+        assert!(apply_agy_scope(&mut cmd).is_err());
+
+        // Blank GEMINI_API_KEY also fails before child construction
+        std::env::set_var("GEMINI_API_KEY", "   ");
+        assert!(validate_agy_home().is_err());
+        let mut cmd = Command::new("dummy");
+        assert!(apply_agy_scope(&mut cmd).is_err());
+
+        // Valid directory with settings.json specifying exact string "gemini" with nonblank GEMINI_API_KEY succeeds
+        std::env::set_var("GEMINI_API_KEY", "test-synthetic-gemini-key");
+        assert!(validate_agy_home().is_ok());
+        let mut cmd = Command::new("dummy");
+        assert!(apply_agy_scope(&mut cmd).is_ok());
+
+        // Unsupported aliases and casing/whitespace variations fail before child construction
+        let unsupported_aliases = [
+            r#"{"modelProvider":"google"}"#,
+            r#"{"modelProvider":"native"}"#,
+            r#"{"modelProvider":"oauth"}"#,
+            r#"{"modelProvider":"Gemini"}"#,
+            r#"{"modelProvider":"GEMINI"}"#,
+            r#"{"modelProvider":" gemini "}"#,
+            "{\"modelProvider\":\"gemini\\n\"}",
+            r#"{"modelProvider":"openai"}"#,
+            r#"{"modelProvider":"unsupported_provider"}"#,
+        ];
+        for alias_json in unsupported_aliases {
+            std::fs::write(&settings_file, alias_json).unwrap();
+            assert!(
+                validate_agy_home().is_err(),
+                "Expected failure for unsupported alias: {alias_json}"
+            );
+            let mut cmd = Command::new("dummy");
+            assert!(
+                apply_agy_scope(&mut cmd).is_err(),
+                "apply_agy_scope must fail before child construction for: {alias_json}"
+            );
+        }
+
+        // Malformed settings, non-object JSON, and explicit unsupported types fail before child construction
+        let malformed_or_unsupported_types = [
+            "{not json}",
+            "[1, 2]",
+            "\"gemini\"",
+            "123",
+            "true",
+            r#"{"modelProvider":null}"#,
+            r#"{"modelProvider":123}"#,
+            r#"{"modelProvider":true}"#,
+            r#"{"modelProvider":["gemini"]}"#,
+            r#"{"modelProvider":{"name":"gemini"}}"#,
+        ];
+        for malformed in malformed_or_unsupported_types {
+            std::fs::write(&settings_file, malformed).unwrap();
+            assert!(
+                validate_agy_home().is_err(),
+                "Expected failure for malformed/unsupported settings: {malformed}"
+            );
+            let mut cmd = Command::new("dummy");
+            assert!(
+                apply_agy_scope(&mut cmd).is_err(),
+                "apply_agy_scope must fail before child construction for: {malformed}"
+            );
+        }
+    }
+
+    #[test]
     fn test_validate_ao_worker_agent_scope() {
         let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _restore = EnvRestore::new(&[
             "DARK_FACTORY_CLAUDE_CONFIG_DIR",
             "CODEX_HOME",
             "MINIMAX_API_KEY",
+            "DARK_FACTORY_AGY_HOME",
         ]);
 
         // Clean env
         std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR");
         std::env::remove_var("CODEX_HOME");
         std::env::remove_var("MINIMAX_API_KEY");
+        std::env::remove_var("DARK_FACTORY_AGY_HOME");
 
         let mut cmd = Command::new("dummy");
 
@@ -584,11 +823,20 @@ mod tests {
         assert!(envs.iter().any(|(k, v)| k.to_str() == Some("ANTHROPIC_MODEL") && v.map(|x| x.to_str().unwrap()) == Some("MiniMax-M3")));
         assert!(envs.iter().any(|(k, v)| k.to_str() == Some("ANTHROPIC_BASE_URL") && v.map(|x| x.to_str().unwrap()) == Some("https://api.minimax.io/anthropic")));
 
-        // 4. antigravity / agy scrubs auth and succeeds
+        // 4. antigravity / agy without DARK_FACTORY_AGY_HOME fails closed
+        let mut cmd = Command::new("dummy");
+        assert!(validate_ao_worker_agent_scope("antigravity", &mut cmd).is_err());
+        let mut cmd = Command::new("dummy");
+        assert!(validate_ao_worker_agent_scope("agy", &mut cmd).is_err());
+
+        // antigravity / agy with valid DARK_FACTORY_AGY_HOME succeeds and pins HOME
+        let temp_agy = TempDir::new("ao_worker_agy");
+        std::env::set_var("DARK_FACTORY_AGY_HOME", &temp_agy.path);
         let mut cmd = Command::new("dummy");
         cmd.env("ANTHROPIC_API_KEY", "dirty_key");
         assert!(validate_ao_worker_agent_scope("antigravity", &mut cmd).is_ok());
         let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.iter().any(|(k, v)| k.to_str() == Some("HOME") && v.is_some()));
         assert!(envs.iter().any(|(k, v)| k.to_str() == Some("ANTHROPIC_API_KEY") && v.is_none()));
 
         let mut cmd = Command::new("dummy");
@@ -602,29 +850,38 @@ mod tests {
         assert!(format!("{}", err.unwrap_err()).contains("Unsupported AO worker agent"));
         let envs: Vec<_> = cmd.get_envs().collect();
         assert!(envs.iter().any(|(k, v)| k.to_str() == Some("OPENAI_API_KEY") && v.is_none()));
-
     }
 
     #[test]
     fn direct_agy_rejects_missing_invalid_and_conflicting_scope() {
         let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let _restore = EnvRestore::new(&["CODEX_HOME", "DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
+        let _restore = EnvRestore::new(&[
+            "DARK_FACTORY_AGY_HOME",
+            "CODEX_HOME",
+            "DARK_FACTORY_CLAUDE_CONFIG_DIR",
+        ]);
+        std::env::remove_var("DARK_FACTORY_AGY_HOME");
         std::env::remove_var("CODEX_HOME");
         std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR");
         assert!(apply_direct_cli_scope("agy", &[], &mut Command::new("sh")).is_err());
         let temp = TempDir::new("agy_invalid_scope");
-        std::env::set_var("CODEX_HOME", temp.path.join("missing"));
+        std::env::set_var("DARK_FACTORY_AGY_HOME", temp.path.join("missing"));
         assert!(apply_direct_cli_scope("/synthetic/bin/agy", &[], &mut Command::new("sh")).is_err());
-        std::env::set_var("CODEX_HOME", &temp.path);
-        std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", temp.path.join("missing"));
+        std::env::set_var("DARK_FACTORY_AGY_HOME", &temp.path);
+        std::env::set_var("CODEX_HOME", temp.path.join("missing_codex"));
         assert!(apply_direct_cli_scope("agy", &[], &mut Command::new("sh")).is_err());
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", temp.path.join("missing_claude"));
+        assert!(apply_direct_cli_scope("agy", &[], &mut Command::new("sh")).is_err());
+        std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR");
+        assert!(apply_direct_cli_scope("agy", &[], &mut Command::new("sh")).is_ok());
     }
 
     #[cfg(unix)]
     fn child_scope_env(command: &mut Command) -> String {
         let output = command
             .arg("-c")
-            .arg("printf '%s\\n' \"ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY-}\" \"ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN-}\" \"ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL-}\" \"ANTHROPIC_MODEL=${ANTHROPIC_MODEL-}\" \"CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR-}\" \"CODEX_HOME=${CODEX_HOME-}\" \"MINIMAX_API_KEY=${MINIMAX_API_KEY-}\"")
+            .arg("printf '%s\\n' \"ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY-}\" \"ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN-}\" \"ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL-}\" \"ANTHROPIC_MODEL=${ANTHROPIC_MODEL-}\" \"CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR-}\" \"CODEX_HOME=${CODEX_HOME-}\" \"HOME=${HOME-}\" \"MINIMAX_API_KEY=${MINIMAX_API_KEY-}\"")
             .output()
             .expect("synthetic scope child must spawn");
         assert!(output.status.success(), "synthetic scope child failed: {output:?}");
@@ -638,15 +895,19 @@ mod tests {
         let temp = TempDir::new("child_scope");
         let claude_dir = temp.path.join("claude");
         let codex_dir = temp.path.join("codex");
+        let agy_dir = temp.path.join("agy");
         std::fs::create_dir_all(&claude_dir).unwrap();
         std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::create_dir_all(&agy_dir).unwrap();
 
         let prior_claude = std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR");
         let prior_codex = std::env::var_os("CODEX_HOME");
         let prior_minimax = std::env::var_os("MINIMAX_API_KEY");
+        let prior_agy = std::env::var_os("DARK_FACTORY_AGY_HOME");
         std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_dir);
         std::env::set_var("CODEX_HOME", &codex_dir);
         std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_SENTINEL");
+        std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_dir);
 
         let mut claude = Command::new("sh");
         for var in SCRUBBED_AUTH_VARS {
@@ -680,7 +941,7 @@ mod tests {
         assert!(minimax_env.contains("MINIMAX_API_KEY=\n"), "MiniMax child inherited provider-specific key: {minimax_env}");
 
         // AGY is commonly launched through a path-qualified executable name;
-        // prove that the direct-dispatch path still scrubs inherited auth.
+        // prove that the direct-dispatch path still scrubs inherited auth and sets HOME.
         let mut agy = Command::new("sh");
         for var in SCRUBBED_AUTH_VARS {
             agy.env(var, "SYNTHETIC_AUTH_SENTINEL");
@@ -689,6 +950,7 @@ mod tests {
         let agy_env = child_scope_env(&mut agy);
         assert!(agy_env.lines().all(|line| !line.ends_with("=SYNTHETIC_AUTH_SENTINEL")), "AGY child leaked scoped auth: {agy_env}");
         assert!(agy_env.contains("MINIMAX_API_KEY=\n"), "AGY child inherited MiniMax auth: {agy_env}");
+        assert!(agy_env.contains(&format!("HOME={}\n", agy_dir.canonicalize().unwrap().display())), "AGY child did not receive HOME: {agy_env}");
 
         match prior_claude {
             Some(value) => std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", value),
@@ -701,6 +963,10 @@ mod tests {
         match prior_minimax {
             Some(value) => std::env::set_var("MINIMAX_API_KEY", value),
             None => std::env::remove_var("MINIMAX_API_KEY"),
+        }
+        match prior_agy {
+            Some(value) => std::env::set_var("DARK_FACTORY_AGY_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_AGY_HOME"),
         }
     }
 }

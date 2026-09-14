@@ -3536,7 +3536,8 @@ fn run_go_scope_query(
     label: &str,
 ) -> Result<String, DaemonError> {
     let provider = match agent.trim().to_ascii_lowercase().as_str() {
-        "agy" | "antigravity" | "codex" => crate::account_scope::AiProvider::Codex,
+        "agy" | "antigravity" => crate::account_scope::AiProvider::Antigravity,
+        "codex" => crate::account_scope::AiProvider::Codex,
         "claude" | "claude-code" => crate::account_scope::AiProvider::Claude,
         _ => {
             return Err(DaemonError::Config(
@@ -3587,6 +3588,54 @@ fn validate_go_server_scope(
     })
 }
 
+#[derive(Debug, Clone)]
+struct ValidatedGoServerBinding {
+    run_file: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
+    port: u16,
+    pid: u32,
+    server_scope: GoAoScope,
+}
+
+fn validate_go_server_binding() -> Result<ValidatedGoServerBinding, DaemonError> {
+    if !cfg!(target_os = "linux") {
+        return Err(DaemonError::Config(
+            "Go AO production dispatch is supported only on Linux".to_string(),
+        ));
+    }
+    let (run_file, data_dir, port) = required_go_scope()?;
+    let runfile_bytes = std::fs::read(&run_file).map_err(|_| {
+        DaemonError::Config("AO_RUN_FILE could not be read for Go AO scope preflight".to_string())
+    })?;
+    let runfile: serde_json::Value = serde_json::from_slice(&runfile_bytes)
+        .map_err(|_| DaemonError::Parse("AO_RUN_FILE was not valid JSON".to_string()))?;
+    let pid = runfile
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|pid| *pid <= u64::from(u32::MAX))
+        .map(|pid| pid as u32)
+        .ok_or_else(|| DaemonError::Parse("AO_RUN_FILE has no valid PID".to_string()))?;
+    let runfile_port = runfile
+        .get("port")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|p| *p <= u64::from(u16::MAX))
+        .map(|p| p as u16)
+        .ok_or_else(|| DaemonError::Parse("AO_RUN_FILE has no valid port".to_string()))?;
+    if runfile_port != port {
+        return Err(DaemonError::Config(
+            "AO_RUN_FILE port does not match AO_PORT".to_string(),
+        ));
+    }
+    let server_scope = validate_go_server_scope(&run_file, &data_dir, port, pid)?;
+    Ok(ValidatedGoServerBinding {
+        run_file,
+        data_dir,
+        port,
+        pid,
+        server_scope,
+    })
+}
+
 fn nonempty_provider_conflict(env: &HashMap<String, String>, allowed: &[&str]) -> Option<&'static str> {
     crate::account_scope::SCRUBBED_AUTH_VARS
         .iter()
@@ -3606,7 +3655,8 @@ fn validate_go_provider_scope(
     }
     let normalized = agent.trim().to_ascii_lowercase();
     let allowed: &[&str] = match normalized.as_str() {
-        "agy" | "antigravity" | "codex" => &["CODEX_HOME"],
+        "agy" | "antigravity" => &["HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"],
+        "codex" => &["CODEX_HOME"],
         "claude" | "claude-code" => &["CLAUDE_CONFIG_DIR"],
         _ => {
             return Err(DaemonError::Config(
@@ -3623,6 +3673,101 @@ fn validate_go_provider_scope(
         return Err(DaemonError::Config(format!(
             "Go AO provider scope contains conflicting nonempty variable {key}"
         )));
+    }
+    if normalized == "agy" || normalized == "antigravity" {
+        let value = effective
+            .get("HOME")
+            .map(|value| value.trim())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| DaemonError::Config("Go AO provider scope is missing HOME".to_string()))?;
+        let path = std::path::Path::new(value);
+        if !path.is_absolute() || !path.is_dir() {
+            return Err(DaemonError::Config(
+                "Go AO provider scope HOME must be an existing absolute directory".to_string(),
+            ));
+        }
+        let server_value = server_env
+            .get("HOME")
+            .map(|value| value.trim())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| DaemonError::Config("Go AO server scope is missing HOME".to_string()))?;
+        if server_value != value {
+            return Err(DaemonError::Config(
+                "Go AO project provider scope HOME does not match server scope".to_string(),
+            ));
+        }
+        let intended = crate::account_scope::validate_agy_home().map_err(|_| {
+            DaemonError::Config(
+                "intended DARK_FACTORY_AGY_HOME profile is missing or invalid".to_string(),
+            )
+        })?;
+        if std::path::Path::new(value).canonicalize().ok().as_deref() != Some(intended.as_path()) {
+            return Err(DaemonError::Config(
+                "Go AO provider scope HOME does not match intended daemon profile".to_string(),
+            ));
+        }
+        if let Some(codex_val) = effective
+            .get("CODEX_HOME")
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        {
+            let server_codex = server_env
+                .get("CODEX_HOME")
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty());
+            if server_codex != Some(codex_val) {
+                return Err(DaemonError::Config(
+                    "Go AO project provider scope CODEX_HOME does not match server scope".to_string(),
+                ));
+            }
+            if std::env::var_os("CODEX_HOME").is_some() {
+                let intended_codex = crate::account_scope::validate_codex_home().map_err(|_| {
+                    DaemonError::Config("intended CODEX_HOME profile is missing or invalid".to_string())
+                })?;
+                if std::path::Path::new(codex_val).canonicalize().ok().as_deref()
+                    != Some(intended_codex.as_path())
+                {
+                    return Err(DaemonError::Config(
+                        "Go AO provider scope CODEX_HOME does not match intended daemon profile"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        if let Some(claude_val) = effective
+            .get("CLAUDE_CONFIG_DIR")
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        {
+            let server_claude = server_env
+                .get("CLAUDE_CONFIG_DIR")
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty());
+            if server_claude != Some(claude_val) {
+                return Err(DaemonError::Config(
+                    "Go AO project provider scope CLAUDE_CONFIG_DIR does not match server scope"
+                        .to_string(),
+                ));
+            }
+            if std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR").is_some() {
+                let intended_claude =
+                    crate::account_scope::validate_claude_config_dir().map_err(|_| {
+                        DaemonError::Config(
+                            "intended DARK_FACTORY_CLAUDE_CONFIG_DIR profile is missing or invalid"
+                                .to_string(),
+                        )
+                    })?;
+                if std::path::Path::new(claude_val).canonicalize().ok().as_deref()
+                    != Some(intended_claude.as_path())
+                {
+                    return Err(DaemonError::Config(
+                        "Go AO provider scope CLAUDE_CONFIG_DIR does not match intended daemon profile"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        return Ok(());
     }
     let required = if allowed == ["CODEX_HOME"] {
         "CODEX_HOME"
@@ -3717,35 +3862,25 @@ fn resolve_go_source_ref(
 }
 
 fn validate_go_ao_preflight(agent: &str, spec: &SpawnSpec) -> Result<(), DaemonError> {
-    if !cfg!(target_os = "linux") {
-        return Err(DaemonError::Config(
-            "Go AO production dispatch is supported only on Linux".to_string(),
-        ));
-    }
-    let scope_values = required_go_scope()?;
-    let runfile: serde_json::Value = serde_json::from_slice(&std::fs::read(&scope_values.0).map_err(|_| {
-        DaemonError::Config("AO_RUN_FILE could not be read for Go AO scope preflight".to_string())
-    })?).map_err(|_| DaemonError::Parse("AO_RUN_FILE was not valid JSON".to_string()))?;
-    let pid = runfile.get("pid").and_then(serde_json::Value::as_u64).filter(|pid| *pid <= u64::from(u32::MAX)).map(|pid| pid as u32).ok_or_else(|| DaemonError::Parse("AO_RUN_FILE has no valid PID".to_string()))?;
-    let runfile_port = runfile.get("port").and_then(serde_json::Value::as_u64).filter(|port| *port <= u64::from(u16::MAX)).map(|port| port as u16).ok_or_else(|| DaemonError::Parse("AO_RUN_FILE has no valid port".to_string()))?;
-    if runfile_port != scope_values.2 {
-        return Err(DaemonError::Config("AO_RUN_FILE port does not match AO_PORT".to_string()));
-    }
-    let server_scope = validate_go_server_scope(&scope_values.0, &scope_values.1, scope_values.2, pid)?;
+    let binding = validate_go_server_binding()?;
 
-    let env = go_scope_env(&scope_values);
-    let refs: Vec<(&str, &str)> = env.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
+    let env = [
+        ("AO_RUN_FILE", binding.run_file.display().to_string()),
+        ("AO_DATA_DIR", binding.data_dir.display().to_string()),
+        ("AO_PORT", binding.port.to_string()),
+    ];
+    let refs: Vec<(&str, &str)> = env.iter().map(|(key, value)| (*key, value.as_str())).collect();
     let status_output = run_go_scope_query(agent, &["status", "--json"], &refs, "status")?;
     let status: serde_json::Value = serde_json::from_str(status_output.trim()).map_err(|_| DaemonError::Parse("ao-go status returned malformed JSON".to_string()))?;
     if status.get("state").and_then(serde_json::Value::as_str) != Some("ready")
-        || status.get("pid").and_then(serde_json::Value::as_u64) != Some(pid as u64)
-        || status.get("port").and_then(serde_json::Value::as_u64) != Some(scope_values.2 as u64)
-        || status.get("runFile").and_then(serde_json::Value::as_str) != Some(scope_values.0.to_str().unwrap_or_default())
-        || status.get("dataDir").and_then(serde_json::Value::as_str) != Some(scope_values.1.to_str().unwrap_or_default())
+        || status.get("pid").and_then(serde_json::Value::as_u64) != Some(binding.pid as u64)
+        || status.get("port").and_then(serde_json::Value::as_u64) != Some(binding.port as u64)
+        || status.get("runFile").and_then(serde_json::Value::as_str) != Some(binding.run_file.to_str().unwrap_or_default())
+        || status.get("dataDir").and_then(serde_json::Value::as_str) != Some(binding.data_dir.to_str().unwrap_or_default())
     {
         return Err(DaemonError::Config("ao-go status did not prove the intended server scope".to_string()));
     }
-    if process_start_ticks(pid) != Some(server_scope.server_start_ticks) {
+    if process_start_ticks(binding.pid) != Some(binding.server_scope.server_start_ticks) {
         return Err(DaemonError::Config("AO server identity changed during status preflight".to_string()));
     }
 
@@ -3799,15 +3934,15 @@ fn validate_go_ao_preflight(agent: &str, spec: &SpawnSpec) -> Result<(), DaemonE
             }
         }
     };
-    let server_env = process_environ(pid)?;
+    let server_env = process_environ(binding.pid)?;
     validate_go_provider_scope(agent, &server_env, &project_env)?;
     resolve_go_source_ref(&source, &spec.branch, default_branch, spec.expected_revision.as_deref().ok_or_else(|| DaemonError::Config("Go AO spawn requires an expected revision".to_string()))?)?;
-    if process_start_ticks(pid) != Some(server_scope.server_start_ticks) {
+    if process_start_ticks(binding.pid) != Some(binding.server_scope.server_start_ticks) {
         return Err(DaemonError::Config(
             "AO server identity changed during scope preflight".to_string(),
         ));
     }
-    verify_go_server_listener(pid, scope_values.2)?;
+    verify_go_server_listener(binding.pid, binding.port)?;
     Ok(())
 }
 
@@ -4706,12 +4841,14 @@ pub fn verify_ao_bridge_compatibility(
     configured_vendors: &[String],
 ) -> Result<(), DaemonError> {
     if std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go") {
-        // Upstream Go AO `status` reports daemon health via healthz/readyz and
-        // exposes only `--json`; project scoping belongs to session commands.
+        let binding = validate_go_server_binding()?;
         let mut command = Command::new("ao-go");
         command
             .arg("status")
             .arg("--json")
+            .env("AO_RUN_FILE", &binding.run_file)
+            .env("AO_DATA_DIR", &binding.data_dir)
+            .env("AO_PORT", binding.port.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -4735,12 +4872,26 @@ pub fn verify_ao_bridge_compatibility(
         let is_healthy = status.get("health").and_then(|v| v.as_str()) == Some("ok")
             || status.get("state").and_then(|v| v.as_str()) == Some("ready")
             || status.get("ready").and_then(|v| v.as_str()) == Some("ready");
-        if is_healthy {
-            return Ok(());
+        if !is_healthy {
+            return Err(DaemonError::Config(format!(
+                "ao-go status reported unhealthy: {stdout}"
+            )));
         }
-        return Err(DaemonError::Config(format!(
-            "ao-go status reported unhealthy: {stdout}"
-        )));
+        if status.get("pid").and_then(serde_json::Value::as_u64) != Some(binding.pid as u64)
+            || status.get("port").and_then(serde_json::Value::as_u64) != Some(binding.port as u64)
+            || status.get("runFile").and_then(serde_json::Value::as_str) != Some(binding.run_file.to_str().unwrap_or_default())
+            || status.get("dataDir").and_then(serde_json::Value::as_str) != Some(binding.data_dir.to_str().unwrap_or_default())
+        {
+            return Err(DaemonError::Config(
+                "ao-go status did not prove the intended server scope".to_string(),
+            ));
+        }
+        if process_start_ticks(binding.pid) != Some(binding.server_scope.server_start_ticks) {
+            return Err(DaemonError::Config(
+                "AO server identity changed during status compatibility probe".to_string(),
+            ));
+        }
+        return Ok(());
     }
     let spec = SpawnSpec {
         bead_id: "daemon-startup-diagnostic".to_string(),
@@ -5106,7 +5257,34 @@ impl CliSessions {
 
     fn kill_in_project(project: &str, id: &SessionId) -> Result<(), DaemonError> {
         if std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go") {
-            run_tool("ao-go", &["session", "kill", &id.0, "-p", project], 30)?;
+            let binding = validate_go_server_binding()?;
+            let mut command = Command::new("ao-go");
+            command
+                .args(["session", "kill", &id.0, "-p", project])
+                .env("AO_RUN_FILE", &binding.run_file)
+                .env("AO_DATA_DIR", &binding.data_dir)
+                .env("AO_PORT", binding.port.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let output = command.output().map_err(|error| DaemonError::Tool {
+                tool: format!("ao-go session kill {}", id.0),
+                rc: -1,
+                stderr: format!("execution failed: {error}"),
+            })?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                return Err(DaemonError::Tool {
+                    tool: format!("ao-go session kill {}", id.0),
+                    rc: output.status.code().unwrap_or(-1),
+                    stderr,
+                });
+            }
+            if process_start_ticks(binding.pid) != Some(binding.server_scope.server_start_ticks) {
+                return Err(DaemonError::Config(
+                    "AO server identity changed during session kill".to_string(),
+                ));
+            }
         } else {
             run_tool("ao", &["session", "kill", &id.0, "-p", project], 30)?;
         }
@@ -5197,13 +5375,25 @@ impl CliSessions {
                         }),
                     };
                 }
-                return Err(spawn_error);
+                return Err(DaemonError::SessionAmbiguous {
+                    branch: spec.branch.clone(),
+                    sessions: vec![format!(
+                        "ao-go spawn failed with rc={:?} but produced no session id: stdout={out}, stderr={err_msg}",
+                        output.status.code()
+                    )],
+                });
             }
-            let session_id = session_id.ok_or_else(|| {
-                DaemonError::Parse(format!(
-                    "ao-go spawn produced no 'spawned session ' line: stdout={out}, stderr={err_msg}"
-                ))
-            })?;
+            let session_id = match session_id {
+                Some(id) => id,
+                None => {
+                    return Err(DaemonError::SessionAmbiguous {
+                        branch: spec.branch.clone(),
+                        sessions: vec![format!(
+                            "ao-go spawn exited 0 but produced no 'spawned session ' line: stdout={out}, stderr={err_msg}"
+                        )],
+                    });
+                }
+            };
             let session = SessionId(session_id);
             let (mut ws, metadata_branch) = go_ao_session_workspace_and_branch(&session.0);
             if ws.is_none() {
@@ -5532,7 +5722,10 @@ where
     for agent in agents {
         match attempt_spawn(agent) {
             Ok(sess) => return Ok(sess),
-            Err(error @ DaemonError::SpawnCleanupFailed { .. }) => return Err(error),
+            Err(
+                error @ (DaemonError::SpawnCleanupFailed { .. }
+                | DaemonError::SessionAmbiguous { .. }),
+            ) => return Err(error),
             Err(e) => {
                 attempts.push((agent.clone(), e));
             }
@@ -5561,6 +5754,10 @@ mod spawn_fallback_tests {
     // argv-shape behavior.
     #[test]
     fn runtime_fallback_chain_never_emits_legacy_alias_after_agy_rename() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        std::env::remove_var("DARK_FACTORY_AO_ENGINE");
+
         // Default `agy` (legacy alias) plus a fallback chain that names
         // both `agy` and `antigravity`. After canonicalization + dedup the
         // chain must contain ONLY canonical plugin names; no literal
@@ -5580,10 +5777,18 @@ mod spawn_fallback_tests {
             chain,
             vec!["antigravity".to_string(), "minimax".to_string()]
         );
+        match prior {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
     }
 
     #[test]
     fn runtime_fallback_chain_preserves_passthrough_when_no_alias_matches() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        std::env::remove_var("DARK_FACTORY_AO_ENGINE");
+
         let chain = build_runtime_fallback_chain(
             "minimax",
             "claude-code->antigravity->agy",
@@ -5596,6 +5801,10 @@ mod spawn_fallback_tests {
                 "antigravity".to_string(),
             ]
         );
+        match prior {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
     }
 
     /// jleechan-r56m red proof: simulate all 3 vendors in a fallback chain
@@ -5674,6 +5883,59 @@ mod spawn_fallback_tests {
         .expect("fallback to minimax must succeed when claude-code fails auth");
 
         assert_eq!(session, SessionId("wa-minimax-success".to_string()));
+    }
+
+    #[test]
+    fn session_ambiguous_halts_fallback_immediately() {
+        let agents = vec![
+            "antigravity".to_string(),
+            "minimax".to_string(),
+            "claude-code".to_string(),
+        ];
+        let mut attempts = Vec::new();
+
+        let err = fallback_spawn(&agents, |agent| {
+            attempts.push(agent.to_string());
+            Err(DaemonError::SessionAmbiguous {
+                branch: "factory/feature-1".to_string(),
+                sessions: vec!["unparseable output".to_string()],
+            })
+        })
+        .expect_err("SessionAmbiguous must halt fallback");
+
+        assert!(matches!(err, DaemonError::SessionAmbiguous { .. }));
+        assert_eq!(attempts, vec!["antigravity".to_string()], "fallback must not attempt next vendor");
+    }
+
+    #[test]
+    fn spawn_cleanup_failed_halts_fallback_immediately() {
+        let agents = vec![
+            "antigravity".to_string(),
+            "minimax".to_string(),
+            "claude-code".to_string(),
+        ];
+        let mut attempts = Vec::new();
+
+        let err = fallback_spawn(&agents, |agent| {
+            attempts.push(agent.to_string());
+            Err(DaemonError::SpawnCleanupFailed {
+                session: "known-id".to_string(),
+                spawn_error: Box::new(DaemonError::Tool {
+                    tool: "ao-go spawn".to_string(),
+                    rc: 1,
+                    stderr: "spawn failed".to_string(),
+                }),
+                cleanup_error: Box::new(DaemonError::Tool {
+                    tool: "ao-go session kill".to_string(),
+                    rc: 1,
+                    stderr: "kill failed".to_string(),
+                }),
+            })
+        })
+        .expect_err("SpawnCleanupFailed must halt fallback");
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        assert_eq!(attempts, vec!["antigravity".to_string()], "fallback must not attempt next vendor");
     }
 }
 
@@ -5845,6 +6107,7 @@ mod ao_spawn_contract_tests {
                 "FAKE_GIT_REAL_BIN",
                 "MINIMAX_API_KEY",
                 "DARK_FACTORY_CODER_FALLBACK_CHAIN",
+                "DARK_FACTORY_AO_ENGINE",
             ];
             let saved: Vec<(&'static str, Option<std::ffi::OsString>)> = KEYS
                 .iter()
@@ -5857,6 +6120,7 @@ mod ao_spawn_contract_tests {
             std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", bindings.to_string());
             std::env::set_var("AO_FAKE_LOG", log);
             std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
+            std::env::remove_var("DARK_FACTORY_AO_ENGINE");
             Self {
                 saved,
                 cleanup_dir: dir.to_path_buf(),
@@ -5876,10 +6140,12 @@ mod ao_spawn_contract_tests {
             const KEYS: &[&str] = &[
                 "DARK_FACTORY_CLAUDE_CONFIG_DIR",
                 "CODEX_HOME",
+                "DARK_FACTORY_AGY_HOME",
                 "MINIMAX_API_KEY",
                 "OPENAI_API_KEY",
                 "ANTHROPIC_API_KEY",
                 "DARK_FACTORY_CODER_FALLBACK_CHAIN",
+                "DARK_FACTORY_AO_ENGINE",
             ];
             let saved: Vec<(&'static str, Option<std::ffi::OsString>)> = KEYS
                 .iter()
@@ -5887,11 +6153,15 @@ mod ao_spawn_contract_tests {
                 .collect();
             let claude_dir = root.join("synthetic-claude-config");
             let codex_home = root.join("synthetic-codex-home");
+            let agy_home = root.join("synthetic-agy-home");
             std::fs::create_dir_all(&claude_dir).unwrap();
             std::fs::create_dir_all(&codex_home).unwrap();
+            std::fs::create_dir_all(&agy_home).unwrap();
             std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", claude_dir);
             std::env::set_var("CODEX_HOME", codex_home);
+            std::env::set_var("DARK_FACTORY_AGY_HOME", agy_home);
             std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
+            std::env::remove_var("DARK_FACTORY_AO_ENGINE");
             Self { saved }
         }
     }
@@ -6041,14 +6311,21 @@ mod ao_spawn_contract_tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _scope = SyntheticAccountScopeEnv::install(&root);
-        let intended = root.join("synthetic-codex-home");
+        let intended_codex = root.join("synthetic-codex-home");
+        let intended_agy = root.join("synthetic-agy-home");
         let mut server = HashMap::new();
-        server.insert("CODEX_HOME".to_string(), intended.display().to_string());
+        server.insert("HOME".to_string(), intended_agy.display().to_string());
+        server.insert("CODEX_HOME".to_string(), intended_codex.display().to_string());
         assert!(super::validate_go_provider_scope("agy", &server, &HashMap::new()).is_ok());
         server.insert("MINIMAX_API_KEY".to_string(), "SYNTHETIC_SERVER_KEY".to_string());
         let project = HashMap::from([("MINIMAX_API_KEY".to_string(), String::new())]);
         assert!(super::validate_go_provider_scope("agy", &server, &project).is_err());
         server.remove("MINIMAX_API_KEY");
+        let wrong_agy = root.join("wrong-agy-home");
+        std::fs::create_dir_all(&wrong_agy).unwrap();
+        server.insert("HOME".to_string(), wrong_agy.display().to_string());
+        assert!(super::validate_go_provider_scope("agy", &server, &HashMap::new()).is_err());
+        server.insert("HOME".to_string(), intended_agy.display().to_string());
         let wrong = root.join("wrong-codex-home");
         std::fs::create_dir_all(&wrong).unwrap();
         server.insert("CODEX_HOME".to_string(), wrong.display().to_string());
@@ -12384,6 +12661,7 @@ mod chain_llm_fallback_argv_tests {
                 "HOME",
                 "DARK_FACTORY_CLAUDE_CONFIG_DIR",
                 "CODEX_HOME",
+                "DARK_FACTORY_AGY_HOME",
                 "MINIMAX_API_KEY",
                 "OPENAI_API_KEY",
                 "ANTHROPIC_API_KEY",
@@ -12394,8 +12672,10 @@ mod chain_llm_fallback_argv_tests {
                 .collect();
             let claude_dir = dir.join("synthetic-claude-config");
             let codex_home = dir.join("synthetic-codex-home");
+            let agy_home = dir.join("synthetic-agy-home");
             std::fs::create_dir_all(&claude_dir).unwrap();
             std::fs::create_dir_all(&codex_home).unwrap();
+            std::fs::create_dir_all(&agy_home).unwrap();
             let mut path = std::ffi::OsString::from(dir.join("bin"));
             if let Some(prior) = saved[0].1.as_ref() {
                 path.push(":");
@@ -12405,6 +12685,7 @@ mod chain_llm_fallback_argv_tests {
             std::env::set_var("HOME", dir);
             std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", claude_dir);
             std::env::set_var("CODEX_HOME", codex_home);
+            std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_home);
             std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
             Self { saved }
         }
@@ -12455,7 +12736,7 @@ mod chain_llm_fallback_argv_tests {
         std::fs::write(
             path,
             format!(
-                "#!/usr/bin/env bash\nprintf 'CODEX_HOME=%s\\nOPENAI_API_KEY=%s\\nANTHROPIC_API_KEY=%s\\nMINIMAX_API_KEY=%s\\n' \"$CODEX_HOME\" \"${{OPENAI_API_KEY-}}\" \"${{ANTHROPIC_API_KEY-}}\" \"${{MINIMAX_API_KEY-}}\" >> '{}'\nprintf 'agy-ok\\n'\n",
+                "#!/usr/bin/env bash\nprintf 'HOME=%s\\nOPENAI_API_KEY=%s\\nANTHROPIC_API_KEY=%s\\nMINIMAX_API_KEY=%s\\n' \"$HOME\" \"${{OPENAI_API_KEY-}}\" \"${{ANTHROPIC_API_KEY-}}\" \"${{MINIMAX_API_KEY-}}\" >> '{}'\nprintf 'agy-ok\\n'\n",
                 log.display()
             ),
         )
@@ -12555,25 +12836,25 @@ mod chain_llm_fallback_argv_tests {
         let _env = ScopedChainEnv::install(&dir);
 
         // Invalid scope must stop at validation; no AGY child may run.
-        std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("DARK_FACTORY_AGY_HOME");
         let result = ChainLlm.judge("agy-scope-invalid");
         assert!(result.is_err());
         assert!(!log.exists(), "invalid AGY scope must execute zero AGY children");
-        std::env::set_var("CODEX_HOME", dir.join("missing-profile"));
+        std::env::set_var("DARK_FACTORY_AGY_HOME", dir.join("missing-profile"));
         assert!(ChainLlm.judge("agy-scope-malformed").is_err());
         assert!(!log.exists(), "malformed AGY scope must execute zero AGY children");
 
         // A valid synthetic profile admits exactly one AGY child and proves
-        // inherited provider auth was scrubbed at the process boundary.
-        let codex_home = dir.join("synthetic-codex-home");
-        std::fs::create_dir_all(&codex_home).unwrap();
-        std::env::set_var("CODEX_HOME", &codex_home);
+        // child HOME was pinned to DARK_FACTORY_AGY_HOME and inherited provider auth was scrubbed.
+        let agy_home = dir.join("synthetic-agy-home");
+        std::fs::create_dir_all(&agy_home).unwrap();
+        std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_home);
         std::env::set_var("OPENAI_API_KEY", "SYNTHETIC_PARENT_OPENAI");
         std::env::set_var("ANTHROPIC_API_KEY", "SYNTHETIC_PARENT_ANTHROPIC");
         let result = ChainLlm.judge("agy-scope-valid");
         assert!(result.is_ok(), "valid AGY scope should reach synthetic child: {result:?}");
         let captured = std::fs::read_to_string(&log).expect("AGY child log");
-        assert!(captured.contains(&format!("CODEX_HOME={}\n", codex_home.canonicalize().unwrap().display())));
+        assert!(captured.contains(&format!("HOME={}\n", agy_home.canonicalize().unwrap().display())));
         assert!(captured.contains("OPENAI_API_KEY=\n"));
         assert!(captured.contains("ANTHROPIC_API_KEY=\n"));
         assert!(captured.contains("MINIMAX_API_KEY=\n"));
@@ -14355,84 +14636,8 @@ mod offline_cache_tests {
 mod go_ao_lifecycle_tests {
     use super::*;
     use crate::tools::{SessionActivity, Sessions};
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
-
-    #[test]
-    fn go_ao_verify_bridge_compatibility_variants() {
-        let _guard = crate::test_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let prior_path = std::env::var_os("PATH");
-        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
-        let prior_holdouts = std::env::var_os("DARK_FACTORY_HOLDOUTS");
-
-        let temp_dir = std::env::temp_dir().join(format!("df_test_go_ao_compat_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let fake_ao_go = temp_dir.join("ao-go");
-        let state_file = temp_dir.join("ao_status_payload.json");
-        std::fs::write(&state_file, r#"{"health":"ok"}"#).unwrap();
-
-        let script = format!(
-            r#"#!/bin/sh
-if [ "$1" != "status" ] || [ "$2" != "--json" ] || [ "$3" != "" ]; then
-  echo "unexpected ao-go status argv: $*" >&2
-  exit 9
-fi
-cat "{}"
-"#,
-            state_file.display()
-        );
-        std::fs::write(&fake_ao_go, script).unwrap();
-        std::fs::set_permissions(&fake_ao_go, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let new_path = format!("{}:{}", temp_dir.display(), prior_path.as_deref().unwrap_or_default().to_string_lossy());
-        std::env::set_var("PATH", new_path);
-        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
-        std::env::set_var("DARK_FACTORY_HOLDOUTS", &temp_dir);
-
-        // 1. health == ok
-        assert!(verify_ao_bridge_compatibility("proj", "antigravity", &[]).is_ok());
-
-        // 2. state == ready
-        std::fs::write(&state_file, r#"{"state":"ready"}"#).unwrap();
-        assert!(verify_ao_bridge_compatibility("proj", "antigravity", &[]).is_ok());
-
-        // 3. ready == ready
-        std::fs::write(&state_file, r#"{"ready":"ready"}"#).unwrap();
-        assert!(verify_ao_bridge_compatibility("proj", "antigravity", &[]).is_ok());
-
-        // 4. unhealthy payload
-        std::fs::write(&state_file, r#"{"health":"degraded"}"#).unwrap();
-        let res = verify_ao_bridge_compatibility("proj", "antigravity", &[]);
-        assert!(matches!(res, Err(DaemonError::Config(_))));
-
-        // 5. tool error (exit code != 0)
-        let fail_script = r#"#!/bin/sh
-echo "fatal error" >&2
-exit 1
-"#;
-        std::fs::write(&fake_ao_go, fail_script).unwrap();
-        let res = verify_ao_bridge_compatibility("proj", "antigravity", &[]);
-        assert!(matches!(res, Err(DaemonError::Tool { .. })));
-
-        // Cleanup
-        match prior_path {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
-        match prior_engine {
-            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
-            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
-        }
-        match prior_holdouts {
-            Some(v) => std::env::set_var("DARK_FACTORY_HOLDOUTS", v),
-            None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
-        }
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
 
     #[cfg(target_os = "linux")]
     struct GoSpawnEnv {
@@ -14453,8 +14658,10 @@ exit 1
                 "AO_PORT",
                 "GO_SPAWN_NONZERO",
                 "GO_KILL_FAIL",
+                "GO_SPAWN_NO_SESSION_ID",
                 "DARK_FACTORY_CLAUDE_CONFIG_DIR",
                 "CODEX_HOME",
+                "DARK_FACTORY_AGY_HOME",
                 "MINIMAX_API_KEY",
                 "DARK_FACTORY_CODER_FALLBACK_CHAIN",
             ];
@@ -14473,13 +14680,17 @@ exit 1
             std::env::set_var("DARK_FACTORY_AO_CONFIG_PATH", root.join("operator-home/config.yaml"));
             std::env::set_var("AO_RUN_FILE", root.join("running.json"));
             std::env::set_var("AO_DATA_DIR", root.join("ao-data"));
-        std::env::set_var("AO_PORT", "7831");
+            std::env::set_var("AO_PORT", "7831");
             std::fs::create_dir_all(root.join("synthetic-claude-config")).unwrap();
             std::fs::create_dir_all(root.join("synthetic-codex-home")).unwrap();
+            let agy_home = root.join("synthetic-agy-home");
+            std::fs::create_dir_all(&agy_home).unwrap();
             std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", root.join("synthetic-claude-config"));
             std::env::set_var("CODEX_HOME", root.join("synthetic-codex-home"));
+            std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_home);
             std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
             std::env::set_var("GO_SPAWN_NONZERO", "0");
+            std::env::remove_var("GO_SPAWN_NO_SESSION_ID");
             if kill_fails {
                 std::env::set_var("GO_KILL_FAIL", "1");
             } else {
@@ -14553,7 +14764,7 @@ exit 1
         std::fs::write(
             root.join("ao-go"),
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = status ]; then cat '{}'; exit 0; fi\nif [ \"$1\" = project ] && [ \"$2\" = get ]; then cat '{}'; exit 0; fi\nif [ \"$1\" = session ]; then\n  if [ \"$GO_KILL_FAIL\" = 1 ]; then echo 'synthetic kill failure' >&2; exit 8; fi\n  exit 0\nfi\nprintf 'spawned session go-synthetic\\n'\nif [ \"$GO_SPAWN_NONZERO\" = 1 ]; then exit 7; fi\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{0}'\nif [ \"$1\" = status ]; then printf 'env: AO_RUN_FILE=%s AO_DATA_DIR=%s AO_PORT=%s\\n' \"$AO_RUN_FILE\" \"$AO_DATA_DIR\" \"$AO_PORT\" >> '{0}'; cat '{1}'; exit 0; fi\nif [ \"$1\" = project ] && [ \"$2\" = get ]; then cat '{2}'; exit 0; fi\nif [ \"$1\" = session ]; then\n  printf 'env: AO_RUN_FILE=%s AO_DATA_DIR=%s AO_PORT=%s\\n' \"$AO_RUN_FILE\" \"$AO_DATA_DIR\" \"$AO_PORT\" >> '{0}'\n  if [ \"$GO_KILL_FAIL\" = 1 ]; then echo 'synthetic kill failure' >&2; exit 8; fi\n  exit 0\nfi\nif [ \"$GO_SPAWN_NO_SESSION_ID\" = 1 ]; then\n  printf 'malformed output without session id\\n'\nelse\n  printf 'spawned session go-synthetic\\n'\nfi\nif [ \"$GO_SPAWN_NONZERO\" = 1 ]; then exit 7; fi\n",
                 log.display(), status_file.display(), project_file.display()
             ),
         )
@@ -14566,13 +14777,10 @@ exit 1
         init_go_test_repo(&target, repo, "main");
         let workspace = root.join("operator-home/.ao/data/worktrees/go-project/go-synthetic");
         init_go_test_repo(&workspace, repo, branch);
-        // The production Go path proves the long-lived server through its
-        // Linux /proc environment and run-file PID identity. Keep this
-        // fixture real: a shell process owns the exact scoped environment;
-        // `ao-go` remains only the client/query boundary.
         let run_file = root.join("running.json");
         let data_dir = root.join("ao-data");
         let codex_home = root.join("synthetic-codex-home");
+        let agy_home = root.join("synthetic-agy-home");
         let listener_port = std::net::TcpListener::bind(("127.0.0.1", 0))
             .unwrap()
             .local_addr()
@@ -14582,7 +14790,7 @@ exit 1
         let ready_file = root.join("listener.ready");
         let mut server_command = std::process::Command::new("python3");
         for key in crate::account_scope::SCRUBBED_AUTH_VARS {
-            if *key != "CODEX_HOME" {
+            if *key != "CODEX_HOME" && *key != "HOME" {
                 server_command.env_remove(key);
             }
         }
@@ -14595,6 +14803,7 @@ exit 1
             .env("AO_DATA_DIR", &data_dir)
             .env("AO_PORT", listener_port.to_string())
             .env("CODEX_HOME", &codex_home)
+            .env("HOME", &agy_home)
             .spawn()
             .unwrap();
         let server_pid = server.id();
@@ -14625,7 +14834,10 @@ exit 1
                     "id": "go-project", "path": target.canonicalize().unwrap(),
                     "repo": format!("https://github.com/{repo}.git"),
                     "defaultBranch": "main",
-                    "config": {"env": {"CODEX_HOME": codex_home.canonicalize().unwrap()}}
+                    "config": {"env": {
+                        "CODEX_HOME": codex_home.canonicalize().unwrap(),
+                        "HOME": agy_home.canonicalize().unwrap()
+                    }}
                 }
             }).to_string(),
         ).unwrap();
@@ -14659,6 +14871,121 @@ exit 1
             expected_cwd: None,
         };
         (root, env, spec, log)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_ao_verify_bridge_compatibility_variants() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let (root, env, _spec, log) = make_go_spawn_fixture("compat-variants", false);
+        let status_file = root.join("status.json");
+        let run_file = root.join("running.json");
+        let data_dir = root.join("ao-data");
+        let port: u16 = std::env::var("AO_PORT").unwrap().parse().unwrap();
+        let runfile_content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&run_file).unwrap()).unwrap();
+        let pid = runfile_content["pid"].as_u64().unwrap();
+
+        // 1. health == ok
+        std::fs::write(
+            &status_file,
+            serde_json::json!({
+                "health": "ok",
+                "pid": pid,
+                "port": port,
+                "runFile": run_file.canonicalize().unwrap(),
+                "dataDir": data_dir.canonicalize().unwrap()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(verify_ao_bridge_compatibility("go-project", "antigravity", &[]).is_ok());
+
+        // Verify explicit AO_RUN_FILE, AO_DATA_DIR, AO_PORT on status command
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains(&format!(
+            "env: AO_RUN_FILE={} AO_DATA_DIR={} AO_PORT={}",
+            run_file.display(),
+            data_dir.display(),
+            port
+        )));
+
+        // 2. state == ready
+        std::fs::write(
+            &status_file,
+            serde_json::json!({
+                "state": "ready",
+                "pid": pid,
+                "port": port,
+                "runFile": run_file.canonicalize().unwrap(),
+                "dataDir": data_dir.canonicalize().unwrap()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(verify_ao_bridge_compatibility("go-project", "antigravity", &[]).is_ok());
+
+        // 3. ready == ready
+        std::fs::write(
+            &status_file,
+            serde_json::json!({
+                "ready": "ready",
+                "pid": pid,
+                "port": port,
+                "runFile": run_file.canonicalize().unwrap(),
+                "dataDir": data_dir.canonicalize().unwrap()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(verify_ao_bridge_compatibility("go-project", "antigravity", &[]).is_ok());
+
+        // 4. unhealthy payload
+        std::fs::write(
+            &status_file,
+            serde_json::json!({
+                "health": "degraded",
+                "pid": pid,
+                "port": port,
+                "runFile": run_file.canonicalize().unwrap(),
+                "dataDir": data_dir.canonicalize().unwrap()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let res = verify_ao_bridge_compatibility("go-project", "antigravity", &[]);
+        assert!(matches!(res, Err(DaemonError::Config(_))));
+
+        // 5. scope mismatch (wrong PID in status)
+        std::fs::write(
+            &status_file,
+            serde_json::json!({
+                "health": "ok",
+                "pid": pid + 1,
+                "port": port,
+                "runFile": run_file.canonicalize().unwrap(),
+                "dataDir": data_dir.canonicalize().unwrap()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let res = verify_ao_bridge_compatibility("go-project", "antigravity", &[]);
+        assert!(matches!(res, Err(DaemonError::Config(_))));
+
+        // 6. tool error (exit code != 0)
+        let fail_script = r#"#!/bin/sh
+echo "fatal error" >&2
+exit 1
+"#;
+        std::fs::write(root.join("ao-go"), fail_script).unwrap();
+        let res = verify_ao_bridge_compatibility("go-project", "antigravity", &[]);
+        assert!(matches!(res, Err(DaemonError::Tool { .. })));
+
+        drop(env);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -14889,6 +15216,127 @@ exit 1
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn go_spawn_no_id_exit0_fails_session_ambiguous_and_no_fallback() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, spec, log) = make_go_spawn_fixture("no-id-exit0", false);
+        std::env::set_var("GO_SPAWN_NO_SESSION_ID", "1");
+        std::env::set_var("GO_SPAWN_NONZERO", "0");
+        std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", "codex");
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.spawn_with_fallback(&spec);
+        assert!(
+            matches!(result, Err(DaemonError::SessionAmbiguous { .. })),
+            "exit 0 with no session ID must fail closed with SessionAmbiguous: {result:?}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            calls.matches("spawn --project").count(),
+            1,
+            "noIDexit0 must yield exactly 1 spawn and no fallback: {calls}"
+        );
+        assert!(
+            !calls.contains("session kill"),
+            "must never pretend cleanup happened without identity: {calls}"
+        );
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_spawn_no_id_nonzero_fails_session_ambiguous_and_no_fallback_no_kill() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, spec, log) = make_go_spawn_fixture("no-id-nonzero", false);
+        std::env::set_var("GO_SPAWN_NO_SESSION_ID", "1");
+        std::env::set_var("GO_SPAWN_NONZERO", "1");
+        std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", "codex");
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.spawn_with_fallback(&spec);
+        assert!(
+            matches!(result, Err(DaemonError::SessionAmbiguous { .. })),
+            "nonzero exit with no session ID must fail closed with SessionAmbiguous: {result:?}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            calls.matches("spawn --project").count(),
+            1,
+            "noIDnonzero must not attempt fallback vendor: {calls}"
+        );
+        assert!(
+            !calls.contains("session kill"),
+            "no kill attempted when identity is unknown: {calls}"
+        );
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_spawn_known_id_cleanup_failure_retains_spawn_cleanup_failed() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, spec, log) = make_go_spawn_fixture("known-id-cleanup-fail", true);
+        std::env::set_var("GO_SPAWN_NONZERO", "1");
+        std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", "codex");
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.spawn_with_fallback(&spec);
+        assert!(
+            matches!(result, Err(DaemonError::SpawnCleanupFailed { ref session, .. }) if session == "go-synthetic"),
+            "known ID cleanup failure must retain SpawnCleanupFailed: {result:?}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            calls.matches("spawn --project").count(),
+            1,
+            "knownIDcleanupfailure must halt fallback: {calls}"
+        );
+        assert!(
+            calls.contains("session kill go-synthetic -p go-project"),
+            "kill must be attempted for known session ID: {calls}"
+        );
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_ao_kill_in_project_invokes_ao_go() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let (root, env, _spec, log) = make_go_spawn_fixture("kill-in-project", false);
+        let run_file = root.join("running.json");
+        let data_dir = root.join("ao-data");
+        let port = std::env::var("AO_PORT").unwrap();
+
+        let session = SessionId("test-session-999".to_string());
+        CliSessions::kill_in_project("go-project", &session).unwrap();
+
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("session kill test-session-999 -p go-project"));
+        assert!(logged.contains(&format!(
+            "env: AO_RUN_FILE={} AO_DATA_DIR={} AO_PORT={}",
+            run_file.display(),
+            data_dir.display(),
+            port
+        )));
+
+        // Requirement 1: Keep cleanup possible even if LLM provider credentials disappear:
+        // termination is a control operation requiring intended live server identity,
+        // not valid AI authentication.
+        std::env::remove_var("MINIMAX_API_KEY");
+        std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR");
+        std::env::remove_var("DARK_FACTORY_AGY_HOME");
+
+        CliSessions::kill_in_project("go-project", &session).unwrap();
+
+        drop(env);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn go_ao_controller_env_preserves_operator_home() {
         let _guard = crate::test_env_lock()
             .lock()
@@ -15041,52 +15489,6 @@ exit 1
             None => std::env::remove_var("AO_DATA_DIR"),
         }
         let _ = std::fs::remove_dir_all(&temp_home);
-    }
-
-    #[test]
-    fn go_ao_kill_in_project_invokes_ao_go() {
-        let _guard = crate::test_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let prior_path = std::env::var_os("PATH");
-        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
-
-        let temp_dir = std::env::temp_dir().join(format!("df_test_go_ao_kill_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let fake_ao_go = temp_dir.join("ao-go");
-        let log_file = temp_dir.join("call.log");
-
-        let script = format!(
-            r#"#!/bin/sh
-echo "$@" >> "{}"
-"#,
-            log_file.display()
-        );
-        std::fs::write(&fake_ao_go, script).unwrap();
-        std::fs::set_permissions(&fake_ao_go, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let new_path = format!("{}:{}", temp_dir.display(), prior_path.as_deref().unwrap_or_default().to_string_lossy());
-        std::env::set_var("PATH", new_path);
-        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
-
-        let session = SessionId("test-session-999".to_string());
-        CliSessions::kill_in_project("target-proj", &session).unwrap();
-
-        let logged = std::fs::read_to_string(&log_file).unwrap();
-        assert!(logged.contains("session kill test-session-999 -p target-proj"));
-
-        match prior_path {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
-        match prior_engine {
-            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
-            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
-        }
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

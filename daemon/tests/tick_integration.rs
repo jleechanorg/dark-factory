@@ -8441,6 +8441,42 @@ fn write_fake_target_worktree_git(dir: &std::path::Path, head_sha: &str) {
     std::fs::set_permissions(&path, perms).unwrap();
 }
 
+/// Sets up process-wide environment variables and synthetic scoped home directories
+/// for tests that exercise reviewer CLI dispatch with fake scripts.
+///
+/// Creates private, clean synthetic directories for `CODEX_HOME`,
+/// `DARK_FACTORY_CLAUDE_CONFIG_DIR`, and `DARK_FACTORY_AGY_HOME` (with
+/// `.gemini/antigravity-cli/settings.json` containing `{}`) within `fake_bin_dir`,
+/// prepends `fake_bin_dir` to `PATH`, sets `DARK_FACTORY_CODER_DEFAULT`,
+/// and configures a synthetic `MINIMAX_API_KEY`.
+/// All variables are safely restored when the returned `EnvVarGuard` is dropped.
+#[cfg(unix)]
+fn setup_fake_reviewer_env(fake_bin_dir: &std::path::Path, coder_default: &str) -> EnvVarGuard {
+    let fake_codex_home = fake_bin_dir.join("fake_codex_home");
+    std::fs::create_dir_all(&fake_codex_home).unwrap();
+    let fake_claude_home = fake_bin_dir.join("fake_claude_home");
+    std::fs::create_dir_all(&fake_claude_home).unwrap();
+    let fake_agy_home = fake_bin_dir.join("fake_agy_home");
+    let fake_agy_cli = fake_agy_home.join(".gemini").join("antigravity-cli");
+    std::fs::create_dir_all(&fake_agy_cli).unwrap();
+    std::fs::write(fake_agy_cli.join("settings.json"), "{}").unwrap();
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let codex_home_str = fake_codex_home.to_string_lossy().to_string();
+    let claude_home_str = fake_claude_home.to_string_lossy().to_string();
+    let agy_home_str = fake_agy_home.to_string_lossy().to_string();
+
+    EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", coder_default),
+        ("CODEX_HOME", &codex_home_str),
+        ("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_home_str),
+        ("DARK_FACTORY_AGY_HOME", &agy_home_str),
+        ("MINIMAX_API_KEY", "test-synthetic-minimax-key-fixture"),
+    ])
+}
+
 #[test]
 #[cfg(unix)]
 fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff() {
@@ -8468,14 +8504,11 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef555");
 
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-
     // Fix the coder vendor so the reviewer priority list (and therefore
     // which two fake binaries get dispatched) is deterministic regardless
-    // of the ambient environment.
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
+    // of the ambient environment. Provide synthetic scoped directories
+    // for direct CLI execution.
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "agy");
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -8664,14 +8697,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef556");
 
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-
-    // Fix the coder vendor so the reviewer priority list (and therefore
-    // which two fake binaries get dispatched) is deterministic regardless
-    // of the ambient environment.
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "agy");
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -8873,13 +8899,9 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     write_fake_reviewer(&fake_bin_dir, "agy", "still not a verdict");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
 
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-
     // coder=codex is not in [claudem, agy, cursor-agent], so priority stays
     // the full default list and the third-vendor fallback is reachable.
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "codex")]);
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "codex");
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -9069,11 +9091,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef558");
 
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "agy");
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -9564,11 +9582,7 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef558");
 
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "codex")]);
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "codex");
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -9748,14 +9762,10 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
     write_fake_reviewer(&fake_bin_dir, "gemini", "fail should-not-dispatch-gemini");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
 
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-
     // coder=codex is not in the reviewer queue, so priority stays
     // [claudem, agy, cursor-agent] and the third-vendor fallback is
     // reachable.
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "codex")]);
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "codex");
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -9989,11 +9999,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef560");
 
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "agy");
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -15666,12 +15672,7 @@ fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
     .to_string();
     write_fake_reviewer(&fake_bin_dir, "claude", "pass");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let reviewer_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-    let _env_guard = EnvVarGuard::set(&[
-        ("PATH", &reviewer_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
-    ]);
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "agy");
 
     let mut scm = FakeScm::new();
     scm.prs.push(LabeledPr {
