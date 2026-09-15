@@ -3654,7 +3654,17 @@ fn validate_go_provider_scope(
         effective.insert(key.clone(), value.clone());
     }
     let normalized = agent.trim().to_ascii_lowercase();
+    let (is_gemini_api, agy_intended) = if normalized == "agy" || normalized == "antigravity" {
+        let intended = crate::account_scope::validate_agy_home()?;
+        let is_api = crate::account_scope::validate_agy_settings(&intended)?;
+        (is_api, Some(intended))
+    } else {
+        (false, None)
+    };
     let allowed: &[&str] = match normalized.as_str() {
+        "agy" | "antigravity" if is_gemini_api => {
+            &["HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "GEMINI_API_KEY"]
+        }
         "agy" | "antigravity" => &["HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"],
         "codex" => &["CODEX_HOME"],
         "claude" | "claude-code" => &["CLAUDE_CONFIG_DIR"],
@@ -3696,15 +3706,48 @@ fn validate_go_provider_scope(
                 "Go AO project provider scope HOME does not match server scope".to_string(),
             ));
         }
-        let intended = crate::account_scope::validate_agy_home().map_err(|_| {
-            DaemonError::Config(
-                "intended DARK_FACTORY_AGY_HOME profile is missing or invalid".to_string(),
-            )
-        })?;
+        let intended = agy_intended.unwrap();
         if std::path::Path::new(value).canonicalize().ok().as_deref() != Some(intended.as_path()) {
             return Err(DaemonError::Config(
                 "Go AO provider scope HOME does not match intended daemon profile".to_string(),
             ));
+        }
+        if is_gemini_api {
+            let intended_gemini = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+            let intended_trimmed = intended_gemini.trim();
+            if intended_trimmed.is_empty() {
+                return Err(DaemonError::Config(
+                    "Go AO provider scope is missing nonblank intended GEMINI_API_KEY for explicit gemini modelProvider".to_string(),
+                ));
+            }
+            let effective_gemini = effective
+                .get("GEMINI_API_KEY")
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty());
+            if effective_gemini.is_none() {
+                return Err(DaemonError::Config(
+                    "Go AO provider scope is missing GEMINI_API_KEY for explicit gemini modelProvider".to_string(),
+                ));
+            }
+            let server_gemini = server_env
+                .get("GEMINI_API_KEY")
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty());
+            if server_gemini.is_none() {
+                return Err(DaemonError::Config(
+                    "Go AO server scope is missing GEMINI_API_KEY for explicit gemini modelProvider".to_string(),
+                ));
+            }
+            if server_gemini != effective_gemini {
+                return Err(DaemonError::Config(
+                    "Go AO project provider scope GEMINI_API_KEY does not match server scope".to_string(),
+                ));
+            }
+            if effective_gemini != Some(intended_trimmed) {
+                return Err(DaemonError::Config(
+                    "Go AO provider scope GEMINI_API_KEY does not match intended daemon key".to_string(),
+                ));
+            }
         }
         if let Some(codex_val) = effective
             .get("CODEX_HOME")
@@ -6144,6 +6187,7 @@ mod ao_spawn_contract_tests {
                 "MINIMAX_API_KEY",
                 "OPENAI_API_KEY",
                 "ANTHROPIC_API_KEY",
+                "GEMINI_API_KEY",
                 "DARK_FACTORY_CODER_FALLBACK_CHAIN",
                 "DARK_FACTORY_AO_ENGINE",
             ];
@@ -6161,6 +6205,7 @@ mod ao_spawn_contract_tests {
             std::env::set_var("CODEX_HOME", codex_home);
             std::env::set_var("DARK_FACTORY_AGY_HOME", agy_home);
             std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
+            std::env::remove_var("GEMINI_API_KEY");
             std::env::remove_var("DARK_FACTORY_AO_ENGINE");
             Self { saved }
         }
@@ -6330,6 +6375,46 @@ mod ao_spawn_contract_tests {
         std::fs::create_dir_all(&wrong).unwrap();
         server.insert("CODEX_HOME".to_string(), wrong.display().to_string());
         assert!(super::validate_go_provider_scope("agy", &server, &HashMap::new()).is_err());
+        server.insert("CODEX_HOME".to_string(), intended_codex.display().to_string());
+
+        // Native AGY rejects ambient GEMINI_API_KEY in server or project scope
+        server.insert("GEMINI_API_KEY".to_string(), "SYNTHETIC_SERVER_GEMINI_KEY".to_string());
+        assert!(super::validate_go_provider_scope("agy", &server, &HashMap::new()).is_err());
+        server.remove("GEMINI_API_KEY");
+        let project_gemini = HashMap::from([("GEMINI_API_KEY".to_string(), "SYNTHETIC_PROJECT_GEMINI_KEY".to_string())]);
+        assert!(super::validate_go_provider_scope("agy", &server, &project_gemini).is_err());
+
+        // Native AGY with empty/removed GEMINI_API_KEY succeeds (root actual server contract)
+        let project_empty_gemini = HashMap::from([("GEMINI_API_KEY".to_string(), String::new())]);
+        assert!(super::validate_go_provider_scope("agy", &server, &project_empty_gemini).is_ok());
+
+        // Explicit Gemini API mode requires and validates GEMINI_API_KEY matching intended daemon key and server
+        let agy_settings_dir = intended_agy.join(".gemini").join("antigravity-cli");
+        std::fs::create_dir_all(&agy_settings_dir).unwrap();
+        std::fs::write(agy_settings_dir.join("settings.json"), r#"{"modelProvider":"gemini"}"#).unwrap();
+
+        let key_a = "SYNTHETIC_CALLER_KEY_A";
+        let key_b = "SYNTHETIC_SERVER_KEY_B";
+        std::env::set_var("GEMINI_API_KEY", key_a);
+
+        // Without GEMINI_API_KEY in effective, fails
+        assert!(super::validate_go_provider_scope("agy", &server, &HashMap::new()).is_err());
+
+        // Caller key A, server+project key B must fail even though server equals project
+        let mut server_b = server.clone();
+        server_b.insert("GEMINI_API_KEY".to_string(), key_b.to_string());
+        let project_b = HashMap::from([("GEMINI_API_KEY".to_string(), key_b.to_string())]);
+        assert!(super::validate_go_provider_scope("agy", &server_b, &project_b).is_err());
+
+        // All three key A (caller A, server A, project A) must pass
+        server.insert("GEMINI_API_KEY".to_string(), key_a.to_string());
+        let project_a = HashMap::from([("GEMINI_API_KEY".to_string(), key_a.to_string())]);
+        assert!(super::validate_go_provider_scope("agy", &server, &project_a).is_ok());
+
+        // With mismatched GEMINI_API_KEY between server and project, fails
+        let project_mismatched_gemini = HashMap::from([("GEMINI_API_KEY".to_string(), "WRONG_KEY".to_string())]);
+        assert!(super::validate_go_provider_scope("agy", &server, &project_mismatched_gemini).is_err());
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -10224,19 +10309,21 @@ export const isTerminalSession = () => false;
 impl Sessions for CliSessions {
     fn active_count(&self) -> Result<usize, DaemonError> {
         if is_go_ao() {
-            let conn = match open_go_ao_db() {
-                Ok(c) => c,
-                Err(_) => return Ok(0),
-            };
-            let mut stmt = match conn.prepare(
-                "SELECT count(*) FROM sessions WHERE project_id = ?1 AND is_terminated = 0",
-            ) {
-                Ok(s) => s,
-                Err(_) => return Ok(0),
-            };
+            let conn = open_go_ao_db()?;
+            let mut stmt = conn
+                .prepare("SELECT count(*) FROM sessions WHERE project_id = ?1 AND is_terminated = 0")
+                .map_err(|e| DaemonError::Tool {
+                    tool: "go-ao-sqlite".to_string(),
+                    rc: 1,
+                    stderr: format!("failed to prepare active_count query: {e}"),
+                })?;
             let count: i64 = stmt
                 .query_row([&self.project], |row| row.get(0))
-                .unwrap_or(0);
+                .map_err(|e| DaemonError::Tool {
+                    tool: "go-ao-sqlite".to_string(),
+                    rc: 1,
+                    stderr: format!("failed to query active_count: {e}"),
+                })?;
             return Ok(count as usize);
         }
         let out = run_ao_tool(&self.project, &["status", "-p", &self.project, "--json"], 30)?;
@@ -10368,36 +10455,24 @@ impl Sessions for CliSessions {
         timeout_secs: u64,
     ) -> Result<SessionId, DaemonError> {
         if is_go_ao() {
-            let conn = match open_go_ao_db() {
-                Ok(c) => c,
-                Err(_) => {
-                    return Err(DaemonError::SessionNotFound {
-                        branch: branch.to_string(),
-                        bead_id: bead_id.to_string(),
-                    });
-                }
-            };
-            let mut stmt = match conn.prepare(
-                "SELECT id FROM sessions WHERE project_id = ?1 AND branch = ?2 AND is_terminated = 0 ORDER BY num DESC LIMIT 1",
-            ) {
-                Ok(s) => s,
-                Err(_) => {
-                    return Err(DaemonError::SessionNotFound {
-                        branch: branch.to_string(),
-                        bead_id: bead_id.to_string(),
-                    });
-                }
-            };
-            let mut rows = match stmt.query([project, branch]) {
-                Ok(r) => r,
-                Err(_) => {
-                    return Err(DaemonError::SessionNotFound {
-                        branch: branch.to_string(),
-                        bead_id: bead_id.to_string(),
-                    });
-                }
-            };
-            if let Ok(Some(row)) = rows.next() {
+            let conn = open_go_ao_db()?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM sessions WHERE project_id = ?1 AND branch = ?2 AND is_terminated = 0 ORDER BY num DESC LIMIT 1",
+                )
+                .map_err(|e| DaemonError::Tool {
+                    tool: "go-ao-sqlite".to_string(),
+                    rc: 1,
+                    stderr: format!("failed to prepare session id query: {e}"),
+                })?;
+            let mut rows = stmt.query([project, branch]).map_err(|e| DaemonError::Tool {
+                tool: "go-ao-sqlite".to_string(),
+                rc: 1,
+                stderr: format!("failed to query session id: {e}"),
+            })?;
+            if let Some(row) = rows.next().map_err(|e| {
+                DaemonError::Parse(format!("failed to iterate session id rows: {e}"))
+            })? {
                 let id: String = row.get(0).map_err(|e| {
                     DaemonError::Parse(format!("failed to read session id: {e}"))
                 })?;
@@ -10452,24 +10527,34 @@ impl Sessions for CliSessions {
 
     fn is_quiescent_in_project(&self, id: &SessionId, project: &str) -> Result<bool, DaemonError> {
         if is_go_ao() {
-            let conn = match open_go_ao_db() {
-                Ok(c) => c,
-                Err(_) => return Ok(false),
-            };
-            let mut stmt = match conn.prepare(
-                "SELECT activity_state, is_terminated FROM sessions WHERE id = ?1 AND project_id = ?2",
-            ) {
-                Ok(s) => s,
-                Err(_) => return Ok(false),
-            };
-            let mut rows = match stmt.query([&id.0, project]) {
-                Ok(r) => r,
-                Err(_) => return Ok(false),
-            };
-            if let Ok(Some(row)) = rows.next() {
-                let activity_state: String = row.get::<_, Option<String>>(0).ok().flatten().unwrap_or_default();
-                let is_terminated: i64 = row.get::<_, Option<i64>>(1).ok().flatten().unwrap_or(0);
-                let quiescent = is_terminated != 0 || activity_state == "idle" || activity_state == "exited";
+            let conn = open_go_ao_db()?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT activity_state, is_terminated FROM sessions WHERE id = ?1 AND project_id = ?2",
+                )
+                .map_err(|e| DaemonError::Tool {
+                    tool: "go-ao-sqlite".to_string(),
+                    rc: 1,
+                    stderr: format!("failed to prepare is_quiescent query: {e}"),
+                })?;
+            let mut rows = stmt.query([&id.0, project]).map_err(|e| DaemonError::Tool {
+                tool: "go-ao-sqlite".to_string(),
+                rc: 1,
+                stderr: format!("failed to query is_quiescent: {e}"),
+            })?;
+            if let Some(row) = rows.next().map_err(|e| {
+                DaemonError::Parse(format!("failed to iterate is_quiescent rows: {e}"))
+            })? {
+                let activity_state: Option<String> = row.get(0).map_err(|e| {
+                    DaemonError::Parse(format!("failed to decode activity_state: {e}"))
+                })?;
+                let is_terminated: i64 = row
+                    .get::<_, Option<i64>>(1)
+                    .map_err(|e| DaemonError::Parse(format!("failed to decode is_terminated: {e}")))?
+                    .unwrap_or(0);
+                let quiescent = is_terminated != 0
+                    || activity_state.as_deref() == Some("idle")
+                    || activity_state.as_deref() == Some("exited");
                 return Ok(quiescent);
             }
             return Ok(false);
@@ -10520,26 +10605,34 @@ impl Sessions for CliSessions {
         timeout_secs: u64,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
         if is_go_ao() {
-            let conn = match open_go_ao_db() {
-                Ok(c) => c,
-                Err(_) => return Ok(crate::tools::SessionActivity::NotFound),
-            };
-            let mut stmt = match conn.prepare(
-                "SELECT activity_state, is_terminated FROM sessions WHERE id = ?1 AND project_id = ?2",
-            ) {
-                Ok(s) => s,
-                Err(_) => return Ok(crate::tools::SessionActivity::NotFound),
-            };
-            let mut rows = match stmt.query([&id.0, project]) {
-                Ok(r) => r,
-                Err(_) => return Ok(crate::tools::SessionActivity::NotFound),
-            };
-            if let Ok(Some(row)) = rows.next() {
-                let activity_state: String = row.get::<_, Option<String>>(0).ok().flatten().unwrap_or_default();
-                let is_terminated: i64 = row.get::<_, Option<i64>>(1).ok().flatten().unwrap_or(0);
-                if is_terminated != 0 || activity_state == "exited" {
+            let conn = open_go_ao_db()?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT activity_state, is_terminated FROM sessions WHERE id = ?1 AND project_id = ?2",
+                )
+                .map_err(|e| DaemonError::Tool {
+                    tool: "go-ao-sqlite".to_string(),
+                    rc: 1,
+                    stderr: format!("failed to prepare session activity query: {e}"),
+                })?;
+            let mut rows = stmt.query([&id.0, project]).map_err(|e| DaemonError::Tool {
+                tool: "go-ao-sqlite".to_string(),
+                rc: 1,
+                stderr: format!("failed to query session activity: {e}"),
+            })?;
+            if let Some(row) = rows.next().map_err(|e| {
+                DaemonError::Parse(format!("failed to iterate session activity rows: {e}"))
+            })? {
+                let activity_state: Option<String> = row.get(0).map_err(|e| {
+                    DaemonError::Parse(format!("failed to decode activity_state: {e}"))
+                })?;
+                let is_terminated: i64 = row
+                    .get::<_, Option<i64>>(1)
+                    .map_err(|e| DaemonError::Parse(format!("failed to decode is_terminated: {e}")))?
+                    .unwrap_or(0);
+                if is_terminated != 0 || activity_state.as_deref() == Some("exited") {
                     return Ok(crate::tools::SessionActivity::Terminal);
-                } else if activity_state == "idle" {
+                } else if activity_state.as_deref() == Some("idle") {
                     return Ok(crate::tools::SessionActivity::Idle);
                 } else {
                     return Ok(crate::tools::SessionActivity::Running);
@@ -15567,6 +15660,7 @@ exit 1
 
         let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
         let prior_op_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+        let prior_ao_data = std::env::var_os("AO_DATA_DIR");
 
         let temp_home = std::env::temp_dir().join(format!("df_test_go_ao_not_found_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_home);
@@ -15575,6 +15669,7 @@ exit 1
 
         std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
         std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &temp_home);
+        std::env::set_var("AO_DATA_DIR", &ao_data);
 
         let db_path = ao_data.join("ao.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -15590,6 +15685,9 @@ exit 1
             );
             INSERT INTO sessions VALUES ('sess-term', '/ws/term', 'feature/terminated', 'proj-a', 1, 'active', 10);
             INSERT INTO sessions VALUES ('sess-other', '/ws/other', 'feature/other-branch', 'proj-b', 0, 'active', 20);
+            INSERT INTO sessions VALUES ('sess-live', '/ws/live', 'feature/live', 'proj-a', 0, 'active', 30);
+            INSERT INTO sessions VALUES ('sess-idle', '/ws/idle', 'feature/idle', 'proj-a', 0, 'idle', 31);
+            INSERT INTO sessions VALUES ('sess-null', '/ws/null', 'feature/null-act', 'proj-a', 0, NULL, 32);
             ",
         )
         .unwrap();
@@ -15597,7 +15695,24 @@ exit 1
 
         let sessions = CliSessions::new("org/proj-a", "antigravity");
 
-        // 1. Branch completely absent
+        // 1. Positive match: live branch attaches successfully and counts active workers
+        let res_live = sessions.attach_within_in_project("feature/live", "bead-live-0", "proj-a", 10);
+        assert_eq!(res_live.unwrap(), SessionId("sess-live".to_string()));
+        assert_eq!(sessions.active_count().unwrap(), 3); // sess-live, sess-idle, sess-null
+
+        // Legitimate nullable activity_state: NULL activity_state defaults to Running
+        let act_null = sessions.session_activity_within_in_project(&SessionId("sess-null".to_string()), "proj-a", 10).unwrap();
+        assert_eq!(act_null, crate::tools::SessionActivity::Running);
+
+        // Explicit idle activity_state
+        let act_idle = sessions.session_activity_within_in_project(&SessionId("sess-idle".to_string()), "proj-a", 10).unwrap();
+        assert_eq!(act_idle, crate::tools::SessionActivity::Idle);
+
+        // Explicit terminated
+        let act_term = sessions.session_activity_within_in_project(&SessionId("sess-term".to_string()), "proj-a", 10).unwrap();
+        assert_eq!(act_term, crate::tools::SessionActivity::Terminal);
+
+        // 2. Only successful query with NO row proves SessionNotFound / NotFound
         let res_missing = sessions.attach_within_in_project("feature/absent", "bead-absent-1", "proj-a", 10);
         assert!(matches!(
             res_missing,
@@ -15605,7 +15720,7 @@ exit 1
             if branch == "feature/absent" && bead_id == "bead-absent-1"
         ));
 
-        // 2. Branch exists only for another project
+        // Branch exists only for another project -> SessionNotFound
         let res_other_proj = sessions.attach_within_in_project("feature/other-branch", "bead-other-2", "proj-a", 10);
         assert!(matches!(
             res_other_proj,
@@ -15613,7 +15728,7 @@ exit 1
             if branch == "feature/other-branch" && bead_id == "bead-other-2"
         ));
 
-        // 3. Branch exists in project but is terminated (is_terminated = 1)
+        // Branch exists in project but is terminated -> SessionNotFound
         let res_term = sessions.attach_within_in_project("feature/terminated", "bead-term-3", "proj-a", 10);
         assert!(matches!(
             res_term,
@@ -15621,14 +15736,53 @@ exit 1
             if branch == "feature/terminated" && bead_id == "bead-term-3"
         ));
 
-        // 4. DB file is absent entirely
+        // Non-existent session activity -> NotFound
+        let act_none = sessions.session_activity_within_in_project(&SessionId("sess-nonexistent".to_string()), "proj-a", 10).unwrap();
+        assert_eq!(act_none, crate::tools::SessionActivity::NotFound);
+
+        // 3. Legitimate empty table: active_count returns Ok(0), attach returns SessionNotFound
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("DELETE FROM sessions", []).unwrap();
+        drop(conn);
+        assert_eq!(sessions.active_count().unwrap(), 0);
+        let res_empty = sessions.attach_within_in_project("feature/live", "bead-empty", "proj-a", 10);
+        assert!(matches!(res_empty, Err(DaemonError::SessionNotFound { .. })));
+
+        // 4. Missing DB file: MUST NOT return SessionNotFound / NotFound / Ok(0); propagates typed Config error
         let _ = std::fs::remove_file(&db_path);
         let res_no_db = sessions.attach_within_in_project("feature/any", "bead-no-db-4", "proj-a", 10);
-        assert!(matches!(
-            res_no_db,
-            Err(DaemonError::SessionNotFound { ref branch, ref bead_id })
-            if branch == "feature/any" && bead_id == "bead-no-db-4"
-        ));
+        assert!(matches!(res_no_db, Err(DaemonError::Config(_))), "expected DaemonError::Config, got: {res_no_db:?}");
+        let count_no_db = sessions.active_count();
+        assert!(matches!(count_no_db, Err(DaemonError::Config(_))), "expected DaemonError::Config, got: {count_no_db:?}");
+        let act_no_db = sessions.session_activity_within_in_project(&SessionId("sess-live".to_string()), "proj-a", 10);
+        assert!(matches!(act_no_db, Err(DaemonError::Config(_))), "expected DaemonError::Config, got: {act_no_db:?}");
+
+        // 5. Corrupt DB file: propagates Tool/Parse error, never false-positive NotFound or active_count 0
+        std::fs::write(&db_path, "not a valid sqlite database file").unwrap();
+        let res_corrupt = sessions.attach_within_in_project("feature/any", "bead-corrupt", "proj-a", 10);
+        assert!(res_corrupt.is_err() && !matches!(res_corrupt, Err(DaemonError::SessionNotFound { .. })));
+        let count_corrupt = sessions.active_count();
+        assert!(count_corrupt.is_err());
+        let act_corrupt = sessions.session_activity_within_in_project(&SessionId("sess-live".to_string()), "proj-a", 10);
+        assert!(act_corrupt.is_err() && !matches!(act_corrupt, Ok(crate::tools::SessionActivity::NotFound)));
+
+        // 6. Wrong schema: column missing or wrong type must fail closed rather than defaulting to Running or 0
+        let _ = std::fs::remove_file(&db_path);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                unrelated_col TEXT
+            );
+            INSERT INTO sessions VALUES ('sess-bad-schema', 'data');",
+        ).unwrap();
+        drop(conn);
+        let res_wrong = sessions.attach_within_in_project("feature/any", "bead-wrong", "proj-a", 10);
+        assert!(res_wrong.is_err() && !matches!(res_wrong, Err(DaemonError::SessionNotFound { .. })));
+        let count_wrong = sessions.active_count();
+        assert!(count_wrong.is_err());
+        let act_wrong = sessions.session_activity_within_in_project(&SessionId("sess-bad-schema".to_string()), "proj-a", 10);
+        assert!(act_wrong.is_err() && !matches!(act_wrong, Ok(crate::tools::SessionActivity::NotFound)));
 
         match prior_engine {
             Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
@@ -15638,8 +15792,13 @@ exit 1
             Some(v) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", v),
             None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
         }
+        match prior_ao_data {
+            Some(v) => std::env::set_var("AO_DATA_DIR", v),
+            None => std::env::remove_var("AO_DATA_DIR"),
+        }
         let _ = std::fs::remove_dir_all(&temp_home);
     }
+
 }
 
 // PR #666 — bead jleechan-nfdl (pr-655-finding-3) anchor for Evidence Gate re-trigger

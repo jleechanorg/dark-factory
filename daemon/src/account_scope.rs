@@ -18,6 +18,7 @@ pub const SCRUBBED_AUTH_VARS: &[&str] = &[
     "CODEX_ACCESS_TOKEN",
     "CODEX_HOME",
     "MINIMAX_API_KEY",
+    "GEMINI_API_KEY",
 ];
 
 /// Scrub all inherited AI provider authentication, configuration, and token variables
@@ -209,11 +210,14 @@ pub fn validate_agy_home() -> Result<PathBuf, DaemonError> {
 /// Default authentication uses OS keyring / native OAuth and requires omitting `modelProvider`.
 /// API mode is supported ONLY when `settings.modelProvider` is the exact string `"gemini"`
 /// and `GEMINI_API_KEY` is nonblank.
-/// All unsupported explicit values, aliases, and malformed non-object settings fail closed.
-pub fn validate_agy_settings(home: &Path) -> Result<(), DaemonError> {
+/// All unsupported explicit values, aliases, and malformed non-object settings fail closed with Err.
+///
+/// Returns `Ok(true)` if explicit Gemini API mode is configured and valid,
+/// or `Ok(false)` if default native auth (field omitted or file absent) is configured and valid.
+pub fn validate_agy_settings(home: &Path) -> Result<bool, DaemonError> {
     let settings_path = home.join(".gemini").join("antigravity-cli").join("settings.json");
     if !settings_path.exists() {
-        return Ok(());
+        return Ok(false);
     }
     if !settings_path.is_file() {
         return Err(DaemonError::Config(format!(
@@ -248,30 +252,40 @@ pub fn validate_agy_settings(home: &Path) -> Result<(), DaemonError> {
                         "Antigravity settings specify modelProvider 'gemini' but GEMINI_API_KEY is not set or blank".to_string(),
                     ));
                 }
+                Ok(true)
             }
             Some(other) => {
-                return Err(DaemonError::Config(format!(
+                Err(DaemonError::Config(format!(
                     "unsupported Antigravity modelProvider '{other}'; only exact 'gemini' is supported or the field must be omitted for default auth"
-                )));
+                )))
             }
             None => {
-                return Err(DaemonError::Config(format!(
+                Err(DaemonError::Config(format!(
                     "unsupported Antigravity modelProvider value '{provider_val}'; must be exact string 'gemini' or omitted"
-                )));
+                )))
             }
         }
+    } else {
+        Ok(false)
     }
-    Ok(())
+}
+
+/// Check if the validated Antigravity settings explicitly specify API mode via `modelProvider == "gemini"`.
+/// Reuses the shared validator so unsupported/malformed settings are rejected instead of returning false.
+pub fn agy_is_gemini_api_mode(home: &Path) -> Result<bool, DaemonError> {
+    validate_agy_settings(home)
 }
 
 /// Apply Antigravity scoping to a Command:
 /// 1. Validates `DARK_FACTORY_AGY_HOME` exists, is a directory, inspects settings, and canonicalizes it.
 /// 2. Validates optional `CODEX_HOME` and/or `DARK_FACTORY_CLAUDE_CONFIG_DIR` if present in environment.
-/// 3. Scrubs conflicting AI provider authentication.
+/// 3. Scrubs conflicting AI provider authentication (including ambient GEMINI_API_KEY).
 /// 4. Pins child `HOME` to the validated native AGY home directory.
-/// 5. Pins optional validated `CODEX_HOME` and/or `CLAUDE_CONFIG_DIR` if present.
+/// 5. Restores validated `GEMINI_API_KEY` ONLY when explicitly configured in `modelProvider == "gemini"`.
+/// 6. Pins optional validated `CODEX_HOME` and/or `CLAUDE_CONFIG_DIR` if present.
 pub fn apply_agy_scope(command: &mut Command) -> Result<(), DaemonError> {
     let agy_home = validate_agy_home()?;
+    let is_gemini_api = validate_agy_settings(&agy_home)?;
     let codex_home = if std::env::var_os("CODEX_HOME").is_some() {
         Some(validate_codex_home()?)
     } else {
@@ -283,7 +297,11 @@ pub fn apply_agy_scope(command: &mut Command) -> Result<(), DaemonError> {
         None
     };
     scrub_all_ai_provider_auth(command);
-    command.env("HOME", agy_home);
+    command.env("HOME", &agy_home);
+    if is_gemini_api {
+        let key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+        command.env("GEMINI_API_KEY", key);
+    }
     if let Some(dir) = codex_home {
         command.env("CODEX_HOME", dir);
     }
@@ -881,7 +899,7 @@ mod tests {
     fn child_scope_env(command: &mut Command) -> String {
         let output = command
             .arg("-c")
-            .arg("printf '%s\\n' \"ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY-}\" \"ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN-}\" \"ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL-}\" \"ANTHROPIC_MODEL=${ANTHROPIC_MODEL-}\" \"CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR-}\" \"CODEX_HOME=${CODEX_HOME-}\" \"HOME=${HOME-}\" \"MINIMAX_API_KEY=${MINIMAX_API_KEY-}\"")
+            .arg("printf '%s\\n' \"ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY-}\" \"ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN-}\" \"ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL-}\" \"ANTHROPIC_MODEL=${ANTHROPIC_MODEL-}\" \"CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR-}\" \"CODEX_HOME=${CODEX_HOME-}\" \"GEMINI_API_KEY=${GEMINI_API_KEY-}\" \"HOME=${HOME-}\" \"MINIMAX_API_KEY=${MINIMAX_API_KEY-}\"")
             .output()
             .expect("synthetic scope child must spawn");
         assert!(output.status.success(), "synthetic scope child failed: {output:?}");
@@ -903,6 +921,7 @@ mod tests {
         let prior_claude = std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR");
         let prior_codex = std::env::var_os("CODEX_HOME");
         let prior_minimax = std::env::var_os("MINIMAX_API_KEY");
+        let prior_gemini = std::env::var_os("GEMINI_API_KEY");
         let prior_agy = std::env::var_os("DARK_FACTORY_AGY_HOME");
         std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_dir);
         std::env::set_var("CODEX_HOME", &codex_dir);
@@ -918,6 +937,7 @@ mod tests {
         assert!(claude_env.contains(&format!("CLAUDE_CONFIG_DIR={}", claude_dir.canonicalize().unwrap().display())), "Claude child env: {claude_env}");
         assert!(claude_env.lines().filter(|line| line.ends_with("=SYNTHETIC_AUTH_SENTINEL")).count() == 0, "Claude child leaked scoped auth: {claude_env}");
         assert!(claude_env.contains("MINIMAX_API_KEY=\n"), "Claude child inherited MiniMax auth: {claude_env}");
+        assert!(claude_env.contains("GEMINI_API_KEY=\n"), "Claude child inherited Gemini auth: {claude_env}");
 
         let mut codex = Command::new("sh");
         for var in SCRUBBED_AUTH_VARS {
@@ -928,6 +948,7 @@ mod tests {
         assert!(codex_env.contains(&format!("CODEX_HOME={}", codex_dir.canonicalize().unwrap().display())), "Codex child env: {codex_env}");
         assert!(codex_env.lines().filter(|line| line.ends_with("=SYNTHETIC_AUTH_SENTINEL")).count() == 0, "Codex child leaked scoped auth: {codex_env}");
         assert!(codex_env.contains("MINIMAX_API_KEY=\n"), "Codex child inherited MiniMax auth: {codex_env}");
+        assert!(codex_env.contains("GEMINI_API_KEY=\n"), "Codex child inherited Gemini auth: {codex_env}");
 
         let mut minimax = Command::new("sh");
         for var in SCRUBBED_AUTH_VARS {
@@ -939,9 +960,10 @@ mod tests {
         assert!(minimax_env.contains("ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic\n"));
         assert!(minimax_env.contains("ANTHROPIC_MODEL=MiniMax-M3\n"));
         assert!(minimax_env.contains("MINIMAX_API_KEY=\n"), "MiniMax child inherited provider-specific key: {minimax_env}");
+        assert!(minimax_env.contains("GEMINI_API_KEY=\n"), "MiniMax child inherited Gemini auth: {minimax_env}");
 
-        // AGY is commonly launched through a path-qualified executable name;
-        // prove that the direct-dispatch path still scrubs inherited auth and sets HOME.
+        // Native AGY is launched without modelProvider=gemini;
+        // prove that the direct-dispatch path scrubs ambient GEMINI_API_KEY and sets HOME.
         let mut agy = Command::new("sh");
         for var in SCRUBBED_AUTH_VARS {
             agy.env(var, "SYNTHETIC_AUTH_SENTINEL");
@@ -950,7 +972,31 @@ mod tests {
         let agy_env = child_scope_env(&mut agy);
         assert!(agy_env.lines().all(|line| !line.ends_with("=SYNTHETIC_AUTH_SENTINEL")), "AGY child leaked scoped auth: {agy_env}");
         assert!(agy_env.contains("MINIMAX_API_KEY=\n"), "AGY child inherited MiniMax auth: {agy_env}");
+        assert!(agy_env.contains("GEMINI_API_KEY=\n"), "Native AGY child inherited Gemini auth: {agy_env}");
         assert!(agy_env.contains(&format!("HOME={}\n", agy_dir.canonicalize().unwrap().display())), "AGY child did not receive HOME: {agy_env}");
+
+        // Explicit Gemini API mode AGY:
+        // Validates and retains GEMINI_API_KEY when configured.
+        let agy_api_dir = temp.path.join("agy_api");
+        let agy_api_settings = agy_api_dir.join(".gemini").join("antigravity-cli");
+        std::fs::create_dir_all(&agy_api_settings).unwrap();
+        std::fs::write(agy_api_settings.join("settings.json"), r#"{"modelProvider":"gemini"}"#).unwrap();
+        std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_api_dir);
+        std::env::set_var("GEMINI_API_KEY", "SYNTHETIC_GEMINI_SENTINEL");
+
+        let mut agy_api = Command::new("sh");
+        for var in SCRUBBED_AUTH_VARS {
+            agy_api.env(var, "SYNTHETIC_AUTH_SENTINEL");
+        }
+        apply_direct_cli_scope("/opt/antigravity/bin/agy", &[], &mut agy_api).unwrap();
+        let agy_api_env = child_scope_env(&mut agy_api);
+        assert!(agy_api_env.contains("GEMINI_API_KEY=SYNTHETIC_GEMINI_SENTINEL\n"), "Gemini API child did not retain GEMINI_API_KEY: {agy_api_env}");
+        assert!(agy_api_env.contains("MINIMAX_API_KEY=\n"), "Gemini API child inherited MiniMax auth: {agy_api_env}");
+
+        // Explicit Gemini API mode with missing key fails before child construction
+        std::env::remove_var("GEMINI_API_KEY");
+        let mut agy_api_fail = Command::new("sh");
+        assert!(apply_direct_cli_scope("/opt/antigravity/bin/agy", &[], &mut agy_api_fail).is_err());
 
         match prior_claude {
             Some(value) => std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", value),
@@ -963,6 +1009,10 @@ mod tests {
         match prior_minimax {
             Some(value) => std::env::set_var("MINIMAX_API_KEY", value),
             None => std::env::remove_var("MINIMAX_API_KEY"),
+        }
+        match prior_gemini {
+            Some(value) => std::env::set_var("GEMINI_API_KEY", value),
+            None => std::env::remove_var("GEMINI_API_KEY"),
         }
         match prior_agy {
             Some(value) => std::env::set_var("DARK_FACTORY_AGY_HOME", value),
