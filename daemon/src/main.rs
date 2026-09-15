@@ -2052,7 +2052,7 @@ mod tests {
         let live_fail = verify_startup_account_scopes(
             prod_args,
             &["invalid-agent-foo".to_string()],
-            |vendor, cmd| daemon::account_scope::validate_ao_worker_agent_scope(vendor, cmd),
+            daemon::account_scope::validate_ao_worker_agent_scope,
         );
         assert!(live_fail.is_err());
         assert!(live_fail.unwrap_err().to_string().contains("Unsupported AO worker agent"));
@@ -2061,7 +2061,7 @@ mod tests {
         let live_dry = verify_startup_account_scopes(
             dry_run_args,
             &["invalid-agent-foo".to_string()],
-            |vendor, cmd| daemon::account_scope::validate_ao_worker_agent_scope(vendor, cmd),
+            daemon::account_scope::validate_ao_worker_agent_scope,
         );
         assert!(live_dry.is_ok());
     }

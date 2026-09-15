@@ -273,7 +273,8 @@ fn dependency_admission_survives_restarts_then_dispatches_once_when_ready() {
         .unwrap();
     }
 
-    for tick in [1_u64] {
+    {
+        let tick = 1_u64;
         let store = SqliteStateStore::open(&path).unwrap();
         run_tick(
             &TickDeps {
