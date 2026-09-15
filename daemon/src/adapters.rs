@@ -3690,8 +3690,8 @@ fn query_existing_tmux_env(
     tmux_tmpdir: &std::path::Path,
 ) -> Result<Option<HashMap<String, String>>, DaemonError> {
     let socket_path = private_tmux_default_socket(tmux_tmpdir);
-    match std::fs::symlink_metadata(&socket_path) {
-        Ok(_) => {}
+    let meta_before = match std::fs::symlink_metadata(&socket_path) {
+        Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(None);
         }
@@ -3700,6 +3700,58 @@ fn query_existing_tmux_env(
                 "failed to inspect private tmux socket path {}: {e}",
                 socket_path.display()
             )));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::fs::MetadataExt;
+
+        if meta_before.file_type().is_socket() {
+            if meta_before.uid() != current_process_uid() {
+                return Err(DaemonError::Config(format!(
+                    "failed to query existing tmux socket {}: socket owned by foreign uid {}",
+                    socket_path.display(),
+                    meta_before.uid()
+                )));
+            }
+
+            match std::os::unix::net::UnixStream::connect(&socket_path) {
+                Ok(stream) => {
+                    drop(stream);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    let meta_after = match std::fs::symlink_metadata(&socket_path) {
+                        Ok(m) => m,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(None);
+                        }
+                        Err(e) => {
+                            return Err(DaemonError::Config(format!(
+                                "failed to verify private tmux socket path after liveness probe {}: {e}",
+                                socket_path.display()
+                            )));
+                        }
+                    };
+                    if !meta_after.file_type().is_socket()
+                        || meta_after.uid() != current_process_uid()
+                        || meta_after.ino() != meta_before.ino()
+                    {
+                        return Err(DaemonError::Config(format!(
+                            "failed to query existing tmux socket {}: socket inode changed concurrently during liveness probe",
+                            socket_path.display()
+                        )));
+                    }
+                    return Ok(None);
+                }
+                Err(e) => {
+                    return Err(DaemonError::Config(format!(
+                        "failed to query existing tmux socket {}: liveness probe error: {e}",
+                        socket_path.display()
+                    )));
+                }
+            }
         }
     }
 
@@ -6989,6 +7041,36 @@ mod ao_spawn_contract_tests {
 
             // Exact named owned session cleanup, not shared kill-server
             let _ = run_tmux(&["kill-session", "-t", "scope_probe"]);
+
+            // After killing the last session, the tmux server exits asynchronously, leaving a stale socket.
+            let default_sock = super::private_tmux_default_socket(&intended_tmux);
+            let mut server_exited = false;
+            for _ in 0..50 {
+                #[cfg(unix)]
+                {
+                    if std::os::unix::net::UnixStream::connect(&default_sock).is_err() {
+                        server_exited = true;
+                        break;
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    server_exited = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(server_exited, "tmux server must exit after last session is killed");
+            assert!(default_sock.exists(), "tmux socket must remain on disk after server exit");
+            assert_eq!(
+                super::query_existing_tmux_env(&intended_tmux).unwrap(),
+                None,
+                "stale socket after last-session exit must return None"
+            );
+            assert!(
+                super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).is_ok(),
+                "scope validation must cleanly pass on stale socket after last-session exit"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&root);
@@ -7094,6 +7176,57 @@ mod ao_spawn_contract_tests {
         assert!(!socket_path.exists());
         assert_eq!(super::query_existing_tmux_env(&intended_tmux).unwrap(), None);
         assert!(super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).is_ok());
+
+        // 3b. Definitively stale socket from an exited server (ConnectionRefused on owned socket):
+        // Must be treated as fresh namespace without deleting the socket.
+        #[cfg(unix)]
+        {
+            let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+            drop(listener);
+            assert!(socket_path.exists());
+
+            let stale_query = super::query_existing_tmux_env(&intended_tmux).unwrap();
+            assert_eq!(stale_query, None, "stale socket must return None without manual deletion");
+            assert!(socket_path.exists(), "stale socket must not be deleted by query_existing_tmux_env");
+
+            assert!(
+                super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).is_ok(),
+                "scope validation must cleanly pass on stale socket"
+            );
+
+            std::fs::remove_file(&socket_path).unwrap();
+
+            // 3c. Active uninspectable listener (UnixListener actively listening but not tmux protocol)
+            // must fail closed and reject before AO marker
+            let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let r_clone = running.clone();
+            let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+            let _ = listener.set_nonblocking(true);
+            let handle = std::thread::spawn(move || {
+                while r_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok((mut stream, _)) = listener.accept() {
+                        use std::io::Write;
+                        let _ = stream.write_all(b"corrupted_not_tmux\n");
+                        let _ = stream.flush();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+
+            let active_err = super::query_existing_tmux_env(&intended_tmux).unwrap_err();
+            assert!(matches!(active_err, DaemonError::Config(_)));
+            assert!(
+                active_err.to_string().contains("failed to query existing tmux socket")
+                    || active_err.to_string().contains("failed to execute tmux to inspect existing socket")
+            );
+
+            let active_scope_err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+            assert!(matches!(active_scope_err, DaemonError::Config(_)));
+
+            running.store(false, std::sync::atomic::Ordering::Relaxed);
+            let _ = handle.join();
+            std::fs::remove_file(&socket_path).unwrap();
+        }
 
         // 4. Nonempty Go server TMUX socket override rejects before launch
         let mut server_with_tmux = base_server.clone();
