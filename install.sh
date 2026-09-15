@@ -324,14 +324,8 @@ if [[ "${RUNTIME_ROOT}" != "${REPO_ROOT}" ]]; then
     fi
     echo "==> initialized persistent Beads state: ${BR_DB}"
   else
-    if [[ -f "${RUNTIME_ROOT}/.beads/issues.jsonl" ]]; then
-      cp "${RUNTIME_ROOT}/.beads/issues.jsonl" "${STATE_ROOT}/.beads/issues.jsonl"
-      (
-        cd "${STATE_ROOT}"
-        br sync --db "${BR_DB}" --import-only
-      )
-      echo "==> migrated persistent Beads state: ${BR_DB}"
-    fi
+    # Repository seeds bootstrap a new store; upgrades preserve live authority.
+    echo "==> preserving existing persistent Beads state: ${BR_DB}"
   fi
 fi
 

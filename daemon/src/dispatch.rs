@@ -225,6 +225,11 @@ pub fn dispatch_ready_with_vcs(
 
     let mut report = DispatchReport::default();
     for (bead, verdict, drive_branch) in ready {
+        if let Some(task_bead_id) = cfg.task_bead_id.as_deref() {
+            if bead.id != task_bead_id {
+                continue;
+            }
+        }
         if report.success_count() >= batch {
             break;
         }
@@ -2172,6 +2177,7 @@ mod tests {
 
     fn cfg() -> Config {
         Config {
+            task_bead_id: None,
             target_repo: "owner/repo".into(),
             ao_project: None,
             base_branch: "main".into(),

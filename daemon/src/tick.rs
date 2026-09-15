@@ -760,6 +760,31 @@ fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AdoptedHeadAdvance {
+    Advanced { post_sha: String },
+    Unchanged { head_sha: String },
+    Indeterminate,
+}
+
+fn check_adopted_head_advance(
+    deps: &TickDeps,
+    branch: Option<&str>,
+    pre_sha: Option<&str>,
+) -> AdoptedHeadAdvance {
+    let (Some(branch), Some(pre_sha)) = (branch, pre_sha) else {
+        return AdoptedHeadAdvance::Indeterminate;
+    };
+    let Ok(post_sha) = deps.vcs.remote_head_sha(branch) else {
+        return AdoptedHeadAdvance::Indeterminate;
+    };
+    if post_sha != pre_sha && deps.vcs.is_ancestor(pre_sha, &post_sha).unwrap_or(false) {
+        AdoptedHeadAdvance::Advanced { post_sha }
+    } else {
+        AdoptedHeadAdvance::Unchanged { head_sha: post_sha }
+    }
+}
+
 /// jleechan-7t2g: predicate extracted from the `EXISTING_PR_ADOPTED`
 /// dedup check at the original line 1507 of the slow-tier PR adoption
 /// loop. Returns `true` when the overlay's pre-adoption state is one of
@@ -787,6 +812,69 @@ pub(crate) fn should_skip_existing_pr_adoption_emit(
     )
 }
 
+/// Validate a configured task scope before any lifecycle side effect. Existing
+/// overlay identity and routing are always required; tracker admission is
+/// required only while a queued bead is about to be selected. Active/READY
+/// overlays remain monitorable after their tracker candidate is closed or
+/// unlabeled.
+pub fn validate_task_scope(
+    store: &dyn StateStore,
+    cfg: &Config,
+    tracker: &dyn Tracker,
+    task_bead_id: &str,
+) -> Result<(), DaemonError> {
+    crate::config::validate_task_bead_id(task_bead_id)?;
+    let overlay = store.load(task_bead_id)?.ok_or_else(|| {
+        DaemonError::Config(format!("task_bead_id {task_bead_id:?} has no overlay row"))
+    })?;
+    if overlay.state == OverlayState::Dispatching {
+        return Err(DaemonError::Config(format!(
+            "task_bead_id {task_bead_id:?} is in orphaned/ambiguous DISPATCHING state after crash; redrive by resetting state to QUEUED or park explicitly"
+        )));
+    }
+    let repo = overlay.repo(cfg);
+    let routing = cfg.resolve_repo(repo).ok_or_else(|| {
+        DaemonError::Config(format!(
+            "task_bead_id {task_bead_id:?} targets unmapped repository {repo:?}"
+        ))
+    })?;
+    if let Some(project) = overlay.session_ao_project.as_deref() {
+        if project != routing.ao_project {
+            return Err(DaemonError::Config(format!(
+                "task_bead_id {task_bead_id:?} session AO project {project:?} conflicts with routed project {:?}",
+                routing.ao_project
+            )));
+        }
+    }
+    if overlay.pr_number.is_some() && overlay.branch.as_deref().unwrap_or("").is_empty() {
+        return Err(DaemonError::Config(format!(
+            "task_bead_id {task_bead_id:?} has a PR without a branch identity"
+        )));
+    }
+    if matches!(overlay.state, OverlayState::Queued | OverlayState::Redispatched) {
+        let present = tracker
+            .fetch_candidates()?
+            .into_iter()
+            .find(|bead| bead.id == task_bead_id);
+        let bead = present.ok_or_else(|| {
+            DaemonError::Config(format!(
+                "task_bead_id {task_bead_id:?} queued overlay is not an admitted tracker candidate"
+            ))
+        })?;
+        if let Some(target_repo) = intake::resolve_target_repo(
+            &bead.description,
+            bead.external_ref.as_deref(),
+        ) {
+            if target_repo != repo {
+                return Err(DaemonError::Config(format!(
+                    "task_bead_id {task_bead_id:?} tracker repository {target_repo:?} conflicts with overlay repository {repo:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn run_tick(
     deps: &TickDeps,
     tick_index: u64,
@@ -800,6 +888,10 @@ pub fn run_tick(
     }
 
     let mut summary = TickSummary::default();
+    let task_bead_id = deps.cfg.task_bead_id.as_deref();
+    if let Some(task_bead_id) = task_bead_id {
+        validate_task_scope(deps.store, deps.cfg, deps.tracker, task_bead_id)?;
+    }
 
     let slow_tier_due = {
         let ratio = (deps.cfg.slow_tick_secs / deps.cfg.fast_tick_secs.max(1)).max(1);
@@ -810,7 +902,17 @@ pub fn run_tick(
     // every active row" into list + per-row bump so we can pause the autonomy
     // clock for ATTESTED rows whose PR has ci_pending=true (CI wait time is
     // operator/CI wall-clock, not coder session time we are budgeting against).
-    let active_overlays = deps.store.list_active_overlays()?;
+    let active_overlays = if let Some(task_bead_id) = task_bead_id {
+        deps.store
+            .load(task_bead_id)?
+            .into_iter()
+            .filter(|overlay| {
+                matches!(overlay.state, OverlayState::Dispatched | OverlayState::Attested)
+            })
+            .collect()
+    } else {
+        deps.store.list_active_overlays()?
+    };
     for mut overlay in active_overlays {
         if tick_index == 0 && overlay.state == OverlayState::Attested && overlay.session_id.is_none() {
             let _ = emit(
@@ -1483,7 +1585,7 @@ pub fn run_tick(
     // is never re-parked by it; placing recovery after the wedge loop is safe.
     // Recovery only fires when the slow tier is due (matches the shell
     // overlay's cadence — `recover-held` was never per-fast-tick).
-    if slow_tier_due {
+    if slow_tier_due && task_bead_id.is_none() {
         run_recovery_step(deps, &mut summary)?;
     }
 
@@ -1760,15 +1862,20 @@ fn run_quota_watchdog_wake(deps: &TickDeps, summary: &mut TickSummary) -> Result
     // the module doc comment on `health::quota_watchdog`), so scoping the
     // query to this store's own bead ids is what keeps two independent
     // tick loops from reacting to each other's armed entries.
-    let branches = deps.store.owned_branches()?;
-    let mut bead_ids: Vec<String> = Vec::new();
-    for branch in &branches {
-        if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
-            bead_ids.push(bead_id);
+    let bead_ids: Vec<String> = if let Some(task_bead_id) = deps.cfg.task_bead_id.as_deref() {
+        vec![task_bead_id.to_string()]
+    } else {
+        let branches = deps.store.owned_branches()?;
+        let mut ids: Vec<String> = Vec::new();
+        for branch in &branches {
+            if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
+                ids.push(bead_id);
+            }
         }
-    }
-    bead_ids.sort();
-    bead_ids.dedup();
+        ids.sort();
+        ids.dedup();
+        ids
+    };
 
     for bead_id in bead_ids {
         let Some(session_id) = crate::health::quota_watchdog::take_due_wake(&bead_id, now_epoch)
@@ -1813,16 +1920,28 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // the rate-limit-aware variant. The cache is rewritten at the end of
     // every slow pass (see below) so a daemon restart doesn't re-probe
     // the entire factory-labeled PR set on its first tick.
-    let mut adoption_cache = intake::AdoptionProbeCache::load_or_default();
-    let slow_tick_now = now_epoch_secs();
-    let intake_outcome = intake::normalize_labeled_prs_outcome(
-        deps.scm,
-        deps.tracker,
-        deps.cfg,
-        &mut adoption_cache,
-        slow_tick_now,
-        deps.telemetry_log,
-    )?;
+    let task_bead_id = deps.cfg.task_bead_id.as_deref();
+    let mut adoption_cache = task_bead_id
+        .is_none()
+        .then(intake::AdoptionProbeCache::load_or_default);
+    let intake_outcome = if task_bead_id.is_some() {
+        intake::LabeledPrsIntakeOutcome {
+            adopted: Vec::new(),
+            outcomes: Vec::new(),
+            rate_limited: false,
+            metrics: intake::IntakeProbeMetrics::default(),
+        }
+    } else {
+        let slow_tick_now = now_epoch_secs();
+        intake::normalize_labeled_prs_outcome(
+            deps.scm,
+            deps.tracker,
+            deps.cfg,
+            adoption_cache.as_mut().expect("global intake cache"),
+            slow_tick_now,
+            deps.telemetry_log,
+        )?
+    };
     // jtg8-r4 acceptance #3: warn when per-tick gh call count exceeds the
     // slow-tier budget. The threshold (20) is generous — well below what
     // the 2026-07-22 incident burned per tick (~50+), so a hit means
@@ -2093,15 +2212,19 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         }
     }
 
-    let (created, issue_skip_outcomes) = match intake::normalize(deps.scm, deps.tracker, deps.cfg) {
-        Ok(outcome) => outcome,
-        Err(error) if error.is_gh_rate_limit() => {
-            eprintln!(
-                "auto-factory daemon: GitHub issue intake rate-limited; continuing with local bead routing and dispatch"
-            );
-            (Vec::new(), Vec::new())
+    let (created, issue_skip_outcomes) = if task_bead_id.is_some() {
+        (Vec::new(), Vec::new())
+    } else {
+        match intake::normalize(deps.scm, deps.tracker, deps.cfg) {
+            Ok(outcome) => outcome,
+            Err(error) if error.is_gh_rate_limit() => {
+                eprintln!(
+                    "auto-factory daemon: GitHub issue intake rate-limited; continuing with local bead routing and dispatch"
+                );
+                (Vec::new(), Vec::new())
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
     };
     // jleechan-eazj: same unconditional per-candidate guarantee as the PR
     // path above — every factory-labeled issue that did NOT result in a
@@ -2109,8 +2232,12 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     for outcome in &issue_skip_outcomes {
         emit_intake_outcome(deps.telemetry_log, outcome)?;
     }
-    let tracker_candidates = deps.tracker.fetch_candidates()?;
-    let dependency_ready_ids = deps.tracker.fetch_ready_ids()?;
+    let mut tracker_candidates = deps.tracker.fetch_candidates()?;
+    let mut dependency_ready_ids = deps.tracker.fetch_ready_ids()?;
+    if let Some(task_bead_id) = task_bead_id {
+        tracker_candidates.retain(|bead| bead.id == task_bead_id);
+        dependency_ready_ids.retain(|bead_id| bead_id == task_bead_id);
+    }
     let mut routing_candidates: Vec<Bead> = Vec::new();
     for bead_id in &created {
         let mut pr_number = None;
@@ -3457,10 +3584,12 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // factory-labeled PR set on its first tick. Best-effort: a failed
     // write logs but does not abort the tick (a missing cache file is
     // the same as a cold cache).
-    if let Err(e) = adoption_cache.persist() {
-        eprintln!(
-            "auto-factory daemon: WARNING failed to persist adoption-probe cache: {e}"
-        );
+    if let Some(adoption_cache) = adoption_cache {
+        if let Err(e) = adoption_cache.persist() {
+            eprintln!(
+                "auto-factory daemon: WARNING failed to persist adoption-probe cache: {e}"
+            );
+        }
     }
 
     Ok(())
@@ -5015,21 +5144,27 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
     // restart cycles immediately queue all ATTESTED beads for gate assessment
     // rather than waiting for next organic tick.
     let mut bead_ids: Vec<String> = Vec::new();
-    if let Ok(branches) = deps.store.owned_branches() {
+    if let Some(task_bead_id) = deps.cfg.task_bead_id.as_deref() {
+        if deps.store.load(task_bead_id)?.is_some() {
+            bead_ids.push(task_bead_id.to_string());
+        }
+    } else if let Ok(branches) = deps.store.owned_branches() {
         for branch in &branches {
             if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
                 bead_ids.push(bead_id);
             }
         }
     }
-    if let Ok(active_overlays) = deps.store.list_active_overlays() {
-        for overlay in active_overlays {
-            if let Some(ref branch) = overlay.branch {
-                if let Ok(None) = deps.store.bead_id_for_branch(branch) {
-                    let _ = deps.store.register_branch(&overlay.bead_id, branch);
+    if deps.cfg.task_bead_id.is_none() {
+        if let Ok(active_overlays) = deps.store.list_active_overlays() {
+            for overlay in active_overlays {
+                if let Some(ref branch) = overlay.branch {
+                    if let Ok(None) = deps.store.bead_id_for_branch(branch) {
+                        let _ = deps.store.register_branch(&overlay.bead_id, branch);
+                    }
                 }
+                bead_ids.push(overlay.bead_id);
             }
-            bead_ids.push(overlay.bead_id);
         }
     }
     bead_ids.sort();
@@ -5058,7 +5193,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // so NotProvided is the right answer (matches r5 contract).
         let is_test_repo = crate::config::is_fixture_repo(&repo);
 
-        if overlay.state == OverlayState::Dispatched {
+        if overlay.state == OverlayState::Dispatched && !overlay.is_adopted {
             if let Some(ref session_id_str) = overlay.session_id {
                 let sid = SessionId(session_id_str.clone());
                 if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
@@ -5312,45 +5447,116 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // verifier checks real landed work, not the stale pre-fix
                 // commit.
                 let ready_to_promote = if overlay.is_adopted {
-                    match (&overlay.session_id, overlay_session_project(deps, &overlay)) {
+                    let session_id_opt = overlay.session_id.clone();
+                    let session_project = overlay_session_project(deps, &overlay);
+                    match (session_id_opt, session_project) {
                         (Some(session_id_str), Ok(project)) => {
                             let sid = SessionId(session_id_str.clone());
-                            if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
-                                emit(
-                                    deps.telemetry_log,
-                                    bead_id,
-                                    overlay.attempt,
-                                    OverlayState::Dispatched.as_str(),
-                                    "SESSION_HEALTH_FAILED",
-                                    serde_json::json!({}),
-                                    serde_json::json!({
-                                        "session_id": session_id_str,
-                                        "reason": health_failure,
-                                        "branch": overlay.branch,
-                                    }),
-                                )?;
-                                stop_overlay_session(deps, &overlay, &sid).is_ok()
-                            } else if deps
-                                .sessions
-                                .is_quiescent_in_project(&sid, &project)
-                                .unwrap_or(false)
-                            {
-                                true
-                            } else {
-                                match deps.sessions.session_activity_in_project(&sid, &project) {
-                                    Ok(crate::tools::SessionActivity::Idle) => {
-                                        stop_overlay_session(deps, &overlay, &sid).is_ok()
+                            let health_failure = deps.sessions.check_session_health(&sid).ok().flatten();
+                            let activity = deps.sessions.session_activity_in_project(&sid, &project);
+
+                            let is_terminal_or_unhealthy = health_failure.is_some()
+                                || matches!(
+                                    activity,
+                                    Ok(crate::tools::SessionActivity::Terminal
+                                        | crate::tools::SessionActivity::NotFound)
+                                );
+
+                            if matches!(activity, Ok(crate::tools::SessionActivity::Running)) {
+                                if let Some(reason) = health_failure {
+                                    let _ = emit(
+                                        deps.telemetry_log,
+                                        bead_id,
+                                        overlay.attempt,
+                                        OverlayState::Dispatched.as_str(),
+                                        "SESSION_HEALTH_FAILED",
+                                        serde_json::json!({}),
+                                        serde_json::json!({
+                                            "session_id": session_id_str,
+                                            "reason": reason,
+                                            "branch": overlay.branch,
+                                            "action": "retained_live_running_worker",
+                                        }),
+                                    );
+                                }
+                                false
+                            } else if is_terminal_or_unhealthy {
+                                let head_advance = check_adopted_head_advance(
+                                    deps,
+                                    overlay.branch.as_deref(),
+                                    overlay.pre_session_head_sha.as_deref(),
+                                );
+                                match head_advance {
+                                    AdoptedHeadAdvance::Advanced { .. } => true,
+                                    _ => {
+                                        if let Some(reason) = health_failure {
+                                            let _ = emit(
+                                                deps.telemetry_log,
+                                                bead_id,
+                                                overlay.attempt,
+                                                OverlayState::Dispatched.as_str(),
+                                                "SESSION_HEALTH_FAILED",
+                                                serde_json::json!({}),
+                                                serde_json::json!({
+                                                    "session_id": session_id_str,
+                                                    "reason": reason,
+                                                    "branch": overlay.branch,
+                                                }),
+                                            );
+                                        }
+                                        overlay.state = OverlayState::HumanHeld;
+                                        kill_session_and_clear_handle(deps, &mut overlay);
+                                        set_human_hold_reason(
+                                            &mut overlay,
+                                            HumanHoldReason::AdoptedRemediationUnfinished,
+                                        );
+                                        deps.store.save(&overlay)?;
+                                        emit(
+                                            deps.telemetry_log,
+                                            bead_id,
+                                            overlay.attempt,
+                                            OverlayState::HumanHeld.as_str(),
+                                            "PARKED_HUMAN_HELD",
+                                            serde_json::json!({}),
+                                            serde_json::json!({
+                                                "reason": HumanHoldReason::AdoptedRemediationUnfinished.value(),
+                                                "branch": overlay.branch,
+                                                "session_id": session_id_str,
+                                                "pre_session_sha": overlay.pre_session_head_sha,
+                                            }),
+                                        )?;
+                                        let comment_body = format!(
+                                            "🤖 **[dark-factory]** Escalation required: remediation coder session ended without publishing new commits on adopted branch `{}`. Parked HUMAN_HELD for manual review.",
+                                            overlay.branch.as_deref().unwrap_or_default()
+                                        );
+                                        let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+                                        summary.beads_parked_human_held += 1;
+                                        continue;
                                     }
-                                    Ok(
-                                        crate::tools::SessionActivity::Terminal
-                                        | crate::tools::SessionActivity::NotFound,
-                                    ) => true,
+                                }
+                            } else {
+                                match activity {
+                                    Ok(crate::tools::SessionActivity::Idle) => {
+                                        let head_advance = check_adopted_head_advance(
+                                            deps,
+                                            overlay.branch.as_deref(),
+                                            overlay.pre_session_head_sha.as_deref(),
+                                        );
+                                        matches!(head_advance, AdoptedHeadAdvance::Advanced { .. })
+                                    }
                                     _ => false,
                                 }
                             }
                         }
                         (Some(_), Err(_)) => false,
-                        (None, _) => true,
+                        (None, _) => {
+                            let head_advance = check_adopted_head_advance(
+                                deps,
+                                overlay.branch.as_deref(),
+                                overlay.pre_session_head_sha.as_deref(),
+                            );
+                            matches!(head_advance, AdoptedHeadAdvance::Advanced { .. })
+                        }
                     }
                 } else {
                     true
