@@ -3829,6 +3829,12 @@ fn validate_go_tmux_scope(
         ));
     }
 
+    if project_env.get("TMUX").is_some_and(|v| !v.trim().is_empty()) {
+        return Err(DaemonError::Config(
+            "Go AO project scope contains conflicting nonempty TMUX socket override".to_string(),
+        ));
+    }
+
     let server_tmux_raw = server_env
         .get("TMUX_TMPDIR")
         .map(|v| v.trim())
@@ -7029,11 +7035,59 @@ mod ao_spawn_contract_tests {
         std::fs::write(&socket_path, b"unresponsive_corrupted_socket_payload").unwrap();
         assert!(socket_path.exists());
 
-        let query_err = super::query_existing_tmux_env(&intended_tmux).unwrap_err();
-        assert!(query_err.to_string().contains("failed to query existing tmux socket"));
+        let canonical_tmux = intended_tmux.canonicalize().unwrap();
+        let query_err = super::query_existing_tmux_env(&canonical_tmux).unwrap_err();
+        assert!(matches!(query_err, DaemonError::Config(_)));
+        let query_err_msg = query_err.to_string();
+        assert!(
+            query_err_msg.contains("failed to query existing tmux socket")
+                || query_err_msg.contains("failed to execute tmux to inspect existing socket"),
+            "expected uninspectable socket error, got: {query_err_msg}"
+        );
 
         let scope_err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
-        assert!(scope_err.to_string().contains("failed to query existing tmux socket"));
+        assert!(matches!(scope_err, DaemonError::Config(_)));
+        assert_eq!(
+            scope_err.to_string(),
+            query_err_msg,
+            "scope must propagate exact error from existing socket query"
+        );
+
+        // 2b. Controlled missing/unexecutable tmux binary demonstration:
+        // When tmux command cannot be executed, uninspectable socket still fails closed with Config error
+        let non_executable_dir = root.join("missing-tmux-bin");
+        std::fs::create_dir_all(&non_executable_dir).unwrap();
+        let fake_tmux = non_executable_dir.join("tmux");
+        std::fs::write(&fake_tmux, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o644));
+        }
+        let prior_path = std::env::var_os("PATH");
+        let mut stub_path = std::ffi::OsString::from(&non_executable_dir);
+        if let Some(ref prior) = prior_path {
+            stub_path.push(":");
+            stub_path.push(prior);
+        }
+        std::env::set_var("PATH", &stub_path);
+
+        let missing_query_err = super::query_existing_tmux_env(&canonical_tmux).unwrap_err();
+        assert!(matches!(missing_query_err, DaemonError::Config(_)));
+        let missing_msg = missing_query_err.to_string();
+        assert!(
+            missing_msg.contains("failed to execute tmux to inspect existing socket"),
+            "expected execution failure, got: {missing_msg}"
+        );
+
+        let missing_scope_err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+        assert_eq!(missing_scope_err.to_string(), missing_msg);
+
+        // Restore PATH
+        match prior_path {
+            Some(val) => std::env::set_var("PATH", val),
+            None => std::env::remove_var("PATH"),
+        }
 
         // 3. Removing the uninspectable socket restores verified clean fresh namespace
         std::fs::remove_file(&socket_path).unwrap();
@@ -7046,6 +7100,17 @@ mod ao_spawn_contract_tests {
         server_with_tmux.insert("TMUX".to_string(), "/tmp/tmux-1000/default,3794,0".to_string());
         let tmux_err = super::validate_go_provider_scope("agy", &server_with_tmux, &HashMap::new()).unwrap_err();
         assert!(tmux_err.to_string().contains("conflicting nonempty TMUX socket override"));
+
+        // 4b. Nonempty project TMUX socket override rejects before launch; empty remains allowed
+        let mut proj_with_tmux = HashMap::new();
+        proj_with_tmux.insert("TMUX".to_string(), "/tmp/tmux-1000/default,3794,0".to_string());
+        let proj_err = super::validate_go_provider_scope("agy", &base_server, &proj_with_tmux).unwrap_err();
+        assert!(matches!(proj_err, DaemonError::Config(_)));
+        assert!(proj_err.to_string().contains("Go AO project scope contains conflicting nonempty TMUX socket override"));
+
+        let mut proj_with_empty_tmux = HashMap::new();
+        proj_with_empty_tmux.insert("TMUX".to_string(), "   ".to_string());
+        assert!(super::validate_go_provider_scope("agy", &base_server, &proj_with_empty_tmux).is_ok());
 
         // 5. Non-NotFound filesystem inspection error propagates, does not treat as fresh namespace
         #[cfg(unix)]
@@ -15932,6 +15997,27 @@ exit 1
         // A project identity mismatch is rejected after status but before spawn.
         let (root, env, spec, log) = make_go_spawn_fixture("bad-project", false);
         std::fs::write(root.join("project.json"), r#"{"project":{"id":"other-project"}}"#).unwrap();
+        let result = CliSessions::new("owner/repo", "antigravity").run_spawn_process("antigravity", &spec);
+        assert!(result.is_err());
+        assert!(!std::fs::read_to_string(&log).unwrap_or_default().contains("spawn --project"));
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+
+        // A project scope TMUX socket override is rejected before spawn.
+        let (root, env, spec, log) = make_go_spawn_fixture("bad-project-tmux", false);
+        let bad_project = serde_json::json!({
+            "project": {
+                "id": "go-project", "path": root.join("target").canonicalize().unwrap(),
+                "repo": "https://github.com/owner/repo.git",
+                "defaultBranch": "main",
+                "config": {"env": {
+                    "CODEX_HOME": root.join("synthetic-codex-home").canonicalize().unwrap(),
+                    "HOME": root.join("synthetic-agy-home").canonicalize().unwrap(),
+                    "TMUX": "/tmp/tmux-1000/default,3794,0"
+                }}
+            }
+        });
+        std::fs::write(root.join("project.json"), bad_project.to_string()).unwrap();
         let result = CliSessions::new("owner/repo", "antigravity").run_spawn_process("antigravity", &spec);
         assert!(result.is_err());
         assert!(!std::fs::read_to_string(&log).unwrap_or_default().contains("spawn --project"));
