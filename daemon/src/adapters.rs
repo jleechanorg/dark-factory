@@ -3644,6 +3644,315 @@ fn nonempty_provider_conflict(env: &HashMap<String, String>, allowed: &[&str]) -
         .find(|key| env.get(*key).is_some_and(|value| !value.trim().is_empty()))
 }
 
+#[cfg(unix)]
+fn current_process_uid() -> u32 {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    unsafe { getuid() }
+}
+
+#[cfg(not(unix))]
+fn current_process_uid() -> u32 {
+    0
+}
+
+fn system_tmux() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("tmux");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    for candidate in [
+        "/opt/homebrew/bin/tmux",
+        "/usr/local/bin/tmux",
+        "/usr/bin/tmux",
+        "/bin/tmux",
+    ] {
+        let p = std::path::Path::new(candidate);
+        if p.is_file() {
+            return p.to_path_buf();
+        }
+    }
+    std::path::PathBuf::from("tmux")
+}
+
+fn private_tmux_default_socket(tmux_tmpdir: &std::path::Path) -> std::path::PathBuf {
+    tmux_tmpdir
+        .join(format!("tmux-{}", current_process_uid()))
+        .join("default")
+}
+
+fn query_existing_tmux_env(
+    tmux_tmpdir: &std::path::Path,
+) -> Result<Option<HashMap<String, String>>, DaemonError> {
+    let socket_path = private_tmux_default_socket(tmux_tmpdir);
+    match std::fs::symlink_metadata(&socket_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(DaemonError::Config(format!(
+                "failed to inspect private tmux socket path {}: {e}",
+                socket_path.display()
+            )));
+        }
+    }
+
+    let output = std::process::Command::new(system_tmux())
+        .arg("show-environment")
+        .arg("-g")
+        .env_clear()
+        .env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| {
+                "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin".to_string()
+            }),
+        )
+        .env("TMUX_TMPDIR", tmux_tmpdir)
+        .output()
+        .map_err(|e| {
+            DaemonError::Config(format!(
+                "failed to execute tmux to inspect existing socket {}: {e}",
+                socket_path.display()
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        let detail = if trimmed.is_empty() {
+            "tmux process exited with error".to_string()
+        } else {
+            trimmed.to_string()
+        };
+        return Err(DaemonError::Config(format!(
+            "failed to query existing tmux socket {} (exit status {:?}): {detail}",
+            socket_path.display(),
+            output.status.code()
+        )));
+    }
+
+    let text = std::str::from_utf8(&output.stdout).map_err(|_| {
+        DaemonError::Config(format!(
+            "existing tmux server at {} returned non-UTF-8 environment",
+            socket_path.display()
+        ))
+    })?;
+
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('-') {
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once('=') {
+            map.insert(k.trim().to_string(), v.to_string());
+        }
+    }
+    Ok(Some(map))
+}
+
+fn validate_go_tmux_scope(
+    agent: &str,
+    server_env: &HashMap<String, String>,
+    project_env: &HashMap<String, String>,
+    allowed: &[&str],
+    agy_intended: Option<&std::path::Path>,
+    is_gemini_api: bool,
+) -> Result<(), DaemonError> {
+    let raw_intended = std::env::var("TMUX_TMPDIR").map_err(|_| {
+        DaemonError::Config(
+            "intended TMUX_TMPDIR is absent or blank; Go AO requires an explicit private tmux directory".to_string(),
+        )
+    })?;
+    let raw_trimmed = raw_intended.trim();
+    if raw_trimmed.is_empty() {
+        return Err(DaemonError::Config(
+            "intended TMUX_TMPDIR is absent or blank; Go AO requires an explicit private tmux directory".to_string(),
+        ));
+    }
+    let intended_path = std::path::Path::new(raw_trimmed);
+    if !intended_path.is_absolute() {
+        return Err(DaemonError::Config(format!(
+            "intended TMUX_TMPDIR must be an absolute path: {}",
+            intended_path.display()
+        )));
+    }
+    if !intended_path.is_dir() {
+        return Err(DaemonError::Config(format!(
+            "intended TMUX_TMPDIR must be an existing directory: {}",
+            intended_path.display()
+        )));
+    }
+
+    let intended_canonical = intended_path.canonicalize().map_err(|e| {
+        DaemonError::Config(format!(
+            "failed to canonicalize intended TMUX_TMPDIR {}: {e}",
+            intended_path.display()
+        ))
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let meta = intended_canonical.metadata().map_err(|e| {
+            DaemonError::Config(format!(
+                "failed to read intended TMUX_TMPDIR metadata {}: {e}",
+                intended_canonical.display()
+            ))
+        })?;
+        let uid = meta.uid();
+        let current_uid = current_process_uid();
+        if uid != current_uid {
+            return Err(DaemonError::Config(format!(
+                "intended TMUX_TMPDIR is not owned by current process user (owner UID {uid} != current UID {current_uid})",
+            )));
+        }
+        let mode = meta.permissions().mode();
+        if (mode & 0o077) != 0 {
+            return Err(DaemonError::Config(format!(
+                "intended TMUX_TMPDIR has unsafe shared permissions {:o}; must be private owned 0700",
+                mode & 0o777
+            )));
+        }
+    }
+
+    if server_env.get("TMUX").is_some_and(|v| !v.trim().is_empty()) {
+        return Err(DaemonError::Config(
+            "Go AO server scope contains conflicting nonempty TMUX socket override".to_string(),
+        ));
+    }
+
+    let server_tmux_raw = server_env
+        .get("TMUX_TMPDIR")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            DaemonError::Config("Go AO server scope is missing TMUX_TMPDIR".to_string())
+        })?;
+    let server_tmux_path = std::path::Path::new(server_tmux_raw);
+    if !server_tmux_path.is_absolute() || !server_tmux_path.is_dir() {
+        return Err(DaemonError::Config(
+            "Go AO server scope TMUX_TMPDIR must be an existing absolute directory".to_string(),
+        ));
+    }
+    let server_tmux_canonical = server_tmux_path.canonicalize().map_err(|e| {
+        DaemonError::Config(format!(
+            "failed to canonicalize Go AO server scope TMUX_TMPDIR {}: {e}",
+            server_tmux_path.display()
+        ))
+    })?;
+    if server_tmux_canonical != intended_canonical {
+        return Err(DaemonError::Config(
+            "Go AO server scope TMUX_TMPDIR does not match intended daemon TMUX_TMPDIR".to_string(),
+        ));
+    }
+
+    if let Some(proj_tmux_raw) = project_env.get("TMUX_TMPDIR") {
+        let trimmed = proj_tmux_raw.trim();
+        if trimmed.is_empty() {
+            return Err(DaemonError::Config(
+                "Go AO project scope TMUX_TMPDIR cannot be empty".to_string(),
+            ));
+        }
+        let proj_tmux_path = std::path::Path::new(trimmed);
+        if !proj_tmux_path.is_absolute() || !proj_tmux_path.is_dir() {
+            return Err(DaemonError::Config(
+                "Go AO project scope TMUX_TMPDIR must be an existing absolute directory".to_string(),
+            ));
+        }
+        let proj_canonical = proj_tmux_path.canonicalize().map_err(|e| {
+            DaemonError::Config(format!(
+                "failed to canonicalize Go AO project scope TMUX_TMPDIR {}: {e}",
+                proj_tmux_path.display()
+            ))
+        })?;
+        if proj_canonical != intended_canonical {
+            return Err(DaemonError::Config(
+                "Go AO project scope TMUX_TMPDIR does not match server scope".to_string(),
+            ));
+        }
+    }
+
+    if let Some(tmux_env) = query_existing_tmux_env(&intended_canonical)? {
+        if let Some(key) = nonempty_provider_conflict(&tmux_env, allowed) {
+            return Err(DaemonError::Config(format!(
+                "Go AO tmux server scope contains conflicting nonempty variable {key}"
+            )));
+        }
+        let normalized = agent.trim().to_ascii_lowercase();
+        if normalized == "agy" || normalized == "antigravity" {
+            if let Some(tmux_home) = tmux_env.get("HOME").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                let intended_agy = agy_intended.ok_or_else(|| {
+                    DaemonError::Config("missing intended AGY profile home".to_string())
+                })?;
+                if std::path::Path::new(tmux_home).canonicalize().ok().as_deref() != Some(intended_agy) {
+                    return Err(DaemonError::Config(
+                        "Go AO tmux server scope HOME does not match intended daemon profile".to_string(),
+                    ));
+                }
+            }
+            if is_gemini_api {
+                let intended_gemini = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+                let intended_trimmed = intended_gemini.trim();
+                if let Some(tmux_gemini) = tmux_env.get("GEMINI_API_KEY").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                    if tmux_gemini != intended_trimmed {
+                        return Err(DaemonError::Config(
+                            "Go AO tmux server scope GEMINI_API_KEY does not match intended daemon key".to_string(),
+                        ));
+                    }
+                }
+            }
+            if let Some(codex_val) = server_env.get("CODEX_HOME").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                if let Some(tmux_codex) = tmux_env.get("CODEX_HOME").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                    if tmux_codex != codex_val {
+                        return Err(DaemonError::Config(
+                            "Go AO tmux server scope CODEX_HOME does not match server scope".to_string(),
+                        ));
+                    }
+                }
+            }
+            if let Some(claude_val) = server_env.get("CLAUDE_CONFIG_DIR").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                if let Some(tmux_claude) = tmux_env.get("CLAUDE_CONFIG_DIR").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                    if tmux_claude != claude_val {
+                        return Err(DaemonError::Config(
+                            "Go AO tmux server scope CLAUDE_CONFIG_DIR does not match server scope".to_string(),
+                        ));
+                    }
+                }
+            }
+        } else if allowed == ["CODEX_HOME"] {
+            if let Some(codex_val) = server_env.get("CODEX_HOME").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                if let Some(tmux_codex) = tmux_env.get("CODEX_HOME").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                    if tmux_codex != codex_val {
+                        return Err(DaemonError::Config(
+                            "Go AO tmux server scope CODEX_HOME does not match server scope".to_string(),
+                        ));
+                    }
+                }
+            }
+        } else {
+            if let Some(claude_val) = server_env.get("CLAUDE_CONFIG_DIR").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                if let Some(tmux_claude) = tmux_env.get("CLAUDE_CONFIG_DIR").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                    if tmux_claude != claude_val {
+                        return Err(DaemonError::Config(
+                            "Go AO tmux server scope CLAUDE_CONFIG_DIR does not match server scope".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_go_provider_scope(
     agent: &str,
     server_env: &HashMap<String, String>,
@@ -3684,6 +3993,14 @@ fn validate_go_provider_scope(
             "Go AO provider scope contains conflicting nonempty variable {key}"
         )));
     }
+    validate_go_tmux_scope(
+        agent,
+        server_env,
+        project_env,
+        allowed,
+        agy_intended.as_deref(),
+        is_gemini_api,
+    )?;
     if normalized == "agy" || normalized == "antigravity" {
         let value = effective
             .get("HOME")
@@ -6242,6 +6559,7 @@ mod ao_spawn_contract_tests {
                 "DARK_FACTORY_AGY_HOME",
                 "DARK_FACTORY_OPERATOR_HOME",
                 "AO_ORIGINAL_HOME",
+                "TMUX_TMPDIR",
                 "MINIMAX_API_KEY",
                 "OPENAI_API_KEY",
                 "ANTHROPIC_API_KEY",
@@ -6256,14 +6574,22 @@ mod ao_spawn_contract_tests {
             let claude_dir = root.join("synthetic-claude-config");
             let codex_home = root.join("synthetic-codex-home");
             let agy_home = root.join("synthetic-agy-home");
+            let tmux_dir = root.join("synthetic-tmux-tmpdir");
             std::fs::create_dir_all(&claude_dir).unwrap();
             std::fs::create_dir_all(&codex_home).unwrap();
             std::fs::create_dir_all(&agy_home).unwrap();
+            std::fs::create_dir_all(&tmux_dir).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tmux_dir, std::fs::Permissions::from_mode(0o700));
+            }
             std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_dir);
             std::env::set_var("CODEX_HOME", &codex_home);
             std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_home);
             std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &agy_home);
             std::env::set_var("AO_ORIGINAL_HOME", &agy_home);
+            std::env::set_var("TMUX_TMPDIR", &tmux_dir);
             std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
             std::env::remove_var("GEMINI_API_KEY");
             std::env::remove_var("DARK_FACTORY_AO_ENGINE");
@@ -6418,9 +6744,11 @@ mod ao_spawn_contract_tests {
         let _scope = SyntheticAccountScopeEnv::install(&root);
         let intended_codex = root.join("synthetic-codex-home");
         let intended_agy = root.join("synthetic-agy-home");
+        let intended_tmux = root.join("synthetic-tmux-tmpdir");
         let mut server = HashMap::new();
         server.insert("HOME".to_string(), intended_agy.display().to_string());
         server.insert("CODEX_HOME".to_string(), intended_codex.display().to_string());
+        server.insert("TMUX_TMPDIR".to_string(), intended_tmux.display().to_string());
         assert!(super::validate_go_provider_scope("agy", &server, &HashMap::new()).is_ok());
         server.insert("MINIMAX_API_KEY".to_string(), "SYNTHETIC_SERVER_KEY".to_string());
         let project = HashMap::from([("MINIMAX_API_KEY".to_string(), String::new())]);
@@ -6474,6 +6802,264 @@ mod ao_spawn_contract_tests {
         // With mismatched GEMINI_API_KEY between server and project, fails
         let project_mismatched_gemini = HashMap::from([("GEMINI_API_KEY".to_string(), "WRONG_KEY".to_string())]);
         assert!(super::validate_go_provider_scope("agy", &server, &project_mismatched_gemini).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    struct TestTmuxSessionGuard {
+        tmux_tmpdir: std::path::PathBuf,
+        session_name: &'static str,
+    }
+
+    impl Drop for TestTmuxSessionGuard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new(super::system_tmux())
+                .args(["kill-session", "-t", self.session_name])
+                .env_clear()
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .env("TMUX_TMPDIR", &self.tmux_tmpdir)
+                .output();
+        }
+    }
+
+    #[test]
+    fn go_provider_scope_rejects_missing_or_unscoped_tmux_tmpdir_and_dirty_tmux_env() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::path::PathBuf::from("/tmp").join(format!("dft_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+        }
+        let _scope = SyntheticAccountScopeEnv::install(&root);
+        let intended_codex = root.join("synthetic-codex-home");
+        let intended_agy = root.join("synthetic-agy-home");
+        let intended_tmux = root.join("synthetic-tmux-tmpdir");
+
+        let base_server = HashMap::from([
+            ("HOME".to_string(), intended_agy.display().to_string()),
+            ("CODEX_HOME".to_string(), intended_codex.display().to_string()),
+            ("TMUX_TMPDIR".to_string(), intended_tmux.display().to_string()),
+        ]);
+
+        // Clean private scope with fresh namespace (no tmux server) passes
+        assert!(super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).is_ok());
+
+        // 1. Missing caller TMUX_TMPDIR rejects
+        std::env::remove_var("TMUX_TMPDIR");
+        let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("intended TMUX_TMPDIR is absent or blank"));
+
+        // 2. Blank caller TMUX_TMPDIR rejects
+        std::env::set_var("TMUX_TMPDIR", "   ");
+        let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("intended TMUX_TMPDIR is absent or blank"));
+
+        // 3. Relative caller TMUX_TMPDIR rejects
+        std::env::set_var("TMUX_TMPDIR", "relative/tmpdir");
+        let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("must be an absolute path"));
+
+        // 4. Non-existent caller TMUX_TMPDIR rejects
+        let nonexistent = root.join("nonexistent-tmux");
+        std::env::set_var("TMUX_TMPDIR", &nonexistent);
+        let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("must be an existing directory"));
+
+        // 5. Unsafe shared permissions on caller TMUX_TMPDIR rejects
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let unsafe_dir = root.join("unsafe-tmux-tmpdir");
+            std::fs::create_dir_all(&unsafe_dir).unwrap();
+            let _ = std::fs::set_permissions(&unsafe_dir, std::fs::Permissions::from_mode(0o755));
+            std::env::set_var("TMUX_TMPDIR", &unsafe_dir);
+            let mut server_unsafe = base_server.clone();
+            server_unsafe.insert("TMUX_TMPDIR".to_string(), unsafe_dir.display().to_string());
+            let err = super::validate_go_provider_scope("agy", &server_unsafe, &HashMap::new()).unwrap_err();
+            assert!(err.to_string().contains("unsafe shared permissions"));
+        }
+
+        // Restore valid caller TMUX_TMPDIR
+        std::env::set_var("TMUX_TMPDIR", &intended_tmux);
+
+        // 6. Missing TMUX_TMPDIR in server scope rejects
+        let mut missing_server = base_server.clone();
+        missing_server.remove("TMUX_TMPDIR");
+        let err = super::validate_go_provider_scope("agy", &missing_server, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("Go AO server scope is missing TMUX_TMPDIR"));
+
+        // 7. Mismatched TMUX_TMPDIR in server scope rejects
+        let other_tmux = root.join("other-tmux-tmpdir");
+        std::fs::create_dir_all(&other_tmux).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&other_tmux, std::fs::Permissions::from_mode(0o700));
+        }
+        let mut mismatch_server = base_server.clone();
+        mismatch_server.insert("TMUX_TMPDIR".to_string(), other_tmux.display().to_string());
+        let err = super::validate_go_provider_scope("agy", &mismatch_server, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("does not match intended daemon TMUX_TMPDIR"));
+
+        // 8. Mismatched TMUX_TMPDIR in project scope rejects
+        let project_mismatch = HashMap::from([("TMUX_TMPDIR".to_string(), other_tmux.display().to_string())]);
+        let err = super::validate_go_provider_scope("agy", &base_server, &project_mismatch).unwrap_err();
+        assert!(err.to_string().contains("does not match server scope"));
+
+        // 9. Empty TMUX_TMPDIR in project scope rejects
+        let project_empty = HashMap::from([("TMUX_TMPDIR".to_string(), String::new())]);
+        let err = super::validate_go_provider_scope("agy", &base_server, &project_empty).unwrap_err();
+        assert!(err.to_string().contains("Go AO project scope TMUX_TMPDIR cannot be empty"));
+
+        // 10. Existing dirty tmux server inspection
+        let tmux_bin = super::system_tmux();
+        let tmux_available = std::process::Command::new(&tmux_bin)
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if tmux_available {
+            let _tmux_guard = TestTmuxSessionGuard {
+                tmux_tmpdir: intended_tmux.clone(),
+                session_name: "scope_probe",
+            };
+            let run_tmux = |args: &[&str]| {
+                std::process::Command::new(&tmux_bin)
+                    .args(args)
+                    .env_clear()
+                    .env("PATH", std::env::var("PATH").unwrap_or_default())
+                    .env("TMUX_TMPDIR", &intended_tmux)
+                    .output()
+                    .expect("tmux test command failed to execute")
+            };
+
+            // Start tmux server in intended private socket dir
+            let start = run_tmux(&["new-session", "-d", "-s", "scope_probe"]);
+            assert!(start.status.success(), "failed to start test tmux session: {}", String::from_utf8_lossy(&start.stderr));
+
+            // Ambient dirty ANTHROPIC_API_KEY in tmux server rejects without leaking secret
+            let dirty_secret_ant = "sk-ant-ambient-leak-secret-value";
+            run_tmux(&["set-environment", "-g", "ANTHROPIC_API_KEY", dirty_secret_ant]);
+            let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+            let err_msg = err.to_string();
+            assert!(err_msg.contains("conflicting nonempty variable ANTHROPIC_API_KEY"));
+            assert!(!err_msg.contains(dirty_secret_ant), "error must not log secret credential value");
+
+            // Ambient dirty MINIMAX_API_KEY in tmux server rejects without leaking secret
+            run_tmux(&["set-environment", "-g", "-u", "ANTHROPIC_API_KEY"]);
+            let dirty_secret_mini = "sk-minimax-ambient-leak-secret-value";
+            run_tmux(&["set-environment", "-g", "MINIMAX_API_KEY", dirty_secret_mini]);
+            let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+            let err_msg = err.to_string();
+            assert!(err_msg.contains("conflicting nonempty variable MINIMAX_API_KEY"));
+            assert!(!err_msg.contains(dirty_secret_mini), "error must not log secret credential value");
+
+            // Native AGY with ambient GEMINI_API_KEY in tmux server rejects without leaking secret
+            run_tmux(&["set-environment", "-g", "-u", "MINIMAX_API_KEY"]);
+            let dirty_secret_gemini = "sk-gemini-ambient-leak-secret-value";
+            run_tmux(&["set-environment", "-g", "GEMINI_API_KEY", dirty_secret_gemini]);
+            let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+            let err_msg = err.to_string();
+            assert!(err_msg.contains("conflicting nonempty variable GEMINI_API_KEY"));
+            assert!(!err_msg.contains(dirty_secret_gemini), "error must not log secret credential value");
+
+            // Unset dirty secret and set clean matching HOME in tmux server -> passes
+            run_tmux(&["set-environment", "-g", "-u", "GEMINI_API_KEY"]);
+            run_tmux(&["set-environment", "-g", "HOME", &intended_agy.display().to_string()]);
+            assert!(super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).is_ok());
+
+            // Mismatched HOME in tmux server rejects
+            let wrong_home = root.join("wrong-tmux-home");
+            std::fs::create_dir_all(&wrong_home).unwrap();
+            run_tmux(&["set-environment", "-g", "HOME", &wrong_home.display().to_string()]);
+            let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+            assert!(err.to_string().contains("Go AO tmux server scope HOME does not match intended daemon profile"));
+
+            // Exact named owned session cleanup, not shared kill-server
+            let _ = run_tmux(&["kill-session", "-t", "scope_probe"]);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn go_provider_scope_existing_uninspectable_socket_rejects_and_fresh_namespace_passes() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::path::PathBuf::from("/tmp").join(format!("dft_uninsp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+        }
+        let _scope = SyntheticAccountScopeEnv::install(&root);
+        let intended_codex = root.join("synthetic-codex-home");
+        let intended_agy = root.join("synthetic-agy-home");
+        let intended_tmux = root.join("synthetic-tmux-tmpdir");
+
+        let base_server = HashMap::from([
+            ("HOME".to_string(), intended_agy.display().to_string()),
+            ("CODEX_HOME".to_string(), intended_codex.display().to_string()),
+            ("TMUX_TMPDIR".to_string(), intended_tmux.display().to_string()),
+        ]);
+
+        let socket_path = super::private_tmux_default_socket(&intended_tmux);
+
+        // 1. Fresh namespace with verified no private default socket cleanly passes
+        assert!(!socket_path.exists());
+        assert_eq!(super::query_existing_tmux_env(&intended_tmux).unwrap(), None);
+        assert!(super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).is_ok());
+
+        // 2. Existing uninspectable socket on private default socket path rejects before AO marker
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(socket_path.parent().unwrap(), std::fs::Permissions::from_mode(0o700));
+        }
+        std::fs::write(&socket_path, b"unresponsive_corrupted_socket_payload").unwrap();
+        assert!(socket_path.exists());
+
+        let query_err = super::query_existing_tmux_env(&intended_tmux).unwrap_err();
+        assert!(query_err.to_string().contains("failed to query existing tmux socket"));
+
+        let scope_err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+        assert!(scope_err.to_string().contains("failed to query existing tmux socket"));
+
+        // 3. Removing the uninspectable socket restores verified clean fresh namespace
+        std::fs::remove_file(&socket_path).unwrap();
+        assert!(!socket_path.exists());
+        assert_eq!(super::query_existing_tmux_env(&intended_tmux).unwrap(), None);
+        assert!(super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).is_ok());
+
+        // 4. Nonempty Go server TMUX socket override rejects before launch
+        let mut server_with_tmux = base_server.clone();
+        server_with_tmux.insert("TMUX".to_string(), "/tmp/tmux-1000/default,3794,0".to_string());
+        let tmux_err = super::validate_go_provider_scope("agy", &server_with_tmux, &HashMap::new()).unwrap_err();
+        assert!(tmux_err.to_string().contains("conflicting nonempty TMUX socket override"));
+
+        // 5. Non-NotFound filesystem inspection error propagates, does not treat as fresh namespace
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let unreadable_root = root.join("unreadable-tmux-dir");
+            let unreadable_parent = unreadable_root.join(format!("tmux-{}", super::current_process_uid()));
+            std::fs::create_dir_all(&unreadable_parent).unwrap();
+            let _ = std::fs::set_permissions(&unreadable_parent, std::fs::Permissions::from_mode(0o000));
+            let res = super::query_existing_tmux_env(&unreadable_root);
+            let _ = std::fs::set_permissions(&unreadable_parent, std::fs::Permissions::from_mode(0o700));
+            assert!(res.is_err(), "non-NotFound error on socket path must propagate, not return None");
+            assert!(res.unwrap_err().to_string().contains("failed to inspect private tmux socket path"));
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
