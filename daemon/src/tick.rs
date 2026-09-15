@@ -760,6 +760,31 @@ fn kill_session_and_clear_handle(deps: &TickDeps, overlay: &mut BeadOverlay) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AdoptedHeadAdvance {
+    Advanced { post_sha: String },
+    Unchanged { head_sha: String },
+    Indeterminate,
+}
+
+fn check_adopted_head_advance(
+    deps: &TickDeps,
+    branch: Option<&str>,
+    pre_sha: Option<&str>,
+) -> AdoptedHeadAdvance {
+    let (Some(branch), Some(pre_sha)) = (branch, pre_sha) else {
+        return AdoptedHeadAdvance::Indeterminate;
+    };
+    let Ok(post_sha) = deps.vcs.remote_head_sha(branch) else {
+        return AdoptedHeadAdvance::Indeterminate;
+    };
+    if post_sha != pre_sha && deps.vcs.is_ancestor(pre_sha, &post_sha).unwrap_or(false) {
+        AdoptedHeadAdvance::Advanced { post_sha }
+    } else {
+        AdoptedHeadAdvance::Unchanged { head_sha: post_sha }
+    }
+}
+
 /// jleechan-7t2g: predicate extracted from the `EXISTING_PR_ADOPTED`
 /// dedup check at the original line 1507 of the slow-tier PR adoption
 /// loop. Returns `true` when the overlay's pre-adoption state is one of
@@ -5168,7 +5193,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
         // so NotProvided is the right answer (matches r5 contract).
         let is_test_repo = crate::config::is_fixture_repo(&repo);
 
-        if overlay.state == OverlayState::Dispatched {
+        if overlay.state == OverlayState::Dispatched && !overlay.is_adopted {
             if let Some(ref session_id_str) = overlay.session_id {
                 let sid = SessionId(session_id_str.clone());
                 if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
@@ -5422,39 +5447,86 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 // verifier checks real landed work, not the stale pre-fix
                 // commit.
                 let ready_to_promote = if overlay.is_adopted {
-                    match (&overlay.session_id, overlay_session_project(deps, &overlay)) {
+                    let session_id_opt = overlay.session_id.clone();
+                    let session_project = overlay_session_project(deps, &overlay);
+                    match (session_id_opt, session_project) {
                         (Some(session_id_str), Ok(project)) => {
                             let sid = SessionId(session_id_str.clone());
-                            if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
-                                emit(
-                                    deps.telemetry_log,
-                                    bead_id,
-                                    overlay.attempt,
-                                    OverlayState::Dispatched.as_str(),
-                                    "SESSION_HEALTH_FAILED",
-                                    serde_json::json!({}),
-                                    serde_json::json!({
-                                        "session_id": session_id_str,
-                                        "reason": health_failure,
-                                        "branch": overlay.branch,
-                                    }),
-                                )?;
-                                stop_overlay_session(deps, &overlay, &sid).is_ok()
-                            } else if deps
-                                .sessions
-                                .is_quiescent_in_project(&sid, &project)
-                                .unwrap_or(false)
-                            {
-                                true
-                            } else {
-                                match deps.sessions.session_activity_in_project(&sid, &project) {
-                                    Ok(crate::tools::SessionActivity::Idle) => {
-                                        stop_overlay_session(deps, &overlay, &sid).is_ok()
+                            let health_failure = deps.sessions.check_session_health(&sid).ok().flatten();
+                            let activity = deps.sessions.session_activity_in_project(&sid, &project);
+
+                            let is_terminal_or_unhealthy = health_failure.is_some()
+                                || matches!(
+                                    activity,
+                                    Ok(crate::tools::SessionActivity::Terminal
+                                        | crate::tools::SessionActivity::NotFound)
+                                );
+
+                            if is_terminal_or_unhealthy {
+                                let head_advance = check_adopted_head_advance(
+                                    deps,
+                                    overlay.branch.as_deref(),
+                                    overlay.pre_session_head_sha.as_deref(),
+                                );
+                                match head_advance {
+                                    AdoptedHeadAdvance::Advanced { .. } => true,
+                                    _ => {
+                                        if let Some(reason) = health_failure {
+                                            let _ = emit(
+                                                deps.telemetry_log,
+                                                bead_id,
+                                                overlay.attempt,
+                                                OverlayState::Dispatched.as_str(),
+                                                "SESSION_HEALTH_FAILED",
+                                                serde_json::json!({}),
+                                                serde_json::json!({
+                                                    "session_id": session_id_str,
+                                                    "reason": reason,
+                                                    "branch": overlay.branch,
+                                                }),
+                                            );
+                                        }
+                                        overlay.state = OverlayState::HumanHeld;
+                                        kill_session_and_clear_handle(deps, &mut overlay);
+                                        set_human_hold_reason(
+                                            &mut overlay,
+                                            HumanHoldReason::AdoptedRemediationUnfinished,
+                                        );
+                                        deps.store.save(&overlay)?;
+                                        emit(
+                                            deps.telemetry_log,
+                                            bead_id,
+                                            overlay.attempt,
+                                            OverlayState::HumanHeld.as_str(),
+                                            "PARKED_HUMAN_HELD",
+                                            serde_json::json!({}),
+                                            serde_json::json!({
+                                                "reason": HumanHoldReason::AdoptedRemediationUnfinished.value(),
+                                                "branch": overlay.branch,
+                                                "session_id": session_id_str,
+                                                "pre_session_sha": overlay.pre_session_head_sha,
+                                            }),
+                                        )?;
+                                        let comment_body = format!(
+                                            "🤖 **[dark-factory]** Escalation required: remediation coder session ended without publishing new commits on adopted branch `{}`. Parked HUMAN_HELD for manual review.",
+                                            overlay.branch.as_deref().unwrap_or_default()
+                                        );
+                                        let _ = post_scm_comment_by_bead_id(deps, bead_id, &comment_body);
+                                        summary.beads_parked_human_held += 1;
+                                        continue;
                                     }
-                                    Ok(
-                                        crate::tools::SessionActivity::Terminal
-                                        | crate::tools::SessionActivity::NotFound,
-                                    ) => true,
+                                }
+                            } else {
+                                match activity {
+                                    Ok(crate::tools::SessionActivity::Idle) => {
+                                        let head_advance = check_adopted_head_advance(
+                                            deps,
+                                            overlay.branch.as_deref(),
+                                            overlay.pre_session_head_sha.as_deref(),
+                                        );
+                                        matches!(head_advance, AdoptedHeadAdvance::Advanced { .. })
+                                    }
+                                    Ok(crate::tools::SessionActivity::Running) => false,
                                     _ => false,
                                 }
                             }
