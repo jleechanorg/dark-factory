@@ -1567,7 +1567,7 @@ pub fn run_tick(
     // rev-4ou1z: slow-tier cadence matches the hours-long Gemini quota
     // reset window — no need to poll for a wake-due session every fast
     // tick.
-    if slow_tier_due && task_bead_id.is_none() {
+    if slow_tier_due {
         run_quota_watchdog_wake(deps, &mut summary)?;
     }
 
@@ -1837,15 +1837,20 @@ fn run_quota_watchdog_wake(deps: &TickDeps, summary: &mut TickSummary) -> Result
     // the module doc comment on `health::quota_watchdog`), so scoping the
     // query to this store's own bead ids is what keeps two independent
     // tick loops from reacting to each other's armed entries.
-    let branches = deps.store.owned_branches()?;
-    let mut bead_ids: Vec<String> = Vec::new();
-    for branch in &branches {
-        if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
-            bead_ids.push(bead_id);
+    let bead_ids: Vec<String> = if let Some(task_bead_id) = deps.cfg.task_bead_id.as_deref() {
+        vec![task_bead_id.to_string()]
+    } else {
+        let branches = deps.store.owned_branches()?;
+        let mut ids: Vec<String> = Vec::new();
+        for branch in &branches {
+            if let Ok(Some(bead_id)) = deps.store.bead_id_for_branch(branch) {
+                ids.push(bead_id);
+            }
         }
-    }
-    bead_ids.sort();
-    bead_ids.dedup();
+        ids.sort();
+        ids.dedup();
+        ids
+    };
 
     for bead_id in bead_ids {
         let Some(session_id) = crate::health::quota_watchdog::take_due_wake(&bead_id, now_epoch)

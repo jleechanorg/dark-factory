@@ -33,6 +33,41 @@ impl Drop for EnvVarGuard {
     }
 }
 
+struct SyntheticAccountScopeEnv {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl SyntheticAccountScopeEnv {
+    fn install(root: &std::path::Path) -> Self {
+        const KEYS: &[&str] = &[
+            "MINIMAX_API_KEY",
+            "DARK_FACTORY_AGY_HOME",
+        ];
+        let saved: Vec<(&'static str, Option<std::ffi::OsString>)> = KEYS
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        let agy_home = root.join("synthetic-agy-home");
+        let _ = std::fs::create_dir_all(&agy_home);
+        unsafe {
+            std::env::set_var("MINIMAX_API_KEY", "test-synthetic-minimax-key-fixture");
+            std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_home);
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for SyntheticAccountScopeEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.drain(..) {
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+}
+
 #[test]
 fn adopted_pr_rejects_sibling_worktree_before_spawn() {
     let _env_lock = PROCESS_ENV_LOCK
@@ -48,6 +83,7 @@ fn adopted_pr_rejects_sibling_worktree_before_spawn() {
     ));
     let _ = std::fs::remove_dir_all(&temp_root);
     std::fs::create_dir_all(&temp_root).unwrap();
+    let _account_guard = SyntheticAccountScopeEnv::install(&temp_root);
 
     let fake_bin = temp_root.join("bin");
     let managed_worktree = temp_root.join("managed-wa-worktree");
@@ -239,6 +275,7 @@ fn adopted_pr_rejects_drift_before_ao_spawn() {
     ));
     let _ = std::fs::remove_dir_all(&temp_root);
     std::fs::create_dir_all(&temp_root).unwrap();
+    let _account_guard = SyntheticAccountScopeEnv::install(&temp_root);
 
     let fake_bin = temp_root.join("bin");
     let managed_worktree = temp_root.join("managed-wa-worktree");

@@ -4760,9 +4760,65 @@ fn ao_spawn_command_with_mode(
         }
     }
 
-    crate::account_scope::validate_ao_worker_agent_scope(agent, &mut cmd)?;
+    if is_go_ao {
+        crate::account_scope::validate_ao_worker_agent_scope(agent, &mut cmd)?;
+    } else {
+        validate_node_ao_worker_agent_scope(agent, &mut cmd)?;
+    }
 
     Ok(cmd)
+}
+
+fn validate_node_ao_worker_agent_scope(
+    agent: &str,
+    cmd: &mut Command,
+) -> Result<(), DaemonError> {
+    let normalized = agent.trim().to_ascii_lowercase();
+    if normalized == "antigravity" || normalized == "agy" {
+        let mut temp_cmd = Command::new("dummy");
+        crate::account_scope::validate_ao_worker_agent_scope(agent, &mut temp_cmd)?;
+
+        let agy_home = crate::account_scope::validate_agy_home()?;
+        let ao_original_home = cmd
+            .get_envs()
+            .find(|(k, _)| k.to_str() == Some("AO_ORIGINAL_HOME"))
+            .and_then(|(_, v)| v)
+            .and_then(|v| v.to_str())
+            .map(std::path::PathBuf::from)
+            .or_else(|| operator_home().ok().map(std::path::PathBuf::from))
+            .ok_or_else(|| {
+                DaemonError::Config("AO_ORIGINAL_HOME is unavailable for Node AO AGY worker".to_string())
+            })?;
+
+        let ao_original_canonical = ao_original_home.canonicalize().map_err(|e| {
+            DaemonError::Config(format!(
+                "failed to canonicalize AO_ORIGINAL_HOME {}: {e}",
+                ao_original_home.display()
+            ))
+        })?;
+
+        if agy_home != ao_original_canonical {
+            return Err(DaemonError::Config(format!(
+                "Node AO AGY worker account root AO_ORIGINAL_HOME ({}) does not match intended AGY home ({})",
+                ao_original_canonical.display(),
+                agy_home.display()
+            )));
+        }
+
+        crate::account_scope::scrub_all_ai_provider_auth(cmd);
+        for (key, value) in temp_cmd.get_envs() {
+            if key != "HOME" {
+                if let Some(val) = value {
+                    cmd.env(key, val);
+                } else {
+                    cmd.env_remove(key);
+                }
+            }
+        }
+        Ok(())
+    } else {
+        crate::account_scope::validate_ao_worker_agent_scope(agent, cmd)
+    }
 }
 
 fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonError> {
@@ -5691,7 +5747,7 @@ impl CliSessions {
 /// `canonical_for_alias` map the startup preflight uses. Dedup is by
 /// canonical form so a config that names both `agy` and `antigravity`
 /// doesn't try the same plugin twice.
-fn build_runtime_fallback_chain(default_agent: &str, fallback_str: &str) -> Vec<String> {
+pub fn build_runtime_fallback_chain(default_agent: &str, fallback_str: &str) -> Vec<String> {
     if is_go_ao() {
         let canonicalize = |vendor: &str| -> Option<String> {
             let normalized = vendor.trim().to_ascii_lowercase();
@@ -6184,6 +6240,8 @@ mod ao_spawn_contract_tests {
                 "DARK_FACTORY_CLAUDE_CONFIG_DIR",
                 "CODEX_HOME",
                 "DARK_FACTORY_AGY_HOME",
+                "DARK_FACTORY_OPERATOR_HOME",
+                "AO_ORIGINAL_HOME",
                 "MINIMAX_API_KEY",
                 "OPENAI_API_KEY",
                 "ANTHROPIC_API_KEY",
@@ -6201,9 +6259,11 @@ mod ao_spawn_contract_tests {
             std::fs::create_dir_all(&claude_dir).unwrap();
             std::fs::create_dir_all(&codex_home).unwrap();
             std::fs::create_dir_all(&agy_home).unwrap();
-            std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", claude_dir);
-            std::env::set_var("CODEX_HOME", codex_home);
-            std::env::set_var("DARK_FACTORY_AGY_HOME", agy_home);
+            std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_dir);
+            std::env::set_var("CODEX_HOME", &codex_home);
+            std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_home);
+            std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &agy_home);
+            std::env::set_var("AO_ORIGINAL_HOME", &agy_home);
             std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
             std::env::remove_var("GEMINI_API_KEY");
             std::env::remove_var("DARK_FACTORY_AO_ENGINE");
@@ -7845,6 +7905,135 @@ export const isTerminalSession = () => false;
             None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
         }
         let _ = std::fs::remove_dir_all(&temp_holdouts);
+    }
+
+    #[test]
+    fn node_ao_agy_spawn_preserves_controller_home_and_validates_account_root() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_holdouts = std::env::var_os("DARK_FACTORY_HOLDOUTS");
+        let prior_controller = std::env::var_os("DARK_FACTORY_AO_CONTROLLER_HOME");
+        let prior_operator = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+        let prior_ao_orig = std::env::var_os("AO_ORIGINAL_HOME");
+        let prior_agy_home = std::env::var_os("DARK_FACTORY_AGY_HOME");
+
+        let root = std::env::temp_dir().join(format!("df_test_node_agy_scope_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::create_dir_all(&root);
+
+        let temp_holdouts = root.join("holdouts");
+        let _ = std::fs::create_dir_all(&temp_holdouts);
+        std::env::set_var("DARK_FACTORY_HOLDOUTS", &temp_holdouts);
+
+        let controller_base = root.join("controller-base");
+        let _ = std::fs::create_dir_all(&controller_base);
+        std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", &controller_base);
+
+        let agy_home = root.join("intended-agy-home");
+        let _ = std::fs::create_dir_all(&agy_home);
+        std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_home);
+
+        // Node AO mode
+        std::env::remove_var("DARK_FACTORY_AO_ENGINE");
+
+        let test_spec = spec("test prompt", "factory/node-agy-branch");
+
+        // 1. Matching intended AO_ORIGINAL_HOME account profile succeeds
+        // and private controller HOME remains selected (not overwritten with agy_home)
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &agy_home);
+        std::env::set_var("AO_ORIGINAL_HOME", &agy_home);
+
+        let cmd = super::ao_spawn_command_with_mode("antigravity", &test_spec, false)
+            .expect("matching AO_ORIGINAL_HOME and DARK_FACTORY_AGY_HOME must succeed");
+
+        let env_map: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|val| (k.to_string_lossy().to_string(), val.to_string_lossy().to_string()))
+            })
+            .collect();
+
+        let expected_controller_home = controller_base
+            .join(safe_project_component(&test_spec.ao_project))
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            env_map.get("HOME").map(String::as_str),
+            Some(expected_controller_home.as_str()),
+            "private controller HOME must remain selected for Node ao command"
+        );
+        assert_ne!(
+            env_map.get("HOME").map(String::as_str),
+            Some(agy_home.to_string_lossy().as_ref()),
+            "Node ao command must NOT overwrite controller HOME with AGY profile home"
+        );
+        let agy_canonical = agy_home.canonicalize().unwrap().to_string_lossy().into_owned();
+        let ao_orig_canonical = std::path::Path::new(env_map.get("AO_ORIGINAL_HOME").unwrap())
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            ao_orig_canonical,
+            agy_canonical,
+            "AO_ORIGINAL_HOME must equal intended AGY profile"
+        );
+
+        // 2. Mismatched AGY profile fails before child
+        let mismatched_home = root.join("other-operator-home");
+        let _ = std::fs::create_dir_all(&mismatched_home);
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &mismatched_home);
+        std::env::set_var("AO_ORIGINAL_HOME", &mismatched_home);
+
+        let err = super::ao_spawn_command_with_mode("antigravity", &test_spec, false)
+            .expect_err("mismatched AGY profile and AO_ORIGINAL_HOME must fail before child");
+        assert!(
+            format!("{err}").contains("does not match intended AGY home"),
+            "error should indicate profile mismatch: {err}"
+        );
+
+        // Also test "agy" alias with mismatched profile
+        let err_alias = super::ao_spawn_command_with_mode("agy", &test_spec, false)
+            .expect_err("mismatched AGY profile must fail closed for 'agy' alias");
+        assert!(format!("{err_alias}").contains("does not match intended AGY home"));
+
+        // 3. Go actual scope remains unchanged
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+        let go_cmd = super::ao_spawn_command_with_mode("antigravity", &test_spec, false)
+            .expect("Go AO scope must succeed even with operator home pointing elsewhere");
+        let go_args: Vec<String> = go_cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert!(go_args.contains(&"--harness".to_string()));
+        assert!(go_args.contains(&"agy".to_string()));
+
+        // Cleanup
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_holdouts {
+            Some(v) => std::env::set_var("DARK_FACTORY_HOLDOUTS", v),
+            None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
+        }
+        match prior_controller {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_CONTROLLER_HOME"),
+        }
+        match prior_operator {
+            Some(v) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        match prior_ao_orig {
+            Some(v) => std::env::set_var("AO_ORIGINAL_HOME", v),
+            None => std::env::remove_var("AO_ORIGINAL_HOME"),
+        }
+        match prior_agy_home {
+            Some(v) => std::env::set_var("DARK_FACTORY_AGY_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_AGY_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

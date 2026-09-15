@@ -538,38 +538,22 @@ fn handle_tick_action<T: Copy>(
 }
 
 /// Mirrors the runtime fallback chain (`CliSessions::spawn_with_fallback`)
-/// using the same `canonical_for_alias` mapping so the preflight and the
-/// `--agent` argv agree on every vendor name. This is the SINGLE source for
-/// the configured vendor list — startup and dispatch consult it so a renamed
-/// plugin cannot pass preflight while failing the runtime fallback chain
-/// (or vice versa).
-fn configured_vendor_list(default_agent: &str) -> Vec<String> {
+/// by reusing `daemon::adapters::build_runtime_fallback_chain`. This is the
+/// SINGLE source for the configured vendor list — startup and dispatch consult
+/// it so engine-aware vendor filtering and aliases agree on every vendor name.
+fn configured_vendor_list(default_agent: &str) -> Result<Vec<String>, DaemonError> {
     let fallback_str = std::env::var("DARK_FACTORY_CODER_FALLBACK_CHAIN")
         .or_else(|_| std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"))
         .unwrap_or_else(|_| "agy->minimax->claudem".to_string());
 
-    let canonicalize = |vendor: &str| -> String {
-        daemon::adapters::canonical_for_alias(vendor)
-            .map(str::to_string)
-            .unwrap_or_else(|| vendor.to_string())
-    };
-
-    let mut chain: Vec<String> = Vec::new();
-    let default_canonical = canonicalize(default_agent);
-    if !default_canonical.is_empty() {
-        chain.push(default_canonical);
+    let chain = daemon::adapters::build_runtime_fallback_chain(default_agent, &fallback_str);
+    let had_input = !default_agent.trim().is_empty() || !fallback_str.trim().is_empty();
+    if had_input && chain.is_empty() {
+        return Err(DaemonError::Config(format!(
+            "configured vendor chain '{fallback_str}' with default agent '{default_agent}' contains no supported agents for current AO engine"
+        )));
     }
-    for part in fallback_str.split("->") {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let canonical = canonicalize(trimmed);
-        if !canonical.is_empty() && !chain.contains(&canonical) {
-            chain.push(canonical);
-        }
-    }
-    chain
+    Ok(chain)
 }
 
 fn verify_startup_ao_compatibility(
@@ -700,7 +684,7 @@ fn run(args: Args) -> Result<(), DaemonError> {
     };
 
     let binding = resolve_startup_scope_binding(store.as_ref(), &cfg, tracker.as_ref())?;
-    let configured_vendors = configured_vendor_list(&binding.default_agent);
+    let configured_vendors = configured_vendor_list(&binding.default_agent)?;
     // Fail before opening/reconciling state, advertising READY, or polling a
     // healthy tick when the installed AO/Node adapter is incompatible. The
     // diagnostic exits before AO preflight, locking, workspace creation, or
@@ -1134,10 +1118,12 @@ mod tests {
         // Snapshot the existing env, mutate it for the test, restore after.
         let prior_default = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT").ok();
         let prior_chain = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+        let prior_engine = std::env::var("DARK_FACTORY_AO_ENGINE").ok();
 
         // SAFETY: env mutation is serialized by the test isolation rules;
         // we set/remove only the keys this test owns.
         unsafe {
+            std::env::remove_var("DARK_FACTORY_AO_ENGINE");
             std::env::set_var("DARK_FACTORY_REVIEWER_DEFAULT", "agy");
             std::env::set_var(
                 "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
@@ -1145,7 +1131,7 @@ mod tests {
             );
         }
 
-        let vendors = configured_vendor_list("agy");
+        let vendors = configured_vendor_list("agy").unwrap();
 
         unsafe {
             match prior_default {
@@ -1156,6 +1142,10 @@ mod tests {
                 Some(v) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", v),
                 None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
             }
+            match prior_engine {
+                Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+                None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+            }
         }
 
         // Default + canonical fallback entries, deduped (agy->antigravity
@@ -1165,6 +1155,101 @@ mod tests {
             vendors,
             vec!["antigravity".to_string(), "minimax".to_string(), "claude-code".to_string()]
         );
+    }
+
+    #[test]
+    fn go_ao_configured_vendor_list_drops_minimax_and_validates_supported_scopes() {
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior_engine = std::env::var("DARK_FACTORY_AO_ENGINE").ok();
+        let prior_coder_chain = std::env::var("DARK_FACTORY_CODER_FALLBACK_CHAIN").ok();
+        let prior_reviewer_chain = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+
+        unsafe {
+            std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+            std::env::remove_var("DARK_FACTORY_CODER_FALLBACK_CHAIN");
+            std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN");
+        }
+
+        // 1. Default fallback chain under strongdm-go drops minimax/claudem:
+        // default agy->minimax->claudem yields only ["agy"].
+        let default_go_vendors = configured_vendor_list("agy").unwrap();
+        assert_eq!(default_go_vendors, vec!["agy".to_string()]);
+        assert!(!default_go_vendors.contains(&"minimax".to_string()));
+        assert!(!default_go_vendors.contains(&"claudem".to_string()));
+
+        // Verification over default Go vendors succeeds without requiring MINIMAX_API_KEY
+        let prod_args = Args { once: false, dry_run: false };
+        let mut validated_vendors = Vec::new();
+        let verify_res = verify_startup_account_scopes(
+            prod_args,
+            &default_go_vendors,
+            |vendor, _cmd| {
+                validated_vendors.push(vendor.to_string());
+                Ok(())
+            },
+        );
+        assert!(verify_res.is_ok());
+        assert_eq!(validated_vendors, vec!["agy".to_string()]);
+
+        // 2. Explicit chain with AGY, Codex, MiniMax, and Claude:
+        // MiniMax is dropped, but supported AGY, Codex, and Claude scopes are retained and validated.
+        unsafe {
+            std::env::set_var(
+                "DARK_FACTORY_CODER_FALLBACK_CHAIN",
+                "antigravity->codex->minimax->claude-code",
+            );
+        }
+        let explicit_go_vendors = configured_vendor_list("antigravity").unwrap();
+        assert_eq!(
+            explicit_go_vendors,
+            vec!["agy".to_string(), "codex".to_string(), "claude-code".to_string()]
+        );
+
+        let mut validated_multi = Vec::new();
+        let verify_multi = verify_startup_account_scopes(
+            prod_args,
+            &explicit_go_vendors,
+            |vendor, _cmd| {
+                validated_multi.push(vendor.to_string());
+                Ok(())
+            },
+        );
+        assert!(verify_multi.is_ok());
+        assert_eq!(
+            validated_multi,
+            vec!["agy".to_string(), "codex".to_string(), "claude-code".to_string()]
+        );
+
+        // 3. Fallback chain containing only unsupported vendors under Go fails closed.
+        unsafe {
+            std::env::set_var(
+                "DARK_FACTORY_CODER_FALLBACK_CHAIN",
+                "minimax->claudem->aow",
+            );
+        }
+        let empty_err = configured_vendor_list("minimax").unwrap_err();
+        assert!(matches!(empty_err, DaemonError::Config(_)));
+        assert!(empty_err
+            .to_string()
+            .contains("contains no supported agents for current AO engine"));
+
+        unsafe {
+            match prior_engine {
+                Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+                None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+            }
+            match prior_coder_chain {
+                Some(v) => std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", v),
+                None => std::env::remove_var("DARK_FACTORY_CODER_FALLBACK_CHAIN"),
+            }
+            match prior_reviewer_chain {
+                Some(v) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", v),
+                None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
+            }
+        }
     }
 
     #[test]

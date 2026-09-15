@@ -434,3 +434,91 @@ fn task_scope_dispatching_after_crash_fails_closed_and_redrive_recovers() {
     let _ = std::fs::remove_file(&telemetry);
     let _ = std::fs::remove_dir_all(checkout);
 }
+
+#[test]
+fn task_scope_quota_watchdog_resumes_target_and_preserves_unrelated_due_wake() {
+    let target = "target-quota-bead";
+    let target_session = "sess-target-quota";
+    let unrelated = "unrelated-quota-bead";
+    let unrelated_session = "sess-unrelated-quota";
+
+    daemon::health::quota_watchdog::clear(target);
+    daemon::health::quota_watchdog::clear(unrelated);
+
+    let path = sqlite_path("quota-watchdog-scope");
+    let store = SqliteStateStore::open(&path).unwrap();
+
+    let mut target_overlay = overlay(target, OverlayState::Dispatched);
+    target_overlay.branch = Some("factory/target-quota-bead-r1".into());
+    target_overlay.session_id = Some(target_session.into());
+    target_overlay.session_ao_project = Some("repo".into());
+    store.save(&target_overlay).unwrap();
+
+    let mut unrelated_overlay = overlay(unrelated, OverlayState::Dispatched);
+    unrelated_overlay.branch = Some("factory/unrelated-quota-bead-r1".into());
+    unrelated_overlay.session_id = Some(unrelated_session.into());
+    unrelated_overlay.session_ao_project = Some("repo".into());
+    store.save(&unrelated_overlay).unwrap();
+
+    // Arm quota watchdog for both target and unrelated beads with a reset time in the past
+    daemon::health::quota_watchdog::record_quota_reset(target, target_session, 1);
+    daemon::health::quota_watchdog::record_quota_reset(unrelated, unrelated_session, 1);
+    assert_eq!(daemon::health::quota_watchdog::recorded_reset_at(target), Some(1));
+    assert_eq!(daemon::health::quota_watchdog::recorded_reset_at(unrelated), Some(1));
+
+    let tracker = FakeTracker::new();
+    let scm = FakeScm::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let vcs = FakeVcs::new();
+    let mut scoped_cfg = cfg(Some(target));
+    scoped_cfg.fast_tick_secs = 1;
+    scoped_cfg.slow_tick_secs = 1;
+
+    let telemetry = path.with_extension("jsonl");
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &scoped_cfg,
+        telemetry_log: &telemetry,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 0).unwrap();
+    assert_eq!(summary.quota_watchdog_wakes, 1, "only target wake should fire");
+
+    let calls = sessions.calls.borrow();
+    assert!(
+        calls.contains(&format!("wake_pane({target_session})")),
+        "wake_pane must be called for target session: {calls:?}"
+    );
+    assert!(
+        !calls.contains(&format!("wake_pane({unrelated_session})")),
+        "wake_pane must NOT be called for unrelated session: {calls:?}"
+    );
+
+    // Target ledger entry was consumed
+    assert_eq!(
+        daemon::health::quota_watchdog::recorded_reset_at(target),
+        None,
+        "target quota watchdog entry must be consumed"
+    );
+    // Unrelated ledger entry is retained
+    assert_eq!(
+        daemon::health::quota_watchdog::recorded_reset_at(unrelated),
+        Some(1),
+        "unrelated quota watchdog entry must be retained"
+    );
+
+    daemon::health::quota_watchdog::clear(target);
+    daemon::health::quota_watchdog::clear(unrelated);
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    let _ = std::fs::remove_file(&telemetry);
+}
