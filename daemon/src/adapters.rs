@@ -15532,6 +15532,8 @@ mod go_ao_lifecycle_tests {
                 "DARK_FACTORY_AGY_HOME",
                 "MINIMAX_API_KEY",
                 "DARK_FACTORY_CODER_FALLBACK_CHAIN",
+                "TMUX_TMPDIR",
+                "TMUX",
             ];
             let saved: Vec<(&'static str, Option<std::ffi::OsString>)> = KEYS
                 .iter()
@@ -15553,9 +15555,17 @@ mod go_ao_lifecycle_tests {
             std::fs::create_dir_all(root.join("synthetic-codex-home")).unwrap();
             let agy_home = root.join("synthetic-agy-home");
             std::fs::create_dir_all(&agy_home).unwrap();
+            let tmux_dir = root.join("synthetic-tmux-tmpdir");
+            std::fs::create_dir_all(&tmux_dir).unwrap();
+            #[cfg(unix)]
+            {
+                let _ = std::fs::set_permissions(&tmux_dir, std::fs::Permissions::from_mode(0o700));
+            }
             std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", root.join("synthetic-claude-config"));
             std::env::set_var("CODEX_HOME", root.join("synthetic-codex-home"));
             std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_home);
+            std::env::set_var("TMUX_TMPDIR", &tmux_dir);
+            std::env::remove_var("TMUX");
             std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
             std::env::set_var("GO_SPAWN_NONZERO", "0");
             std::env::remove_var("GO_SPAWN_NO_SESSION_ID");
@@ -15662,6 +15672,8 @@ mod go_ao_lifecycle_tests {
                 server_command.env_remove(key);
             }
         }
+        server_command.env_remove("TMUX");
+        let tmux_dir = root.join("synthetic-tmux-tmpdir");
         let server = server_command
             .arg("-c")
             .arg("import socket, sys, time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(); open(sys.argv[2], 'w').close(); time.sleep(600)")
@@ -15672,6 +15684,7 @@ mod go_ao_lifecycle_tests {
             .env("AO_PORT", listener_port.to_string())
             .env("CODEX_HOME", &codex_home)
             .env("HOME", &agy_home)
+            .env("TMUX_TMPDIR", &tmux_dir)
             .spawn()
             .unwrap();
         let server_pid = server.id();
@@ -15890,12 +15903,17 @@ exit 1
         for key in crate::account_scope::SCRUBBED_AUTH_VARS {
             wrong_command.env_remove(key);
         }
+        wrong_command.env_remove("TMUX");
+        let tmux_dir = root.join("synthetic-tmux-tmpdir");
+        let agy_home = root.join("synthetic-agy-home");
         let mut wrong_pid = wrong_command
             .args(["-c", "import time; time.sleep(600)"])
             .env("AO_RUN_FILE", &run_file)
             .env("AO_DATA_DIR", &data_dir)
             .env("AO_PORT", &port)
             .env("CODEX_HOME", &codex_home)
+            .env("HOME", &agy_home)
+            .env("TMUX_TMPDIR", &tmux_dir)
             .spawn()
             .unwrap();
         let pid = wrong_pid.id();
