@@ -16717,6 +16717,7 @@ fn test_dispatched_adopted_health_failed_session_unchanged_head_parks_human_held
     let tracker = FakeTracker::new();
     let mut sessions = FakeSessions::new();
     sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Terminal);
     sessions.set_session_health_failure("wa-hf-unchanged", "terminal session error: auth expired");
 
     let llm = FakeLlm::new();
@@ -16824,6 +16825,7 @@ fn test_dispatched_adopted_health_failed_session_advanced_head_promoted() {
     let tracker = FakeTracker::new();
     let mut sessions = FakeSessions::new();
     sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Terminal);
     sessions.set_session_health_failure("wa-hf-adv", "pane exited after push");
 
     let llm = FakeLlm::new();
@@ -16916,6 +16918,420 @@ fn test_dispatched_adopted_health_failed_session_advanced_head_promoted() {
     assert_eq!(
         o.session_id, None,
         "session handle must be cleared on promotion"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_dispatched_adopted_no_session_missing_baseline_stays_dispatched() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let branch = "fix/test-no-session-nobase";
+    let telemetry_log = std::env::temp_dir().join("afd_test_no_session_nobase.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-no-session-nobase".into(),
+        BeadOverlay {
+            bead_id: "bead-no-session-nobase".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(991),
+            branch: Some(branch.into()),
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-no-session-nobase", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(991));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 991),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        991,
+        PrSnapshot {
+            pr_number: 991,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-991".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-no-session-nobase").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "adopted bead with no session and missing baseline must fail closed (stay DISPATCHED)"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !telemetry.contains("REROLL_ADOPTED_SESSION_QUIESCED"),
+        "must not emit REROLL_ADOPTED_SESSION_QUIESCED without proved head advance"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_dispatched_adopted_no_session_unchanged_head_stays_dispatched() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-no-session-same";
+    let sha = "sha-same-no-session";
+    vcs.heads.insert(branch.into(), sha.into());
+    let telemetry_log = std::env::temp_dir().join("afd_test_no_session_same.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-no-session-same".into(),
+        BeadOverlay {
+            bead_id: "bead-no-session-same".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(990),
+            branch: Some(branch.into()),
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-no-session-same", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(990));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 990),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        990,
+        PrSnapshot {
+            pr_number: 990,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-no-session-same").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "adopted bead with no session and unchanged head must fail closed (stay DISPATCHED)"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !telemetry.contains("REROLL_ADOPTED_SESSION_QUIESCED"),
+        "must not emit REROLL_ADOPTED_SESSION_QUIESCED without proved head advance"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_dispatched_adopted_no_session_advanced_head_promotes() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-no-session-adv";
+    let pre_sha = "sha-pre-no-session";
+    let post_sha = "sha-post-no-session";
+    vcs.heads.insert(branch.into(), post_sha.into());
+    let telemetry_log = std::env::temp_dir().join("afd_test_no_session_adv.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-no-session-adv".into(),
+        BeadOverlay {
+            bead_id: "bead-no-session-adv".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(989),
+            branch: Some(branch.into()),
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(pre_sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-no-session-adv", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(989));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 989),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        989,
+        PrSnapshot {
+            pr_number: 989,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: post_sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-no-session-adv").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Attested,
+        "adopted bead with no session and distinct descendant head advance promotes to ATTESTED"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("REROLL_ADOPTED_SESSION_QUIESCED"),
+        "must emit REROLL_ADOPTED_SESSION_QUIESCED on proved head advance"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_dispatched_adopted_running_health_failed_with_descendant_stays_dispatched() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    // Explicit Running activity must win before health classification
+    sessions.set_activity(daemon::tools::SessionActivity::Running);
+    sessions.set_session_health_failure("wa-run-hf", "temporary health failure");
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-run-hf";
+    let pre_sha = "sha-pre-run-hf";
+    let post_sha = "sha-post-run-hf";
+    vcs.heads.insert(branch.into(), post_sha.into());
+    let telemetry_log = std::env::temp_dir().join("afd_test_run_hf.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-run-hf".into(),
+        BeadOverlay {
+            bead_id: "bead-run-hf".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(988),
+            branch: Some(branch.into()),
+            session_id: Some("wa-run-hf".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(pre_sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-run-hf", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(988));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 988),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        988,
+        PrSnapshot {
+            pr_number: 988,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: post_sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-run-hf").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "running session with health failure must remain DISPATCHED even with descendant head"
+    );
+    assert_eq!(
+        o.session_id,
+        Some("wa-run-hf".into()),
+        "running worker handle must not be cleared"
+    );
+    assert!(
+        !sessions.stop_succeeded.get(),
+        "running worker must not be reaped while reported running"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !telemetry.contains("REROLL_ADOPTED_SESSION_QUIESCED"),
+        "must not emit REROLL_ADOPTED_SESSION_QUIESCED while worker is running"
     );
 
     let _ = std::fs::remove_file(&telemetry_log);

@@ -5462,7 +5462,25 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                         | crate::tools::SessionActivity::NotFound)
                                 );
 
-                            if is_terminal_or_unhealthy {
+                            if matches!(activity, Ok(crate::tools::SessionActivity::Running)) {
+                                if let Some(reason) = health_failure {
+                                    let _ = emit(
+                                        deps.telemetry_log,
+                                        bead_id,
+                                        overlay.attempt,
+                                        OverlayState::Dispatched.as_str(),
+                                        "SESSION_HEALTH_FAILED",
+                                        serde_json::json!({}),
+                                        serde_json::json!({
+                                            "session_id": session_id_str,
+                                            "reason": reason,
+                                            "branch": overlay.branch,
+                                            "action": "retained_live_running_worker",
+                                        }),
+                                    );
+                                }
+                                false
+                            } else if is_terminal_or_unhealthy {
                                 let head_advance = check_adopted_head_advance(
                                     deps,
                                     overlay.branch.as_deref(),
@@ -5526,13 +5544,19 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                         );
                                         matches!(head_advance, AdoptedHeadAdvance::Advanced { .. })
                                     }
-                                    Ok(crate::tools::SessionActivity::Running) => false,
                                     _ => false,
                                 }
                             }
                         }
                         (Some(_), Err(_)) => false,
-                        (None, _) => true,
+                        (None, _) => {
+                            let head_advance = check_adopted_head_advance(
+                                deps,
+                                overlay.branch.as_deref(),
+                                overlay.pre_session_head_sha.as_deref(),
+                            );
+                            matches!(head_advance, AdoptedHeadAdvance::Advanced { .. })
+                        }
                     }
                 } else {
                     true
