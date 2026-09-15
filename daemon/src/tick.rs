@@ -3260,6 +3260,139 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 continue;
             }
 
+            if failure.phase == "register_branch" && !failure.transient {
+                // dispatch::dispatch_ready durably parked this bead HUMAN_HELD before returning
+                // this collision; park-save failures use another phase or return without a report.
+                let reason_val = HumanHoldReason::BranchRegistrationConflict.value();
+                let reason = reason_val.as_str();
+                summary.beads_parked_human_held += 1;
+                emit(
+                    deps.telemetry_log,
+                    &failure.bead_id,
+                    failure.attempt,
+                    OverlayState::HumanHeld.as_str(),
+                    "PARKED_HUMAN_HELD",
+                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": reason,
+                        "branch": failure.branch.as_deref(),
+                        "error": failure.error.as_str(),
+                    }),
+                )?;
+                if escalation_already_recorded(deps, &failure.bead_id)? {
+                    continue;
+                }
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: bead `{}` encountered a permanent branch registration conflict for branch `{}`. Automation parked it HUMAN_HELD rather than dispatching with a conflicted branch; inspect the active branch registry before requeuing. Details: {}",
+                    failure.bead_id,
+                    failure.branch.as_deref().unwrap_or("unknown"),
+                    failure.error.as_str()
+                );
+                if let Err(err) = post_scm_comment_by_bead_id(deps, &failure.bead_id, &comment_body)
+                {
+                    if is_missing_scm_target_error(&err) {
+                        record_local_escalation_fallback(
+                            deps,
+                            &failure.bead_id,
+                            reason,
+                        )?;
+                        summary.beads_escalated_locally += 1;
+                        emit(
+                            deps.telemetry_log,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            "ESCALATED_LOCALLY",
+                            serde_json::json!({}),
+                            serde_json::json!({
+                                "reason": reason,
+                                "branch": failure.branch.as_deref(),
+                                "scm_error": err.to_string(),
+                            }),
+                        )?;
+                        continue;
+                    }
+                    if !err.is_transient() {
+                        mark_escalation_undeliverable_and_emit(
+                            deps,
+                            summary,
+                            &failure.bead_id,
+                            failure.attempt,
+                            OverlayState::HumanHeld.as_str(),
+                            reason,
+                            &err,
+                        )?;
+                        continue;
+                    }
+                    let ctx = serde_json::json!({
+                        "reason": reason,
+                        "branch": failure.branch.as_deref(),
+                        "error": err.to_string(),
+                    });
+                    let now_epoch = now_epoch_secs();
+                    let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                        deps,
+                        &failure.bead_id,
+                        reason,
+                        &ctx,
+                        now_epoch,
+                    )?;
+                    if !should_emit {
+                        summary.escalations_suppressed += 1;
+                        continue;
+                    }
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_NOTIFICATION_FAILED",
+                        serde_json::json!({}),
+                        ctx,
+                    )?;
+                    record_escalation_emit_dedup(
+                        deps,
+                        &failure.bead_id,
+                        reason,
+                        &ctx_hash,
+                        now_epoch,
+                    )?;
+                    continue;
+                }
+                record_escalation(deps, &failure.bead_id, reason)?;
+                summary.beads_escalated += 1;
+                let ctx = serde_json::json!({"reason": reason});
+                let now_epoch = now_epoch_secs();
+                let (should_emit, ctx_hash) = escalation_dedup_should_emit(
+                    deps,
+                    &failure.bead_id,
+                    reason,
+                    &ctx,
+                    now_epoch,
+                )?;
+                if !should_emit {
+                    summary.escalations_suppressed += 1;
+                } else {
+                    emit(
+                        deps.telemetry_log,
+                        &failure.bead_id,
+                        failure.attempt,
+                        OverlayState::HumanHeld.as_str(),
+                        "ESCALATION_REQUIRED",
+                        serde_json::json!({}),
+                        ctx,
+                    )?;
+                    record_escalation_emit_dedup(
+                        deps,
+                        &failure.bead_id,
+                        reason,
+                        &ctx_hash,
+                        now_epoch,
+                    )?;
+                }
+                continue;
+            }
+
             if failure.phase == "worktree_remote_mismatch" {
                 // jleechan-bqdv Stage C: mirrors the `unmapped_target_repo`
                 // idiom immediately above. `dispatch::dispatch_ready` already
@@ -7136,11 +7269,13 @@ fn record_local_escalation_fallback(
     reason: &str,
 ) -> Result<(), DaemonError> {
     if let Some(mut overlay) = deps.store.load(bead_id)? {
-        set_human_hold_reason(
-            &mut overlay,
-            HumanHoldReason::EscalationLocalFallback(reason.to_string()),
-        );
-        deps.store.save(&overlay)?;
+        if overlay.park_reason.as_deref() != Some("branch_registration_conflict") {
+            set_human_hold_reason(
+                &mut overlay,
+                HumanHoldReason::EscalationLocalFallback(reason.to_string()),
+            );
+            deps.store.save(&overlay)?;
+        }
     }
     record_escalation(deps, bead_id, reason)
 }
