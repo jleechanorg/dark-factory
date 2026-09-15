@@ -1984,13 +1984,6 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 reason,
             } => {
                 let owner_live = deps.store.load(&owner)?.is_some();
-                let comment_body = format!(
-                    "🤖 **[dark-factory]** Escalation required: refusing factory PR adoption for branch `{}` because it is already registered to bead `{}`. Branch-key stealing is not allowed; please use a unique same-repo branch.",
-                    adopted.head_ref_name, owner
-                );
-                let _ = deps
-                    .tracker
-                    .comment_external(&adopted.external_ref, &comment_body);
                 let ctx = serde_json::json!({
                     "reason": "adoption_branch_collision",
                     "identity_refusal": reason,
@@ -2014,6 +2007,18 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     summary.escalations_suppressed += 1;
                     continue;
                 }
+                // The comment MUST stay below the dedup gate. An unresolved
+                // collision is re-evaluated on every tick, so posting before
+                // this check re-comments forever while telemetry correctly
+                // dedups — that put ~2,500 identical comments on each of
+                // worldarchitect.ai #7861/#8541/#8672/#8006 in Aug 2026.
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: refusing factory PR adoption for branch `{}` because it is already registered to bead `{}`. Branch-key stealing is not allowed; please use a unique same-repo branch.",
+                    adopted.head_ref_name, owner
+                );
+                let _ = deps
+                    .tracker
+                    .comment_external(&adopted.external_ref, &comment_body);
                 summary.beads_escalated += 1;
                 emit(
                     deps.telemetry_log,
