@@ -3711,11 +3711,11 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
             REVIEWER_TIMEOUT_SECS,
         ),
         // Default fallback reviewer (Cursor CLI, bashrc `agentf`). Invoked as
-        // `cursor-agent -f <prompt>` (headless). Distinct family from
+        // `cursor-agent -p -f <prompt>` (headless print mode). Distinct family from
         // claudem/agy (see `verifier::vendor_model_family`).
         "cursor-agent" | "cursor" | "agentf" => run_tool(
             "cursor-agent",
-            &["-f", prompt],
+            &["-p", "-f", prompt],
             REVIEWER_TIMEOUT_SECS,
         ),
         other => Err(DaemonError::Tool {
