@@ -1984,13 +1984,6 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                 reason,
             } => {
                 let owner_live = deps.store.load(&owner)?.is_some();
-                let comment_body = format!(
-                    "🤖 **[dark-factory]** Escalation required: refusing factory PR adoption for branch `{}` because it is already registered to bead `{}`. Branch-key stealing is not allowed; please use a unique same-repo branch.",
-                    adopted.head_ref_name, owner
-                );
-                let _ = deps
-                    .tracker
-                    .comment_external(&adopted.external_ref, &comment_body);
                 let ctx = serde_json::json!({
                     "reason": "adoption_branch_collision",
                     "identity_refusal": reason,
@@ -2014,23 +2007,66 @@ fn run_slow_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     summary.escalations_suppressed += 1;
                     continue;
                 }
-                summary.beads_escalated += 1;
-                emit(
-                    deps.telemetry_log,
-                    &adopted.bead_id,
-                    1,
-                    OverlayState::HumanHeld.as_str(),
-                    "ESCALATION_REQUIRED",
-                    serde_json::json!({}),
-                    ctx,
-                )?;
-                record_escalation_emit_dedup(
-                    deps,
-                    &adopted.bead_id,
-                    "adoption_branch_collision",
-                    &ctx_hash,
-                    now_epoch,
-                )?;
+                // The comment MUST stay below the dedup gate. An unresolved
+                // collision is re-evaluated on every tick, so posting before
+                // this check re-comments forever while telemetry correctly
+                // dedups — that put ~2,500 identical comments on each of
+                // worldarchitect.ai #7861/#8541/#8672/#8006 in Aug 2026.
+                let comment_body = format!(
+                    "🤖 **[dark-factory]** Escalation required: refusing factory PR adoption for branch `{}` because it is already registered to bead `{}`. Branch-key stealing is not allowed; please use a unique same-repo branch.",
+                    adopted.head_ref_name, owner
+                );
+                match deps
+                    .tracker
+                    .comment_external(&adopted.external_ref, &comment_body)
+                {
+                    Ok(()) => {
+                        // Only a CONFIRMED comment marks the ledger row sent.
+                        // Recording on a discarded/unknown result (the prior
+                        // bug CodeRabbit flagged on this PR) would suppress
+                        // the retry even though nothing was ever delivered.
+                        summary.beads_escalated += 1;
+                        emit(
+                            deps.telemetry_log,
+                            &adopted.bead_id,
+                            1,
+                            OverlayState::HumanHeld.as_str(),
+                            "ESCALATION_REQUIRED",
+                            serde_json::json!({}),
+                            ctx,
+                        )?;
+                        record_escalation_emit_dedup(
+                            deps,
+                            &adopted.bead_id,
+                            "adoption_branch_collision",
+                            &ctx_hash,
+                            now_epoch,
+                        )?;
+                    }
+                    Err(err) if !err.is_transient() => {
+                        // Permanent failure (e.g. a malformed external_ref):
+                        // mark the ledger row terminal so should_emit never
+                        // re-fires this reason again, mirroring the
+                        // transient-spawn-retry arm's undeliverable path.
+                        mark_escalation_undeliverable_and_emit(
+                            deps,
+                            summary,
+                            &adopted.bead_id,
+                            1,
+                            OverlayState::HumanHeld.as_str(),
+                            "adoption_branch_collision",
+                            &err,
+                        )?;
+                    }
+                    Err(_) => {
+                        // Transient failure: leave the ledger row unrecorded
+                        // so should_emit sees no prior record and retries the
+                        // comment next tick, per CodeRabbit's finding on this
+                        // PR (2026-09-15) that discarding this Result let a
+                        // transient failure permanently suppress delivery.
+                        summary.escalations_suppressed += 1;
+                    }
+                }
                 continue;
             }
         }

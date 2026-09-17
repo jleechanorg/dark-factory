@@ -27,6 +27,7 @@ fn fake_tracker_records_calls_and_returns_scripted_response() {
         fail_next_fetch_candidates: Default::default(),
         fail_next_comment: Default::default(),
         fail_next_comment_permanent: Default::default(),
+        fail_comment_matching: Default::default(),
         calls: Default::default(),
     };
 
