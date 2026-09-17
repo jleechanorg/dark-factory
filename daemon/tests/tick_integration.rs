@@ -16011,6 +16011,143 @@ fn adoption_branch_collision_comments_once_across_repeated_ticks() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// CodeRabbit finding on PR #845 (2026-09-15): the fix above moved the
+/// collision comment below the dedup gate, but the arm still discarded the
+/// `comment_external` `Result` with `let _ =`. A transient GitHub failure
+/// (rate limit, network blip) would still record the escalation as sent,
+/// permanently suppressing delivery on every future tick even though nothing
+/// was ever posted — silent under-notification, the opposite failure mode
+/// from the one #845 fixed. Scripting the FIRST collision-comment attempt to
+/// fail transiently, then letting two more ticks run, must show: attempt 1
+/// failed (not delivered), attempt 2 succeeds and is the only delivery, and
+/// attempt 3 never happens because tick 2 already recorded the ledger.
+#[test]
+fn adoption_branch_collision_retries_after_transient_comment_failure() {
+    let mut scm = FakeScm::new();
+    scm.prs.push(LabeledPr {
+        number: 8731,
+        title: "Colliding branch PR".into(),
+        body: "collides with existing registration".into(),
+        author_login: "jleechan2015".into(),
+        external_ref: "jleechanorg/worldarchitect.ai#8731".into(),
+        head_ref_name: "fix/rev-ilwk7-move-modal-validators".into(),
+        is_cross_repository: false,
+        head_repo_full_name: Some("jleechanorg/worldarchitect.ai".into()),
+        head_repo_owner_login: Some("jleechanorg".into()),
+        head_sha: Some("sha-8731-colliding".into()),
+        updated_at_epoch: Some(1_700_000_000),
+    });
+    scm.permissions
+        .insert("jleechan2015".into(), Permission::Write);
+
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    store
+        .save(&BeadOverlay {
+            bead_id: "legacy-bead-ver0".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: Some(123),
+            branch: Some("fix/rev-ilwk7-move-modal-validators".into()),
+            session_id: Some("sess-legacy".into()),
+            session_ao_project: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        })
+        .unwrap();
+    store
+        .register_branch("legacy-bead-ver0", "fix/rev-ilwk7-move-modal-validators")
+        .unwrap();
+
+    let mut cfg = test_cfg();
+    cfg.target_repo = "jleechanorg/dark-factory".into();
+    cfg.repos.insert(
+        "jleechanorg/worldarchitect.ai".into(),
+        daemon::config::RepoConfig {
+            ao_project: "worldarchitect".into(),
+            push_remote: "origin".into(),
+            local_checkout: Some(std::env::current_dir().unwrap()),
+        },
+    );
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join("afd_collision_transient_retry.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    fn collision_comment_count(tracker: &FakeTracker) -> usize {
+        tracker
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| {
+                call.starts_with("comment_external(") && call.contains("Branch-key stealing")
+            })
+            .count()
+    }
+
+    // Tick 1 fires TWO comment_external calls in this fixture: intake's own
+    // "picked up this PR" comment, then (same tick) the collision escalation
+    // itself. Script the transient failure to match ONLY the collision
+    // comment's body, so intake's unrelated comment succeeds normally and
+    // the "adoption_branch_collision" ledger row is left unrecorded.
+    *tracker.fail_comment_matching.borrow_mut() = Some((
+        "Branch-key stealing".into(),
+        "HTTP 502: transient gateway error".into(),
+    ));
+
+    run_tick(&deps, 0, 0).expect("tick 1 must survive a transient comment failure");
+    assert_eq!(
+        collision_comment_count(&tracker),
+        1,
+        "tick 1's collision comment must have been ATTEMPTED even though it \
+         returned Err — the fake tracker logs the call before deciding \
+         success/failure: {:?}",
+        tracker.calls.borrow()
+    );
+
+    run_tick(&deps, 0, 0).expect("tick 2 must retry after the unrecorded failure");
+    assert_eq!(
+        collision_comment_count(&tracker),
+        2,
+        "tick 1 failed transiently and must NOT have recorded the dedup \
+         ledger, so tick 2 retries — this is its SECOND attempt, and the \
+         first one actually delivered: {:?}",
+        tracker.calls.borrow()
+    );
+
+    run_tick(&deps, 0, 0).expect("tick 3 must not retry — tick 2 succeeded and recorded");
+    assert_eq!(
+        collision_comment_count(&tracker),
+        2,
+        "tick 2 succeeded and recorded the dedup ledger, so tick 3 is \
+         suppressed — still only 2 total attempts, never a 3rd: {:?}",
+        tracker.calls.borrow()
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// Bead jleechan-w0r4: verify that when an adopted remediation session transitions
 /// to idle (finished prompt execution), the daemon reaps the worker session via
 /// stop() and promotes the bead to ATTESTED, clearing the session handle.

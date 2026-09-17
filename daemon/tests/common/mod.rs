@@ -56,6 +56,13 @@ pub struct FakeTracker {
     /// set, this takes precedence over `fail_next_comment` so a test can drive
     /// the terminal-marking path. Consumed once.
     pub fail_next_comment_permanent: RefCell<Option<String>>,
+    /// Scripts a TRANSIENT `comment_external` failure only for the call whose
+    /// body contains `substring`, leaving every other call (e.g. the intake
+    /// "picked up this PR" comment that always precedes an escalation in the
+    /// same tick) to succeed normally. Consumed once on match. Needed because
+    /// `fail_next_comment` fails whichever call happens to be next, which
+    /// can't isolate one comment among several fired in a single tick.
+    pub fail_comment_matching: RefCell<Option<(String, String)>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -165,6 +172,19 @@ impl Tracker for FakeTracker {
         self.calls
             .borrow_mut()
             .push(format!("comment_external({external_ref},{body})"));
+        let matches_scripted = self
+            .fail_comment_matching
+            .borrow()
+            .as_ref()
+            .is_some_and(|(substring, _)| body.contains(substring.as_str()));
+        if matches_scripted {
+            let (_, stderr) = self.fail_comment_matching.borrow_mut().take().unwrap();
+            return Err(DaemonError::Tool {
+                tool: "gh".into(),
+                rc: 1,
+                stderr,
+            });
+        }
         if let Some(msg) = self.fail_next_comment_permanent.borrow_mut().take() {
             return Err(DaemonError::Config(msg));
         }
