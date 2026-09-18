@@ -1539,6 +1539,57 @@ pub fn find_cargo_manifest_recursive(repo_root: &Path, max_depth: usize) -> Opti
     None
 }
 
+/// Resolve `bare_name` (the identifier `discover_test_fns_with_skip` parsed
+/// after `fn `) to the fully-qualified name cargo's test harness actually
+/// registers for `--exact` filtering. Integration tests declared inside a
+/// `mod foo { ... }` block compile to `foo::bare_name`, not `bare_name` —
+/// our source scanner does not track module nesting, so a naive
+/// `--exact bare_name` silently selects zero tests and the caller records a
+/// false `NEVER_RAN` (CodeRabbit finding 4, issue #387 r7).
+///
+/// Lists the target's tests via `cargo test --test <basename> -- --list`
+/// and matches `bare_name` first exactly, then as the suffix after `::`.
+/// Falls back to `bare_name` unchanged when the list can't be obtained or
+/// no match is found, preserving today's (still fail-closed) behavior.
+fn resolve_cargo_test_name(
+    cargo_bin: &Path,
+    repo_root: &Path,
+    basename: &str,
+    manifest: Option<&Path>,
+    bare_name: &str,
+) -> String {
+    let mut args: Vec<String> = vec!["test".to_string(), "--test".to_string(), basename.to_string()];
+    if let Some(m) = manifest {
+        args.push("--manifest-path".to_string());
+        args.push(m.to_string_lossy().into_owned());
+    }
+    args.push("--".to_string());
+    args.push("--list".to_string());
+
+    let Ok(out) = Command::new(cargo_bin)
+        .current_dir(repo_root)
+        .args(&args)
+        .output()
+    else {
+        return bare_name.to_string();
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let suffix = format!("::{bare_name}");
+    let mut suffix_match: Option<String> = None;
+    for line in stdout.lines() {
+        let Some(name) = line.strip_suffix(": test") else {
+            continue;
+        };
+        if name == bare_name {
+            return name.to_string();
+        }
+        if suffix_match.is_none() && name.ends_with(&suffix) {
+            suffix_match = Some(name.to_string());
+        }
+    }
+    suffix_match.unwrap_or_else(|| bare_name.to_string())
+}
+
 /// Run cargo test against the working tree (or a worktree under
 /// `baseline_root` for the baseline-main phase) using the resolved
 /// manifest. Issue #387 r5 finding 3: `--manifest-path` is required
@@ -1601,6 +1652,14 @@ fn run_cargo_tests(
             continue;
         }
 
+        let resolved_name = resolve_cargo_test_name(
+            &cargo_bin,
+            repo_root,
+            basename,
+            manifest,
+            &target.name,
+        );
+
         let mut args: Vec<String> = vec![
             "test".to_string(),
             "--test".to_string(),
@@ -1611,7 +1670,7 @@ fn run_cargo_tests(
             args.push(m.to_string_lossy().into_owned());
         }
         args.push("--".to_string());
-        args.push(target.name.clone());
+        args.push(resolved_name.clone());
         args.push("--exact".to_string());
 
         let out = Command::new(&cargo_bin)
@@ -1634,10 +1693,14 @@ fn run_cargo_tests(
             compile_errored = true;
         }
 
+        // Report failures keyed by the diff-scanned bare name (matches
+        // `targeted_tests` elsewhere in the report) even though matching
+        // against cargo's own output uses the resolved, module-qualified
+        // name.
         let name = &target.name;
-        let passed_marker = format!("test {name} ... ok");
-        let failed_marker = format!("test {name} ... FAILED");
-        let ignored_marker = format!("test {name} ... ignored");
+        let passed_marker = format!("test {resolved_name} ... ok");
+        let failed_marker = format!("test {resolved_name} ... FAILED");
+        let ignored_marker = format!("test {resolved_name} ... ignored");
         if stdout.contains(&failed_marker) || stderr.contains(&failed_marker) {
             failing.push(name.clone());
         } else if stdout.contains(&ignored_marker) {
@@ -1700,19 +1763,89 @@ fn run_baseline_check(
         )));
     }
 
-    // Resolve the manifest path relative to the worktree root if the
-    // caller passed a relative manifest — manifests passed in are
-    // typically repo-relative (e.g. "daemon/Cargo.toml"), and the
-    // worktree uses the same relative layout.
-    let baseline_manifest = manifest.map(|m| {
-        if m.is_absolute() {
-            m.to_path_buf()
-        } else {
-            tmp.join(m)
-        }
-    });
+    // `cargo_targets` paths are resolved against the PR target worktree
+    // (`repo_root`). Rebase them into the detached baseline before
+    // materializing/running — mirrors `run_pytest_baseline_check`, which
+    // hit the same problem first (issue #387 r7 / CodeRabbit finding 5).
+    let baseline_targets: Vec<CargoTarget> = cargo_targets
+        .iter()
+        .map(|target| CargoTarget {
+            path: rebase_worktree_path(repo_root, &tmp, &target.path),
+            name: target.name.clone(),
+        })
+        .collect();
 
-    let result = run_cargo_tests(&tmp, cargo_targets, baseline_manifest.as_deref(), cargo_loc);
+    // Unlike the pytest analogue, Cargo targets that are genuinely ADDED by
+    // this PR (the fn name has no counterpart anywhere in the base-side
+    // file — whether because the whole test file is new, or the fn was
+    // added to an existing file) cannot simply be copied into the baseline
+    // and executed: Rust is statically compiled, so a test that exercises a
+    // production symbol the PR *also* introduces (the overwhelmingly common
+    // "add a fn + add its test" shape) fails to compile against base
+    // production code with an unresolved-symbol error — not because the
+    // test was "already broken", but because the symbol it needs is itself
+    // part of this PR. Forcing execution here would turn every ordinary
+    // TDD-style PR into a false `BaselineFailed`. Python's dynamic imports
+    // don't hit this: an unused symbol only errors if actually called.
+    //
+    // There is also nothing meaningful to check for an added fn: baseline
+    // exists to answer "was this test already failing before the PR",
+    // which presupposes the test already existed. So added targets are
+    // skipped rather than materialized — they trivially satisfy the
+    // baseline phase.
+    //
+    // MODIFIED targets (fn name already present in the base-side file) need
+    // no materialization at all: `git worktree add --detach base_ref`
+    // already checked out that file's true base body/imports/helpers, so
+    // rebasing the path is sufficient for `run_cargo_tests` to exercise the
+    // real base state.
+    let mut runnable_targets: Vec<CargoTarget> = Vec::new();
+    for (target, baseline_target) in cargo_targets.iter().zip(&baseline_targets) {
+        let rel = relative_repo_path(repo_root, &target.path);
+        let base_src = rel.and_then(|path| read_base_blob(repo_root, base_ref, &path));
+        let base_names: BTreeSet<String> = base_src
+            .as_deref()
+            .map(discover_test_fns)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if base_names.contains(&target.name) {
+            runnable_targets.push(baseline_target.clone());
+        }
+    }
+
+    // Rebase the manifest into the detached worktree the same way
+    // `run_pytest_baseline_check` does (`rebase_worktree_path`), not the
+    // former `m.is_absolute() => passthrough` shortcut: `repo_root` is an
+    // absolute path in production (the daemon always resolves an absolute
+    // PR worktree), so `find_cargo_manifest`/`find_cargo_manifest_recursive`
+    // return an absolute manifest too. The passthrough case therefore fired
+    // on every real invocation, pointing `--manifest-path` straight back at
+    // the live PR worktree's Cargo.toml/src instead of the detached base —
+    // silently defeating the entire baseline phase. `rebase_worktree_path`
+    // strips the `repo_root` prefix before falling back to passthrough, so
+    // it only keeps an external absolute path (e.g. a manifest genuinely
+    // outside the repo) untouched.
+    let baseline_manifest = manifest
+        .map(|m| rebase_worktree_path(repo_root, &tmp, m))
+        .filter(|p| p.is_file());
+
+    // An empty `runnable_targets` here means every target was genuinely
+    // added (skipped above), not that discovery found nothing — the
+    // top-level `head_pass` phase already rejected a truly-empty
+    // `cargo_targets` before baseline ever runs. Skip spawning cargo
+    // entirely rather than routing through `run_cargo_tests`'s empty-input
+    // guard, which exists for that different (real "nothing to check")
+    // case and would incorrectly report `<no-cargo-targets>:NEVER_RAN`
+    // here.
+    let result = if runnable_targets.is_empty() {
+        Ok(CargoOutcome {
+            failing: Vec::new(),
+            compile_errored: false,
+        })
+    } else {
+        run_cargo_tests(&tmp, &runnable_targets, baseline_manifest.as_deref(), cargo_loc)
+    };
 
     // Always clean up the worktree, even on error. We swallow cleanup
     // errors — the test outcome is the primary signal; a stale /tmp
@@ -2770,6 +2903,245 @@ fn b() {
             "ignored tests must not count as green: {outcome:?}"
         );
         assert_eq!(outcome.failing, vec!["ignored_case:NEVER_RAN".to_string()]);
+    }
+
+    #[test]
+    fn cargo_module_qualified_test_name_is_resolved_before_exact_filter() {
+        // CodeRabbit finding 4 (issue #387 r7): `discover_test_fns_with_skip`
+        // only captures the bare fn identifier, so a test declared inside a
+        // `mod nested { ... }` block — which cargo registers internally as
+        // `nested::qualified_case` — was never matched by
+        // `--exact qualified_case`, and the output parser looked for
+        // `test qualified_case ... ok`, which cargo never prints. Both sides
+        // must use the resolved, module-qualified name.
+        let dir = tempdir_unique("cargo-qualified-name");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"cargo-qualified-fixture\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+        std::fs::write(
+            dir.join("tests/scenario.rs"),
+            "mod nested {\n    #[test]\n    fn qualified_case() { assert_eq!(2 + 2, 4); }\n}\n",
+        )
+        .unwrap();
+
+        let cargo_loc = resolve_cargo(cargo_home_from_env().as_deref());
+        assert_ne!(
+            cargo_loc,
+            CargoLocation::NotFound,
+            "cargo is required for this fixture"
+        );
+        let outcome = run_cargo_tests(
+            &dir,
+            &[CargoTarget {
+                path: dir.join("tests/scenario.rs"),
+                name: "qualified_case".to_string(),
+            }],
+            Some(&dir.join("Cargo.toml")),
+            cargo_loc,
+        )
+        .expect("cargo fixture should execute");
+
+        assert!(
+            outcome.all_passed(),
+            "module-qualified test must be resolved and actually executed, not NEVER_RAN: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_baseline_skips_head_only_added_target_instead_of_never_ran() {
+        // CodeRabbit finding 5 (issue #387 r7): `run_baseline_check` detaches
+        // `base_ref` into a temp worktree but (pre-fix) never accounted for
+        // HEAD-only Cargo targets. A test file added by the PR (with no base
+        // counterpart) is missing from the detached worktree, so
+        // `run_cargo_tests` cannot find `--test <basename>` and records
+        // NEVER_RAN, which the caller maps to a spurious BaselineFailed.
+        //
+        // The fix does NOT copy the added file in and force cargo to run it
+        // (unlike the pytest analogue): Rust needs the file to actually
+        // compile, and an added test very often exercises a production
+        // symbol this same PR also introduces, which doesn't exist at base.
+        // Forcing that compile would turn ordinary "add a fn + add its
+        // test" PRs into false BaselineFailed verdicts. There is also
+        // nothing meaningful to check — a test that never existed at base
+        // cannot have been "already broken". So added targets are skipped;
+        // this fixture's single target is entirely new (base has no
+        // `tests/` dir at all), so the whole baseline phase trivially
+        // passes rather than reporting NEVER_RAN.
+        let dir = tempdir_unique("cargo-baseline-new-file");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"cargo-baseline-new-file-fixture\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+
+        let run = |args: &[&str]| {
+            let out = Command::new(args[0])
+                .current_dir(&dir)
+                .args(&args[1..])
+                .output()
+                .expect("spawn fixture command");
+            assert!(
+                out.status.success(),
+                "fixture command {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["git", "init", "-q", "-b", "main"]);
+        run(&["git", "config", "user.email", "cargo-baseline@ci.invalid"]);
+        run(&["git", "config", "user.name", "cargo-baseline"]);
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        // HEAD adds a brand-new integration test file. Base has no
+        // `tests/` directory at all.
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("tests/new_scenario.rs"),
+            "#[test]\nfn new_case() { assert_eq!(2 + 2, 4); }\n",
+        )
+        .unwrap();
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "head"]);
+
+        let cargo_loc = resolve_cargo(cargo_home_from_env().as_deref());
+        assert_ne!(
+            cargo_loc,
+            CargoLocation::NotFound,
+            "cargo is required for this fixture"
+        );
+        let cargo_targets = vec![CargoTarget {
+            path: dir.join("tests/new_scenario.rs"),
+            name: "new_case".to_string(),
+        }];
+        let result = run_baseline_check(
+            &dir,
+            &base,
+            &cargo_targets,
+            Some(&dir.join("Cargo.toml")),
+            cargo_loc,
+        )
+        .expect("detached baseline should skip the head-only target cleanly");
+
+        assert!(
+            result.all_passed(),
+            "HEAD-only new test file must be skipped (trivially baseline-passing), not NEVER_RAN/BaselineFailed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_baseline_runs_true_base_body_for_modified_test() {
+        // Companion to the skip test above: for a MODIFIED target (the fn
+        // name already existed at base), `run_baseline_check` must actually
+        // exercise base's own test body/production code via the rebased
+        // path — not the live PR worktree's HEAD content. Base asserts
+        // `value() == 1` against base's `value() -> 1` (passes); HEAD
+        // changes `value()` to return 99 (a production regression this
+        // target isn't reverting/checking) and edits the test body just
+        // enough (an added trivial assertion) to count as "modified" while
+        // preserving the original assertion. If baseline leaked HEAD state
+        // (e.g. an unrebased/passthrough manifest pointing at the live
+        // worktree, the bug this fix replaces), it would evaluate
+        // `value() == 1` against HEAD's `value() == 99` and fail.
+        let dir = tempdir_unique("cargo-baseline-modified");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"cargo-baseline-modified-fixture\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+        std::fs::write(
+            dir.join("tests/scenario.rs"),
+            "#[test]\nfn modified_case() { assert_eq!(cargo_baseline_modified_fixture::value(), 1); }\n",
+        )
+        .unwrap();
+
+        let run = |args: &[&str]| {
+            let out = Command::new(args[0])
+                .current_dir(&dir)
+                .args(&args[1..])
+                .output()
+                .expect("spawn fixture command");
+            assert!(
+                out.status.success(),
+                "fixture command {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["git", "init", "-q", "-b", "main"]);
+        run(&["git", "config", "user.email", "cargo-baseline@ci.invalid"]);
+        run(&["git", "config", "user.name", "cargo-baseline"]);
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        // HEAD: production regresses (99, unrelated to this target's own
+        // revert phase), and the test body picks up a trivial byte-level
+        // change (extra `assert!(true)`) so it classifies as "modified"
+        // while its core assertion is untouched.
+        std::fs::write(dir.join("src/lib.rs"), "pub fn value() -> u8 { 99 }\n").unwrap();
+        std::fs::write(
+            dir.join("tests/scenario.rs"),
+            "#[test]\nfn modified_case() { assert!(true); assert_eq!(cargo_baseline_modified_fixture::value(), 1); }\n",
+        )
+        .unwrap();
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "head"]);
+
+        let cargo_loc = resolve_cargo(cargo_home_from_env().as_deref());
+        assert_ne!(
+            cargo_loc,
+            CargoLocation::NotFound,
+            "cargo is required for this fixture"
+        );
+        let cargo_targets = vec![CargoTarget {
+            path: dir.join("tests/scenario.rs"),
+            name: "modified_case".to_string(),
+        }];
+        let result = run_baseline_check(
+            &dir,
+            &base,
+            &cargo_targets,
+            Some(&dir.join("Cargo.toml")),
+            cargo_loc,
+        )
+        .expect("detached baseline should run the modified target against true base state");
+
+        assert!(
+            result.all_passed(),
+            "baseline must evaluate the target against base's own body/production code, not HEAD's: {result:?}"
+        );
     }
 
     /// Create a unique temp directory under `std::env::temp_dir()`. The
