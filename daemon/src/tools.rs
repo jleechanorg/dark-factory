@@ -1308,22 +1308,33 @@ fn run_tool_with_cwd_scoped(
         }
         // Centralized AI account scoping: runs after extra_env overrides so
         // caller-passed extra_env cannot bypass safety. Fails closed before spawn.
+        // Preserve DaemonError::Config as-is: account-scope validators return
+        // it for permanent host misconfiguration, and is_transient() treats
+        // Config as non-transient (park immediately) vs Tool (retry until
+        // MAX_TRANSIENT_SPAWN_RETRY exhausts). Downcasting Config to Tool here
+        // made dispatch requeue an unchanged misconfiguration until the retry
+        // cap burned, then park with a generic transient-spawn reason instead
+        // of the real config error.
         if let Some(p) = provider {
-            crate::account_scope::apply_provider_scope(p, &mut command).map_err(|e| {
-                DaemonError::Tool {
+            crate::account_scope::apply_provider_scope(p, &mut command).map_err(|e| match e {
+                config @ DaemonError::Config(_) => config,
+                other => DaemonError::Tool {
                     tool: cmd.to_string(),
                     rc: -1,
-                    stderr: format!("account scope validation failed: {e}"),
-                }
+                    stderr: format!("account scope validation failed: {other}"),
+                },
             })?;
         } else {
-            crate::account_scope::apply_direct_cli_scope(cmd, extra_env, &mut command).map_err(|e| {
-                DaemonError::Tool {
-                    tool: cmd.to_string(),
-                    rc: -1,
-                    stderr: format!("account scope validation failed: {e}"),
-                }
-            })?;
+            crate::account_scope::apply_direct_cli_scope(cmd, extra_env, &mut command).map_err(
+                |e| match e {
+                    config @ DaemonError::Config(_) => config,
+                    other => DaemonError::Tool {
+                        tool: cmd.to_string(),
+                        rc: -1,
+                        stderr: format!("account scope validation failed: {other}"),
+                    },
+                },
+            )?;
         }
         let mut child = command.spawn().map_err(|e| DaemonError::Tool {
             tool: cmd.to_string(),

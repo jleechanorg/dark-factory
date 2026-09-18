@@ -3546,12 +3546,21 @@ fn run_go_scope_query(
         }
     };
     let refs: Vec<(&str, &str)> = env.iter().map(|(key, value)| (*key, *value)).collect();
-    crate::tools::run_scoped_tool_with_env(provider, "ao-go", args, None, &refs, 30)
-        .map_err(|_| DaemonError::Tool {
-            tool: format!("ao-go {label} preflight"),
-            rc: -1,
-            stderr: "scoped AO query failed".to_string(),
-        })
+    // Preserve DaemonError::Config through this layer too (see matching
+    // comment in tools.rs::run_tool_with_cwd_scoped): a permanent
+    // misconfiguration from the scoped validators must stay non-transient
+    // all the way to dispatch, not get re-flattened into a retryable Tool
+    // error here.
+    crate::tools::run_scoped_tool_with_env(provider, "ao-go", args, None, &refs, 30).map_err(
+        |e| match e {
+            config @ DaemonError::Config(_) => config,
+            _ => DaemonError::Tool {
+                tool: format!("ao-go {label} preflight"),
+                rc: -1,
+                stderr: "scoped AO query failed".to_string(),
+            },
+        },
+    )
 }
 
 fn validate_go_server_scope(
@@ -15704,6 +15713,43 @@ mod go_ao_lifecycle_tests {
     use crate::tools::{SessionActivity, Sessions};
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
+
+    /// CodeRabbit finding (daemon/src/tools.rs:1327): account-scope validators
+    /// return `DaemonError::Config` for permanent host misconfiguration, but
+    /// `run_tool_with_cwd_scoped` and `run_go_scope_query` used to downcast it
+    /// to `DaemonError::Tool` on the way out. `DaemonError::is_transient()`
+    /// treats `Tool` as retryable and `Config` as terminal, so the
+    /// misconfiguration got requeued every tick until `MAX_TRANSIENT_SPAWN_RETRY`
+    /// exhausted and the bead parked with a generic transient-spawn reason
+    /// instead of the real config error. `validate_claude_config_dir` fails
+    /// before any subprocess is spawned, so this exercises both conversion
+    /// layers (tools.rs's account-scope map_err, then run_go_scope_query's own
+    /// map_err) without depending on an `ao-go` binary being present.
+    #[test]
+    fn run_go_scope_query_preserves_config_error_as_non_transient() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR");
+        std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR");
+
+        let result = run_go_scope_query("claude", &["status", "--json"], &[], "status");
+
+        match prior {
+            Some(v) => std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR"),
+        }
+
+        let err = result.expect_err("expected permanent misconfiguration to surface as an error");
+        assert!(
+            matches!(err, DaemonError::Config(_)),
+            "expected DaemonError::Config to survive both conversion layers, got {err:?}"
+        );
+        assert_eq!(err.error_class(), "config");
+        assert!(
+            !err.is_transient(),
+            "a permanent config error must not be classified transient, or dispatch will \
+             requeue-and-exhaust-retry-cap instead of parking immediately"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     struct GoSpawnEnv {
