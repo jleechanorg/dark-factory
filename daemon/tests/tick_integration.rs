@@ -16012,6 +16012,341 @@ fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// dark-factory-lifecyc-gap2: a `check_session_health` failure must never
+/// override a live `SessionActivity::Running` signal on an adopted
+/// DISPATCHED bead. Before the fix, the health-failure branch ran
+/// unconditionally ahead of the activity check, so a transient AO probe
+/// error would stop and promote a session that was still actively pushing.
+#[test]
+fn test_dispatched_adopted_running_session_health_failure_does_not_reap() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Running);
+    // Model the same tick's two independent health probes: `run_fast_tier`'s
+    // unconditional reap check runs first and sees a transiently healthy
+    // session (`None`); the later adopted-promotion readiness check's own
+    // probe is scripted here to fail (`Some`) so the fix under test — never
+    // even *taking* that second probe once activity is known to be Running
+    // — is what keeps the session alive, not probe ordering luck.
+    *sessions.health_failure_sequence.borrow_mut() =
+        vec![None, Some("transient AO probe error".to_string())];
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let telemetry_log = std::env::temp_dir().join("afd_test_gap2.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-gap2".into(),
+        BeadOverlay {
+            bead_id: "bead-gap2".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(997),
+            branch: Some("fix/test-gap2".into()),
+            session_id: Some("wa-gap2".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-gap2", "fix/test-gap2").unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), "fix/test-gap2".into()), Some(997));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 997),
+        daemon::tools::PrHeadBranch::SameRepo("fix/test-gap2".into()),
+    );
+    scm.pr_snapshots.insert(
+        997,
+        PrSnapshot {
+            pr_number: 997,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-997".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-gap2").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "a running session must not be promoted on a health-check failure alone"
+    );
+    assert_eq!(
+        o.session_id,
+        Some("wa-gap2".into()),
+        "session handle must be retained — the worker is still live"
+    );
+    assert!(
+        !sessions.stop_succeeded.get(),
+        "sessions.stop() must not be called while activity is Running"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !telemetry.contains("SESSION_HEALTH_FAILED"),
+        "a Running session must short-circuit before the health-failure check fires: {telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// dark-factory-lifecyc-gap1: an adopted DISPATCHED bead with no
+/// `session_id` (never recorded, or already reaped) must fail closed rather
+/// than promote unconditionally. Covers both fail-closed cases: missing
+/// baseline SHA, and a baseline SHA the branch has not advanced past.
+#[test]
+fn test_dispatched_adopted_no_session_id_fails_closed_without_proven_advance() {
+    for (case, pre_session_head_sha, remote_head) in [
+        ("missing_baseline", None, None),
+        (
+            "unchanged_head",
+            Some("pre-sha-gap1".to_string()),
+            Some("pre-sha-gap1".to_string()),
+        ),
+    ] {
+        let mut scm = FakeScm::new();
+        let tracker = FakeTracker::new();
+        let sessions = FakeSessions::new();
+        let llm = FakeLlm::new();
+        let store = FakeStateStore::new();
+        let cfg = test_cfg();
+        let mut vcs = FakeVcs::new();
+        if let Some(head) = &remote_head {
+            vcs.heads
+                .insert("fix/test-gap1".into(), head.clone());
+        }
+        let telemetry_log =
+            std::env::temp_dir().join(format!("afd_test_gap1_{case}.jsonl"));
+        let _ = std::fs::remove_file(&telemetry_log);
+
+        store.overlays.borrow_mut().insert(
+            "bead-gap1".into(),
+            BeadOverlay {
+                bead_id: "bead-gap1".into(),
+                state: OverlayState::Dispatched,
+                attempt: 1,
+                reroll_count: 0,
+                autonomy_secs: 100,
+                spend_usd: 0.0,
+                pr_number: Some(996),
+                branch: Some("fix/test-gap1".into()),
+                session_id: None,
+                session_ao_project: None,
+                is_adopted: true,
+                spawn_failure_count: 0,
+                transient_error_count: 0,
+                pre_session_head_sha,
+                park_reason: None,
+                target_repo: None,
+                attempt_started_at: None,
+            },
+        );
+
+        store.register_branch("bead-gap1", "fix/test-gap1").unwrap();
+
+        scm.pr_numbers_for_branch
+            .insert(("owner/repo".into(), "fix/test-gap1".into()), Some(996));
+        scm.open_pr_head_refs.insert(
+            ("owner/repo".into(), 996),
+            daemon::tools::PrHeadBranch::SameRepo("fix/test-gap1".into()),
+        );
+        scm.pr_snapshots.insert(
+            996,
+            PrSnapshot {
+                pr_number: 996,
+                ci_success: true,
+                mergeable: true,
+                merge_state_unknown: false,
+                coderabbit_approved: true,
+                bugbot_error_count: 0,
+                unresolved_thread_count: Some(0),
+                head_sha: "head-996".into(),
+                body: "".into(),
+                comments: vec![],
+                files: vec![],
+                updated_at_epoch: 100,
+                ci_status: "green".to_string(),
+                coderabbit_status: "green".to_string(),
+                ci_pending: false,
+                bugbot_pending: false,
+                head_committed_epoch: 0,
+            },
+        );
+
+        let deps = TickDeps {
+            scm: &scm,
+            tracker: &tracker,
+            sessions: &sessions,
+            llm: &llm,
+            store: &store,
+            vcs: &vcs,
+            cfg: &cfg,
+            telemetry_log: &telemetry_log,
+            vendor_health: None,
+        };
+
+        let summary = run_tick(&deps, 0, 10).unwrap();
+        assert_eq!(summary.beads_parked_human_held, 0, "case {case}");
+
+        let o = store.load("bead-gap1").unwrap().unwrap();
+        assert_eq!(
+            o.state,
+            OverlayState::Dispatched,
+            "case {case}: no session_id and no proven head advance must fail closed"
+        );
+
+        let _ = std::fs::remove_file(&telemetry_log);
+    }
+}
+
+/// dark-factory-lifecyc-gap1 (GREEN counterpart): once the branch has
+/// provably advanced past the pre-session baseline, an adopted DISPATCHED
+/// bead with no `session_id` is allowed to promote.
+#[test]
+fn test_dispatched_adopted_no_session_id_promotes_on_proven_head_advance() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    vcs.heads
+        .insert("fix/test-gap1-advance".into(), "post-sha-gap1".into());
+    vcs.remote_ahead.insert(
+        ("fix/test-gap1-advance".into(), "pre-sha-gap1".into()),
+        true,
+    );
+    let telemetry_log = std::env::temp_dir().join("afd_test_gap1_advance.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-gap1-advance".into(),
+        BeadOverlay {
+            bead_id: "bead-gap1-advance".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(995),
+            branch: Some("fix/test-gap1-advance".into()),
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some("pre-sha-gap1".into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store
+        .register_branch("bead-gap1-advance", "fix/test-gap1-advance")
+        .unwrap();
+
+    scm.pr_numbers_for_branch.insert(
+        ("owner/repo".into(), "fix/test-gap1-advance".into()),
+        Some(995),
+    );
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 995),
+        daemon::tools::PrHeadBranch::SameRepo("fix/test-gap1-advance".into()),
+    );
+    scm.pr_snapshots.insert(
+        995,
+        PrSnapshot {
+            pr_number: 995,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-995".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-gap1-advance").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Attested,
+        "a proven remote head advance past the baseline must promote"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// Bead rev-3lm8k: when a coder session's worktree is auto-clean-enabled
 /// (`agent_worktree_root` set) and the session is reaped on promotion to
 /// ATTESTED (the same "coder session finished" moment PR #653/jleechan-w0r4

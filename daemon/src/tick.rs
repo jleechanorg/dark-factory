@@ -3582,11 +3582,11 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
             REVIEWER_TIMEOUT_SECS,
         ),
         // Default fallback reviewer (Cursor CLI, bashrc `agentf`). Invoked as
-        // `cursor-agent -f <prompt>` (headless). Distinct family from
+        // `cursor-agent -p -f <prompt>` (headless print mode). Distinct family from
         // claudem/agy (see `verifier::vendor_model_family`).
         "cursor-agent" | "cursor" | "agentf" => run_tool(
             "cursor-agent",
-            &["-f", prompt],
+            &["-p", "-f", prompt],
             REVIEWER_TIMEOUT_SECS,
         ),
         other => Err(DaemonError::Tool {
@@ -5315,7 +5315,21 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                     match (&overlay.session_id, overlay_session_project(deps, &overlay)) {
                         (Some(session_id_str), Ok(project)) => {
                             let sid = SessionId(session_id_str.clone());
-                            if let Ok(Some(health_failure)) = deps.sessions.check_session_health(&sid) {
+                            // dark-factory-lifecyc-gap2: consult AO activity
+                            // BEFORE a health-check failure. `Running` means
+                            // the worker may still be mid-push; a probe-level
+                            // health failure (e.g. a transient AO API error)
+                            // must never override that live-activity signal
+                            // and reap an actively-working session. Only
+                            // non-Running activity may be superseded via the
+                            // health-failure or quiescence paths below.
+                            let activity =
+                                deps.sessions.session_activity_in_project(&sid, &project);
+                            if matches!(activity, Ok(crate::tools::SessionActivity::Running)) {
+                                false
+                            } else if let Ok(Some(health_failure)) =
+                                deps.sessions.check_session_health(&sid)
+                            {
                                 emit(
                                     deps.telemetry_log,
                                     bead_id,
@@ -5337,7 +5351,7 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             {
                                 true
                             } else {
-                                match deps.sessions.session_activity_in_project(&sid, &project) {
+                                match activity {
                                     Ok(crate::tools::SessionActivity::Idle) => {
                                         stop_overlay_session(deps, &overlay, &sid).is_ok()
                                     }
@@ -5350,7 +5364,21 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                             }
                         }
                         (Some(_), Err(_)) => false,
-                        (None, _) => true,
+                        (None, _) => {
+                            // dark-factory-lifecyc-gap1: no session_id means
+                            // no live-session evidence at all (never
+                            // recorded, or already reaped). Promoting here
+                            // unconditionally let an adopted DISPATCHED bead
+                            // advance without ever proving real work landed.
+                            // Fail closed unless the remote branch has
+                            // provably moved past the pre-session baseline.
+                            match (&overlay.branch, &overlay.pre_session_head_sha) {
+                                (Some(branch), Some(pre_sha)) => {
+                                    deps.vcs.is_remote_ahead(branch, pre_sha).unwrap_or(false)
+                                }
+                                _ => false,
+                            }
+                        }
                     }
                 } else {
                     true

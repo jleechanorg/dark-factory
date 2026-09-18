@@ -484,6 +484,15 @@ pub struct FakeSessions {
     /// by default.
     pub fail_attach_transient_for: RefCell<Vec<String>>,
     pub session_health_failure_for: RefCell<HashMap<String, String>>,
+    /// dark-factory-lifecyc-gap2: a per-call scripted `check_session_health`
+    /// SEQUENCE (consumed front-to-back, mirrors `activity_sequence`), used
+    /// to model a single tick's TWO independent health probes (`run_fast_tier`'s
+    /// unconditional reap check, then the adopted-promotion readiness check)
+    /// returning different answers — e.g. the first probe reports healthy
+    /// but a later, separate probe hits a transient error. Once exhausted,
+    /// `check_session_health` falls back to the static `session_health_failure_for`
+    /// map. Empty by default.
+    pub health_failure_sequence: RefCell<Vec<Option<String>>>,
     /// Bead jleechan-zeij / issue #322 r3 (positive-death modeling): once
     /// `true`, a successful `stop()` does NOT terminate the session — it
     /// survives as a live orphan (`ao session kill` swallowed the tmux
@@ -559,6 +568,7 @@ impl Default for FakeSessions {
             worktree_ancestor_for: RefCell::new(HashMap::new()),
             worktree_ancestor_error_for: RefCell::new(HashMap::new()),
             session_health_failure_for: RefCell::new(HashMap::new()),
+            health_failure_sequence: RefCell::new(Vec::new()),
         }
     }
 }
@@ -929,6 +939,12 @@ impl Sessions for FakeSessions {
         self.calls
             .borrow_mut()
             .push(format!("check_session_health({})", id.0));
+        {
+            let mut seq = self.health_failure_sequence.borrow_mut();
+            if !seq.is_empty() {
+                return Ok(seq.remove(0));
+            }
+        }
         Ok(self.session_health_failure_for.borrow().get(&id.0).cloned())
     }
 
