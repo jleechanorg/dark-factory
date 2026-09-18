@@ -66,7 +66,7 @@ echoed in the run evidence.
 
 | `pipelines/factory/level5_feature.dot` | full reference pipeline | Full Level-5 reference pipeline with hard-tier gates wired in |
 | **dynamic DOT via binary** | binary-owned graph builder | A static graph can't express the needed phase/fanout; the binary saves/echoes the generated graph in run evidence |
-| **no pipeline** | — | Docs-only / test-only / config-only PRs have no behavioral surface for the holdout to grade — say so and stop |
+| **no pipeline** | — | When no available pipeline fits the inspected PR, follow canonical **Honesty rules** below: report the limitation and return to the parent for authorized work; do not force an inapplicable holdout pipeline |
 
 You can also write your own `.dot` and pass it via `--pipeline`.
 
@@ -113,19 +113,27 @@ task, not a deterministic rule table (no `if is_draft then X`, no
 3. **Reason about**: what kind of work this is (new feature / bug fix /
    refactor / docs / test-only / infra — from diff+body+files, never
    pre-bucketed by label alone); whether a spec already covers the
-   change (if so, `/fs` is skippable — deciding `/fs` is needed first
-   and stopping is a valid terminal state, do not force a run); holdout
+   change (if so, `/fs` is skippable; if needed, report the prerequisite
+   and carry out its already-authorized preparation or return it to the
+   parent task under active repository role and execution constraints.
+   Do not force a pipeline run before it is ready); holdout
    eligibility (pass `--feature <name>` only if
    `~/projects/dark-factory-holdouts/holdouts/<feature>/` actually
    exists — never invent one); and what evidence mix (`/es` + `/er` +
    `/code_standards` minimum, `holdout_eval` for behavior-grade) the
    pipeline needs to deliver without over-running.
-4. Pick the pipeline from **Available pipelines** above using that
-   reasoning, pick the backend (`echo` for wiring smoke; `claude` unless
-   the PR's reviewer queue or `gate_er` priority queue says otherwise),
-   then construct, show, and run the command — same shape as Step 0c
-   below but `cd` into the PR's target repo, not `dark-factory`.
-5. Report the verdict per **Output contract** below.
+4. Execute only after needed preparation is complete and a pipeline
+   actually fits: pick the pipeline from **Available pipelines** above
+   using that reasoning, pick the backend (`echo` for wiring smoke;
+   `claude` unless the PR's reviewer queue or `gate_er` priority queue
+   says otherwise), then construct, show, and run the command — same
+   shape as Step 0c below but `cd` into the PR's target repo, not
+   `dark-factory`.
+5. Report the outcome: when a pipeline ran, report the verdict per
+   **Output contract** below; otherwise report the unmet prerequisite or
+   no-fitting-pipeline limitation and return to the parent task with no
+   fabricated run ID, exit code, or review verdict, preserving authorized
+   parent continuation.
 
 `/f-pr` honesty rules (in addition to the shared ones under **Honesty
 rules**): the `gate_er` priority queue (`codex > minimax > agy >
@@ -275,18 +283,23 @@ resolve_dark_factory_home() {
 ```
 
 1. **Verify binary install**. The factory runs via the **`dark-factory` binary**
-   (not `python -m runner` from source). Check:
+   (not `python -m runner` from source). If missing, report the unmet prerequisite
+   and inspect the existing installation before cloning or reinstalling. Complete
+   setup within the current authorized scope and repository execution rules, or
+   return the limitation to the parent for other authorized work. Ask only for
+   missing authority or access; an unavailable binary is not a completed run.
+   The following check runs as a tool command; its failure ends that command,
+   then the parent follows the prerequisite guidance above:
    ```bash
    export PATH="$HOME/.local/bin:$PATH"
    resolve_dark_factory_home || exit 1
-   command -v dark-factory && dark-factory --help 2>/dev/null || true
+   command -v dark-factory || exit 1
+   dark-factory --help || exit 1
    test -x "$DARK_FACTORY_HOME/bin/dark-factory" || {
      echo "ERROR: run $DARK_FACTORY_HOME/install.sh first"
      exit 1
    }
    ```
-   If missing, tell the user to clone
-   `https://github.com/jleechanorg/dark-factory` and run `./install.sh`, then stop.
 
 2. **Environment**:
    ```bash
@@ -392,8 +405,15 @@ default; passing `--backend claude` for the run itself does not change how
 
 ## Output contract
 
-End every `/f`/`/factory` invocation with this proof block. Missing any
-required line means the run is unproven and must be reported as such:
+When a pipeline ran, end the `/f`/`/factory` invocation with this proof block
+(missing any required line means the run is unproven and must be reported as
+such). When no pipeline ran because a prerequisite was unmet or no applicable
+pipeline fits, report the unmet prerequisite or no-fitting-pipeline limitation
+and return to the parent task without fabricated run metadata (no fabricated
+run ID, exit code, or review verdict), preserving authorized parent
+continuation.
+
+For executed pipeline runs, provide this proof block:
 
 ```bash
 # CLI backend: <detected-or-override> (source: <BASH_FUNC_X%%|explicit --backend|default>)
@@ -454,7 +474,12 @@ Whenever `dark-factory review` completes, the agent MUST immediately report:
 ### Loop Exhaustion Invariant
 
 - Reaching the maximum cycle budget (e.g., 3/3 cycles) without achieving `verdict: pass` constitutes a **FAILED RUN**.
-- The agent MUST report `STATUS: REVIEW FAILED / EXHAUSTED AFTER N CYCLES` and halt.
+- The agent MUST report `STATUS: REVIEW FAILED / EXHAUSTED AFTER N CYCLES` and
+  end that factory invocation and return its failure evidence to the parent task.
+  The parent continues authorized work within the mission deadline and the
+  active repository's role and execution rules. Where coding must run through
+  auto-factory, route repairs through a fresh or adjusted factory run.
+  An invocation's cycle budget is not a mission stop.
 - An agent must **NEVER** summarize cycle exhaustion as "addressed findings", "all gates passing", or "/ready".
 
 ## Honesty rules
@@ -474,16 +499,21 @@ Whenever `dark-factory review` completes, the agent MUST immediately report:
 - Do not claim a factory run based on an in-Claude workflow, `Skill()` call,
   or prose summary. The only valid proof is an actual `dark-factory` binary
   invocation plus the proof block above.
-- If the LLM decided `/fs` is needed first, **say so and stop** — do not
-  silently fall through to `gates.dot` and pretend the PR is green.
-- If no pipeline fits (e.g. docs-only PR), **say so and stop** — do not
-  silently fall through to a holdout-bearing pipeline.
+- If `/fs` is needed first, follow `/f-pr` item 3: report the prerequisite and
+  carry out its already-authorized preparation or return it to the parent task
+  under active repository role and execution constraints. Ask only for missing
+  authority; do not silently fall through to `gates.dot` and pretend the PR is green.
+- If no pipeline fits (e.g. docs-only PR), report that limitation and return to
+  the parent task for authorized diagnosis or preparation. A materially different
+  requested method needs authorization; do not silently substitute a
+  holdout-bearing pipeline.
 - Do not invent `--feature` values. If there's no holdout directory at
   `~/projects/dark-factory-holdouts/holdouts/<feature>/`, don't pass `--feature`.
 - When the goal is unrelated to the open PR (Step 0a), **ask the user** which
   mode they meant. Do not silently route to PR-mode for unrelated work.
-- When the fix loop exhausts (3 attempts), surface the diagnosis verbatim and
-  **stop** — do not auto-merge.
+- When the fix loop exhausts (3 attempts), surface its failure diagnosis and
+  return control to the parent as above. Preserve the failed verdict; never
+  auto-merge or retry an unchanged failing approach merely to get a pass.
 
 ## Known limits
 
