@@ -366,6 +366,7 @@ mod tests {
 
     fn make_cfg(root: &Path) -> Config {
         Config {
+            task_bead_id: None,
             target_repo: "owner/repo".into(),
             ao_project: None,
             base_branch: "main".into(),

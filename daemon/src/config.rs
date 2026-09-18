@@ -27,6 +27,11 @@ pub struct RepoRouting {
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Config {
+    /// Optional exact bead execution scope. Omitted preserves the legacy
+    /// unrestricted daemon behavior; when set, only this bead may be routed
+    /// or dispatched by the tick loop.
+    #[serde(default)]
+    pub task_bead_id: Option<String>,
     pub target_repo: String,
     #[serde(default)]
     pub ao_project: Option<String>,
@@ -328,6 +333,46 @@ pub fn is_fixture_repo(repo: &str) -> bool {
     matches!(repo, "owner/repo" | "other/repo" | "myorg/myrepo")
 }
 
+/// Validate and canonicalize one exact bead selector. Bead IDs are opaque
+/// tracker identities, but the tracker grammar is deliberately narrow here:
+/// ASCII letters/digits plus `.`, `_`, and `-`, with no whitespace or path
+/// separators. This is syntax validation only; existence and routing are
+/// checked against the overlay/tracker before startup side effects.
+pub fn validate_task_bead_id(value: &str) -> Result<String, DaemonError> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+    {
+        return Err(DaemonError::Config(
+            "task_bead_id must be a nonblank ASCII bead ID (letters, digits, '.', '_' or '-')"
+                .to_string(),
+        ));
+    }
+    Ok(value.to_string())
+}
+
+/// Resolve the optional task selector from config and the process environment.
+/// The environment is an override only when it agrees with the configured
+/// value; a conflicting pair fails closed rather than silently changing scope.
+pub fn resolve_task_bead_id(
+    configured: Option<&str>,
+    env_override: Option<&str>,
+) -> Result<Option<String>, DaemonError> {
+    let configured = configured.map(validate_task_bead_id).transpose()?;
+    let env_override = env_override.map(validate_task_bead_id).transpose()?;
+    match (configured, env_override) {
+        (Some(configured), Some(env)) if configured != env => Err(DaemonError::Config(
+            format!(
+                "DARK_FACTORY_TASK_BEAD_ID {env:?} conflicts with configured task_bead_id {configured:?}"
+            ),
+        )),
+        (Some(configured), _) => Ok(Some(configured)),
+        (None, Some(env)) => Ok(Some(env)),
+        (None, None) => Ok(None),
+    }
+}
+
 pub fn load(path: &Path) -> Result<Config, DaemonError> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| DaemonError::Config(format!("{}: {e}", path.display())))?;
@@ -352,6 +397,40 @@ mod tests {
         assert_eq!(cfg.max_workers, 40);
         assert_eq!(cfg.max_batch, 15);
         assert_eq!(cfg.base_branch, "main");
+    }
+
+    #[test]
+    fn task_bead_id_is_optional_and_exactly_validated() {
+        let raw = include_str!("../contracts/daemon.toml.example");
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.task_bead_id, None);
+        let cfg: Config = toml::from_str(&format!(
+            "{raw}\ntask_bead_id = 'dark-factory-c4zhq'\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.task_bead_id.as_deref(), Some("dark-factory-c4zhq"));
+        assert_eq!(
+            resolve_task_bead_id(None, Some("dark-factory-c4zhq"))
+                .unwrap()
+                .as_deref(),
+            Some("dark-factory-c4zhq")
+        );
+        assert_eq!(
+            resolve_task_bead_id(
+                Some("dark-factory-c4zhq"),
+                Some("dark-factory-c4zhq")
+            )
+            .unwrap()
+            .as_deref(),
+            Some("dark-factory-c4zhq")
+        );
+        assert_eq!(resolve_task_bead_id(None, None).unwrap(), None);
+        assert!(resolve_task_bead_id(Some("dark-factory-c4zhq"), Some("other")).is_err());
+        assert!(resolve_task_bead_id(None, Some("")).is_err());
+        assert!(resolve_task_bead_id(Some(" bad"), None).is_err());
+        for value in ["", "bad/id", "bad space", "é"] {
+            assert!(validate_task_bead_id(value).is_err(), "{value:?}");
+        }
     }
     #[test]
     fn missing_key_is_config_error() {
@@ -695,6 +774,7 @@ push_remote = "origin"
     #[test]
     fn relative_spec_dir_uses_runtime_state_not_target_worktree() {
         let cfg = Config {
+            task_bead_id: None,
             target_repo: "owner/daemon".into(),
             ao_project: None,
             base_branch: "main".into(),
@@ -738,6 +818,7 @@ push_remote = "origin"
         let absolute_spec_dir = root.join("shared-specs");
 
         let cfg = Config {
+            task_bead_id: None,
             target_repo: "owner/daemon".into(),
             ao_project: None,
             base_branch: "main".into(),
@@ -768,6 +849,7 @@ push_remote = "origin"
     #[test]
     fn explicit_production_repo_without_checkout_is_clone_eligible() {
         let cfg = Config {
+            task_bead_id: None,
             target_repo: "owner/daemon".into(),
             ao_project: None,
             base_branch: "main".into(),
@@ -809,6 +891,7 @@ push_remote = "origin"
         ));
         let checkout = root.join("production");
         let cfg = Config {
+            task_bead_id: None,
             target_repo: "owner/daemon".into(),
             ao_project: None,
             base_branch: "main".into(),
@@ -852,6 +935,7 @@ push_remote = "origin"
     #[test]
     fn explicit_relative_checkout_is_not_clone_eligible() {
         let cfg = Config {
+            task_bead_id: None,
             target_repo: "owner/daemon".into(),
             ao_project: None,
             base_branch: "main".into(),
@@ -971,6 +1055,7 @@ spec_dir = ".factory/specs/"
     #[test]
     fn agent_worktree_path_uses_owner_repo_layout() {
         let cfg = Config {
+            task_bead_id: None,
             target_repo: "owner/repo".into(),
             ao_project: None,
             base_branch: "main".into(),

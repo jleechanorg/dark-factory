@@ -273,7 +273,8 @@ fn dependency_admission_survives_restarts_then_dispatches_once_when_ready() {
         .unwrap();
     }
 
-    for tick in [1_u64] {
+    {
+        let tick = 1_u64;
         let store = SqliteStateStore::open(&path).unwrap();
         run_tick(
             &TickDeps {
@@ -677,6 +678,7 @@ fn test_vcs() -> FakeVcs {
 
 fn test_cfg() -> Config {
     Config {
+        task_bead_id: None,
         target_repo: "owner/repo".into(),
         ao_project: None,
         base_branch: "main".into(),

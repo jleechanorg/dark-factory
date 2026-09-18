@@ -56,10 +56,19 @@ Operational rules:
    token budget on adversarial validation, it is probably under-testing.
 6. Treat `.dot` graphs as the durable process code. Runner code is disposable;
    graph shape, specs, holdouts, and scoring contracts are the important assets.
+7. **Deprecate human interactive hat**: All coding LLM work must be shifted to the auto-factory. Humans only define intent (create GitHub issues/beads) and write comments on PRs for feedback. The auto-factory autonomously processes and drives branches to green without human-interactive coding sessions (exception: explicitly authorized factory infrastructure repair missions may diagnose and repair factory infrastructure in separate worktrees/branches, but product/pilot branches remain strictly autonomous).
 
-## /af — ZERO direct work; monitoring only (operator hard rule)
+## `/af` product runs — ZERO direct work; monitoring only
 
-When the operator directs work through /af (or sets an /af goal), the session
+When the requested object is to make `/af` work, that is a factory-infrastructure
+repair mission, not a product run through `/af`. The repair request authorizes
+normal scoped coding, testing, and deployment of factory infrastructure,
+including direct or delegated coding as needed. Keep intake quiesced, isolate
+the repair in its own worktree/branch, and do not count repair evidence as pilot
+evidence. This boundary does not authorize hand-driving selected product or
+pilot branches.
+
+During ordinary intake (or when an `/af` goal directs product work), the session
 does **ZERO direct work** — no product code, no factory code, no hand-fixes,
 no coding sub-agent lanes. The session's ONLY jobs:
 
@@ -75,14 +84,31 @@ no coding sub-agent lanes. The session's ONLY jobs:
    label→merge E2E proof unfalsifiable (2026-07-11/12 incidents: hand-driven
    PRs masked a dead coder loop for a full day).
 
+**Factory Infrastructure Repair Exception**:
+When the operator explicitly authorizes a factory repair mission (a natural-language goal to make /af work counts as explicit authorization), the session is permitted to diagnose and repair factory infrastructure/harness code in a separate worktree and branch. Operational rules for repair missions:
+- Strictly isolate infrastructure repairs from selected pilot/product PR branches; never hand-drive pilot PRs.
+- Preserve existing logs and telemetry; create and hash backups before modifying files.
+- Independently validate all repairs, then deploy only through the canonical Linux workflow (`jeff-ubuntu` via SSH).
+- After deployment, resume a clean, real /af pilot to prove end-to-end operation.
+- Infrastructure changes never count as autonomous pilot evidence.
+- Safety invariants remain absolute: existing repository-specific merge authorization gates remain unchanged, and AO code writes still require verbatim `AO CODE APPROVED`.
+
+**Outside /af** (ad hoc repo work, audits, reviews), follow
+`~/.claude/skills/parallelize-to-ceiling/SKILL.md`: fan out independent
+read-only and audit work concurrently, and route actual coding to subagents or
+cheaper-tier lanes rather than the main session. **Inside /af**, that policy is
+superseded — no in-session coding sub-agent lanes; all coding routes through
+the external bead → daemon → AO pipeline per the ZERO-direct-work rule above.
+
 ## Factory host placement (Linux-only)
 
 `jeff-ubuntu` is the sole Auto-Factory host. Start, stop, inspect, and deploy
-the daemon only through `/linux` and its user systemd unit
-`ai.dark-factory.daemon.service`. AO worker dispatch is allowed on that Linux
-host only. This Mac is an operator client: do not load or start a Dark Factory
-LaunchAgent, a local daemon, or local AO workers from factory intake. Use SSH
-to Linux for telemetry and operational control.
+the daemon only through `/linux` (`ssh jeff-ubuntu ...`) and its user systemd unit
+`ai.dark-factory.daemon.service`. AO worker dispatch runs on that Linux host only.
+This Mac is an operator client: do not load or start a Dark Factory LaunchAgent,
+a local daemon, or local AO workers from factory intake on macOS.
+Always use SSH to Linux for telemetry (`/home/jleechan/Library/Logs/dark-factory/daemon.jsonl`)
+and operational control.
 
 ## Setup
 
