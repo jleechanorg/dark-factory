@@ -778,10 +778,18 @@ fn check_adopted_head_advance(
     let Ok(post_sha) = deps.vcs.remote_head_sha(branch) else {
         return AdoptedHeadAdvance::Indeterminate;
     };
-    if post_sha != pre_sha && deps.vcs.is_ancestor(pre_sha, &post_sha).unwrap_or(false) {
-        AdoptedHeadAdvance::Advanced { post_sha }
-    } else {
-        AdoptedHeadAdvance::Unchanged { head_sha: post_sha }
+    if post_sha == pre_sha {
+        return AdoptedHeadAdvance::Unchanged { head_sha: post_sha };
+    }
+    // CodeRabbit finding (PR #842): an `is_ancestor` probe error is a
+    // genuine "we don't know" the same way a `remote_head_sha` error is —
+    // `unwrap_or(false)` previously collapsed it into `Unchanged`, which
+    // reads as a CONFIRMED no-advance to callers that park/kill on that
+    // result. Report it as `Indeterminate` instead so those callers defer.
+    match deps.vcs.is_ancestor(pre_sha, &post_sha) {
+        Ok(true) => AdoptedHeadAdvance::Advanced { post_sha },
+        Ok(false) => AdoptedHeadAdvance::Unchanged { head_sha: post_sha },
+        Err(_) => AdoptedHeadAdvance::Indeterminate,
     }
 }
 
@@ -5498,7 +5506,53 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                         | crate::tools::SessionActivity::NotFound)
                                 );
 
-                            if matches!(activity, Ok(crate::tools::SessionActivity::Running)) {
+                            // CodeRabbit finding (PR #842): the adopted path used
+                            // to compute `is_terminal_or_unhealthy` straight from
+                            // `health_failure`, so a Gemini quota exhaustion (a
+                            // recoverable condition the non-adopted path already
+                            // arms via `quota_watchdog::record_quota_reset` at
+                            // ~line 5248) fell into the same destructive
+                            // kill+park(`AdoptedRemediationUnfinished`, NOT in
+                            // `recoverable_exact_values()`) path as a genuinely
+                            // dead remediation session. Arm the watchdog here
+                            // too and defer without promotion/kill/park so the
+                            // slow-tier wake sweep can resume the pane once the
+                            // quota window resets.
+                            let quota_reset = health_failure.as_deref().and_then(|reason| {
+                                crate::health::quota_watchdog::parse_quota_reset_duration(reason)
+                                    .map(|reset_in| (reason.to_string(), reset_in))
+                            });
+
+                            if let Some((reason, reset_in)) = quota_reset {
+                                if crate::health::quota_watchdog::recorded_reset_at(bead_id).is_none()
+                                {
+                                    let now_epoch = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0);
+                                    let reset_at_epoch = now_epoch.saturating_add(reset_in.as_secs());
+                                    crate::health::quota_watchdog::record_quota_reset(
+                                        bead_id,
+                                        &session_id_str,
+                                        reset_at_epoch,
+                                    );
+                                    let _ = emit(
+                                        deps.telemetry_log,
+                                        bead_id,
+                                        overlay.attempt,
+                                        OverlayState::Dispatched.as_str(),
+                                        "QUOTA_WATCHDOG_ARMED",
+                                        serde_json::json!({}),
+                                        serde_json::json!({
+                                            "session_id": session_id_str,
+                                            "reason": reason,
+                                            "reset_at_epoch": reset_at_epoch,
+                                            "phase": "adopted_promotion",
+                                        }),
+                                    );
+                                }
+                                false
+                            } else if matches!(activity, Ok(crate::tools::SessionActivity::Running)) {
                                 if let Some(reason) = health_failure {
                                     let _ = emit(
                                         deps.telemetry_log,
@@ -5524,7 +5578,32 @@ fn run_fast_tier(deps: &TickDeps, summary: &mut TickSummary) -> Result<(), Daemo
                                 );
                                 match head_advance {
                                     AdoptedHeadAdvance::Advanced { .. } => true,
-                                    _ => {
+                                    // CodeRabbit finding (PR #842): a transient VCS
+                                    // probe failure (remote_head_sha/is_ancestor
+                                    // erroring) must not be conflated with a
+                                    // confirmed no-advance. `check_adopted_head_advance`
+                                    // reports that distinctly as `Indeterminate` —
+                                    // defer without killing the (already
+                                    // terminal/unhealthy) session or parking a
+                                    // NON-recoverable `AdoptedRemediationUnfinished`
+                                    // hold on an unconfirmed signal. Retried next tick.
+                                    AdoptedHeadAdvance::Indeterminate => {
+                                        let _ = emit(
+                                            deps.telemetry_log,
+                                            bead_id,
+                                            overlay.attempt,
+                                            OverlayState::Dispatched.as_str(),
+                                            "ADOPTED_HEAD_ADVANCE_INDETERMINATE",
+                                            serde_json::json!({}),
+                                            serde_json::json!({
+                                                "session_id": session_id_str,
+                                                "branch": overlay.branch,
+                                                "action": "deferred_no_park",
+                                            }),
+                                        );
+                                        false
+                                    }
+                                    AdoptedHeadAdvance::Unchanged { .. } => {
                                         if let Some(reason) = health_failure {
                                             let _ = emit(
                                                 deps.telemetry_log,

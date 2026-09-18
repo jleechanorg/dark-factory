@@ -16846,6 +16846,297 @@ fn test_dispatched_adopted_terminal_session_unchanged_head_parks_human_held() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// CodeRabbit finding on PR #842 (tick.rs ~5570): a terminal/unhealthy
+/// adopted session whose `remote_head_sha` VCS probe errors (transient GH
+/// API failure, not a confirmed no-advance) must NOT be conflated with
+/// `AdoptedHeadAdvance::Unchanged` — the old wildcard match arm killed the
+/// session and parked the bead HUMAN_HELD with the NON-recoverable
+/// `adopted_remediation_unfinished` reason on a merely-indeterminate signal.
+/// The fix distinguishes `Indeterminate` and defers instead.
+#[test]
+fn test_dispatched_adopted_terminal_session_vcs_probe_error_defers_no_park() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Terminal);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    // Deliberately do NOT script a head for this branch: FakeVcs::remote_head_sha
+    // returns Err("no scripted remote head for ..."), modeling a transient
+    // VCS probe failure (e.g. GH API timeout) — NOT a confirmed unchanged head.
+    let vcs = FakeVcs::new();
+    let branch = "fix/test-term-vcs-error";
+    let sha = "sha-pre-term-vcs-error";
+    // Positive LOCAL ancestry proof lets the earlier per-tick wedge-detection
+    // sweep (tick.rs ~1093, a distinct check from the one under test) pass
+    // via its documented remote-unavailable fallback instead of parking
+    // `adopted_branch_append_only_check_failed` — isolating this test to the
+    // later promotion-check `check_adopted_head_advance` call under test.
+    sessions.set_worktree_ancestor("wa-term-vcs-error", branch, sha, true);
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_term_vcs_probe_error.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-term-vcs-error".into(),
+        BeadOverlay {
+            bead_id: "bead-term-vcs-error".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(994),
+            branch: Some(branch.into()),
+            session_id: Some("wa-term-vcs-error".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store
+        .register_branch("bead-term-vcs-error", branch)
+        .unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(994));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 994),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        994,
+        PrSnapshot {
+            pr_number: 994,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "a transient VCS probe error must NOT park HUMAN_HELD"
+    );
+
+    let o = store.load("bead-term-vcs-error").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "terminal session with an indeterminate (VCS-probe-error) head check must remain DISPATCHED, not park"
+    );
+    assert_eq!(
+        o.session_id,
+        Some("wa-term-vcs-error".into()),
+        "session handle must be preserved — an indeterminate probe must not kill the session"
+    );
+    assert!(
+        !sessions.stop_succeeded.get(),
+        "session must not be reaped on a transient VCS probe error"
+    );
+    assert_ne!(
+        o.park_reason,
+        Some("adopted_remediation_unfinished".into()),
+        "must not misreport a transient probe failure as confirmed-unfinished remediation"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("ADOPTED_HEAD_ADVANCE_INDETERMINATE"),
+        "telemetry must record the indeterminate probe outcome; telemetry:\n{telemetry}"
+    );
+    assert!(
+        !telemetry.contains("PARKED_HUMAN_HELD"),
+        "telemetry must not record a park on an indeterminate probe; telemetry:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// CodeRabbit finding on PR #842 (tick.rs ~5595): the adopted-session
+/// promotion-check path bypassed the ordinary quota-watchdog arming that
+/// `run_fast_tier`'s non-adopted branch already applies (tick.rs ~5248).
+/// A Gemini quota exhaustion with a parseable "Resets in Xh Ym" reason and
+/// non-Running activity fell straight into `is_terminal_or_unhealthy`,
+/// which — if the head hadn't (yet) advanced — killed the session and
+/// parked the bead HUMAN_HELD with the NON-recoverable
+/// `adopted_remediation_unfinished` reason instead of arming the watchdog
+/// to resume the SAME paused pane after the reset window.
+#[test]
+fn test_dispatched_adopted_quota_health_failure_arms_watchdog_no_park() {
+    daemon::health::quota_watchdog::clear("bead-adopted-quota-arm");
+
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Idle);
+    sessions.set_session_health_failure(
+        "wa-adopted-quota-paused",
+        "terminal session error in tmux pane: individual quota reached (resets in 1h 23m.)",
+    );
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-adopted-quota-arm";
+    let sha = "sha-pre-adopted-quota";
+    // Head unchanged: without the fix, this is exactly the case that falls
+    // through to the destructive kill+park path.
+    vcs.heads.insert(branch.into(), sha.into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_adopted_quota_arm.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-adopted-quota-arm".into(),
+        BeadOverlay {
+            bead_id: "bead-adopted-quota-arm".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(993),
+            branch: Some(branch.into()),
+            session_id: Some("wa-adopted-quota-paused".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store
+        .register_branch("bead-adopted-quota-arm", branch)
+        .unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(993));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 993),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        993,
+        PrSnapshot {
+            pr_number: 993,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "a recoverable quota exhaustion must NOT park HUMAN_HELD"
+    );
+
+    let o = store.load("bead-adopted-quota-arm").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "quota-armed adopted bead must stay DISPATCHED — no kill+park cycle"
+    );
+    assert_eq!(
+        o.session_id,
+        Some("wa-adopted-quota-paused".into()),
+        "the paused session handle must be preserved for the watchdog to wake later"
+    );
+    assert!(
+        !sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|c| c.starts_with("stop(")),
+        "quota-armed adopted session must NOT be stopped; calls={:?}",
+        sessions.calls.borrow()
+    );
+    assert!(
+        daemon::health::quota_watchdog::recorded_reset_at("bead-adopted-quota-arm").is_some(),
+        "quota watchdog ledger must record the reset time for the adopted bead"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("QUOTA_WATCHDOG_ARMED"),
+        "QUOTA_WATCHDOG_ARMED event must be emitted; telemetry:\n{telemetry}"
+    );
+    assert!(
+        !telemetry.contains("PARKED_HUMAN_HELD"),
+        "telemetry must not record a park on a recoverable quota exhaustion; telemetry:\n{telemetry}"
+    );
+
+    daemon::health::quota_watchdog::clear("bead-adopted-quota-arm");
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 #[test]
 fn test_dispatched_adopted_terminal_session_advanced_head_promoted() {
     let mut scm = FakeScm::new();
