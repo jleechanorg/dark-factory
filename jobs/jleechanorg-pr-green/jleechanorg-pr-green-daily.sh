@@ -374,6 +374,8 @@ SAFETY AND DELIVERY
 - Before any push, invoke the job-owned receipt helper exactly as follows; do not use a bare git push:
   session_id="\${AO_SESSION_ID:-\${AGENT_ORCHESTRATOR_SESSION_ID:-}}"
   [[ -n "\$session_id" ]] || { echo 'exact AO session id unavailable; refusing push' >&2; exit 1; }
+  before_sha="\$(gh pr view "https://github.com/jleechanorg/${repo}/pull/${number}" --json headRefOid --jq .headRefOid)"
+  after_sha="\$(git rev-parse HEAD)"
   "${PUSH_RECEIPT_HELPER}" --repo "${repo}" --number "${number}" --session-id "\$session_id" \
     --before-sha "\$before_sha" --after-sha "\$after_sha" \
     --commit-url "https://github.com/jleechanorg/${repo}/commit/\$after_sha" \
@@ -539,41 +541,10 @@ EOF
       rm -f "$spawn_err"
       continue
     fi
-    if ! ao project get "$project_id" --json >/dev/null 2>&1; then
-      pr_green_register_project "$repo" "$project_id" || true
-    fi
-    if ! pr_green_ensure_codex_scope "$project_id"; then
-      echo "$LOG_PREFIX failed to register $repo#$number" >&2
-      record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed ao_registration_failed
-      pr_green_release_admission_lock
-      rm -f "$spawn_err"
-      continue
-    fi
-    retry_err="$(mktemp)"
-    "${spawn_cmd[@]}" >"$retry_err" 2>&1 &
-    retry_pid=$!
-    retry_rc=0
-    wait "$retry_pid" || retry_rc=$?
-    if [[ -s "$retry_err" ]] && pr_green_spawn_output_is_success "$retry_err"; then
-      if pr_green_session_record "$project_id" "$number" >/dev/null 2>&1; then
-        echo "$LOG_PREFIX dispatched $repo#$number after AO registration (session acknowledged)"
-        dispatched=$((dispatched + 1))
-        pr_green_release_admission_lock
-        rm -f "$spawn_err" "$retry_err"
-        reconcile_pr "$repo" "$number" "$url" "$live_state" registered_and_dispatched || true
-        continue
-      fi
-      echo "$LOG_PREFIX AO retry acknowledged but durable session row was not observable for $repo#$number" >&2
-      record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_retry_unverified
-      pr_green_release_admission_lock
-      rm -f "$spawn_err" "$retry_err"
-      continue
-    fi
-    [[ ! -s "$retry_err" ]] || cat "$retry_err" >&2
-    echo "$LOG_PREFIX AO retry failed for $repo#$number (rc=$retry_rc)" >&2
-    record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_retry_failed
+    echo "$LOG_PREFIX AO spawn returned an unverified acknowledgement for $repo#$number; no duplicate retry" >&2
+    record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_unverified
     pr_green_release_admission_lock
-    rm -f "$spawn_err" "$retry_err"
+    rm -f "$spawn_err"
     continue
   fi
   record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_failed

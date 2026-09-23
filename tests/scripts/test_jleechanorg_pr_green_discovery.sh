@@ -242,6 +242,7 @@ run_case() {
     HOME="$fixture_dir/home-$name" \
     PR_GREEN_DISCOVERY_CASE="$name" \
     PR_GREEN_METRICS_DIR="$metrics" \
+    PR_GREEN_AO_SPAWN_LOCK_DIR="$metrics/locks" \
     PR_GREEN_MAX_PRS="$max_prs" \
     PR_GREEN_DRY_RUN="$dry_run" \
     AO_CALLS="$calls" \
@@ -434,6 +435,7 @@ PATH="$mock_bin:$PATH" \
   PR_GREEN_BUSY_FAIRNESS=1 \
   PR_GREEN_ACTIVE_SESSION_COUNT=30 \
   PR_GREEN_AO_DB_PATH="$cap_metrics/ao.db" \
+  PR_GREEN_AO_SPAWN_LOCK_DIR="$cap_metrics/locks" \
   PR_GREEN_METRICS_DIR="$cap_metrics" \
   PR_GREEN_MAX_PRS=12 \
   PR_GREEN_DRY_RUN=0 \
@@ -466,6 +468,7 @@ PATH="$mock_bin:$PATH" \
   PR_GREEN_CAP_TERMINATED_RESTORE=1 \
   PR_GREEN_ACTIVE_SESSION_COUNT=30 \
   PR_GREEN_AO_DB_PATH="$restore_metrics/ao.db" \
+  PR_GREEN_AO_SPAWN_LOCK_DIR="$restore_metrics/locks" \
   PR_GREEN_METRICS_DIR="$restore_metrics" \
   PR_GREEN_MAX_PRS=12 \
   PR_GREEN_DRY_RUN=0 \
@@ -522,6 +525,7 @@ PATH="$mock_bin:$PATH" \
   PR_GREEN_BUSY_FAIRNESS=1 \
   PR_GREEN_SPAWN_FAILURE=1 \
   PR_GREEN_AO_DB_PATH="$fixture_dir/ao-failure.db" \
+  PR_GREEN_AO_SPAWN_LOCK_DIR="$failure_metrics/locks" \
   PR_GREEN_METRICS_DIR="$failure_metrics" \
   PR_GREEN_MAX_PRS=1 \
   PR_GREEN_DRY_RUN=0 \
@@ -551,6 +555,7 @@ PATH="$mock_bin:$PATH" \
   PR_GREEN_SPAWN_FAILURE=1 \
   PR_GREEN_SPAWN_FAILURE_OUTPUT=1 \
   PR_GREEN_AO_DB_PATH="$fixture_dir/ao-retry.db" \
+  PR_GREEN_AO_SPAWN_LOCK_DIR="$retry_metrics/locks" \
   PR_GREEN_METRICS_DIR="$retry_metrics" \
   PR_GREEN_MAX_PRS=1 \
   PR_GREEN_DRY_RUN=0 \
@@ -558,8 +563,8 @@ PATH="$mock_bin:$PATH" \
   AO_CALLS="$fixture_dir/ao-spawn-retry-failure.log" \
   GH_CALLS="$fixture_dir/gh-spawn-retry-failure.log" \
   bash "$JOB" >/dev/null
-[[ "$(jq -sr 'last.session_action' "$retry_metrics/outcomes.jsonl")" == spawn_retry_failed ]] || {
-  echo 'FAIL: failed registration retry did not emit durable retry outcome' >&2
+[[ "$(jq -sr 'last.session_action' "$retry_metrics/outcomes.jsonl")" == spawn_unverified ]] || {
+  echo 'FAIL: ambiguous spawn did not emit durable no-retry outcome' >&2
   exit 1
 }
 retry_run="$(jq -s 'last' "$retry_metrics/runs.jsonl")"
