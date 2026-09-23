@@ -5480,9 +5480,31 @@ mod ao_spawn_contract_tests {
     use crate::tools::{SessionId, Sessions, SpawnSpec};
     use std::os::unix::fs::PermissionsExt;
 
+    struct ScopedTestMinimaxCredential {
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedTestMinimaxCredential {
+        fn install() -> Self {
+            let saved = std::env::var_os("MINIMAX_API_KEY");
+            std::env::set_var("MINIMAX_API_KEY", "test-fake-minimax-key");
+            Self { saved }
+        }
+    }
+
+    impl Drop for ScopedTestMinimaxCredential {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(value) => std::env::set_var("MINIMAX_API_KEY", value),
+                None => std::env::remove_var("MINIMAX_API_KEY"),
+            }
+        }
+    }
+
     struct TestEnvGuard {
         saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
         cleanup_dir: std::path::PathBuf,
+        _minimax_credential: ScopedTestMinimaxCredential,
     }
 
     impl TestEnvGuard {
@@ -5499,7 +5521,6 @@ mod ao_spawn_contract_tests {
                 "FAKE_GIT_EXPECTED_ORIGIN",
                 "FAKE_GIT_LOCAL_SOURCE",
                 "FAKE_GIT_REAL_BIN",
-                "MINIMAX_API_KEY",
             ];
             let saved = KEYS
                 .iter()
@@ -5511,12 +5532,10 @@ mod ao_spawn_contract_tests {
             std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
             std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", bindings.to_string());
             std::env::set_var("AO_FAKE_LOG", log);
-            if std::env::var_os("MINIMAX_API_KEY").is_none() {
-                std::env::set_var("MINIMAX_API_KEY", "test-fake-minimax-key");
-            }
             Self {
                 saved,
                 cleanup_dir: dir.to_path_buf(),
+                _minimax_credential: ScopedTestMinimaxCredential::install(),
             }
         }
     }
@@ -7914,6 +7933,7 @@ os.execv(real_git, [real_git] + args)
         let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _minimax_credential = ScopedTestMinimaxCredential::install();
 
         let root = std::env::temp_dir().join(format!(
             "afd_batch_recovery_integration_{}",
@@ -8136,6 +8156,7 @@ sys.exit(99)
         let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _minimax_credential = ScopedTestMinimaxCredential::install();
         let root = std::env::temp_dir().join(format!(
             "afd_ao_missing_worktree_cleanup_{}",
             std::process::id()
@@ -8204,6 +8225,7 @@ raise SystemExit(9)
     #[test]
     fn missing_worktree_kill_failure_does_not_spawn_fallback_vendor() {
         let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _minimax_credential = ScopedTestMinimaxCredential::install();
         let root = std::env::temp_dir().join(format!(
             "afd_ao_missing_worktree_kill_failure_{}",
             std::process::id()
@@ -8652,6 +8674,7 @@ export const isTerminalSession = () => false;
         let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _minimax_credential = ScopedTestMinimaxCredential::install();
         let root = std::env::temp_dir().join(format!(
             "afd_ao_bridge_batch_semantics_{}",
             std::process::id()
