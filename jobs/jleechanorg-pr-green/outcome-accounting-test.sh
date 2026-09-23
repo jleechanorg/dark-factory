@@ -30,6 +30,13 @@ assert_eq "$(jq -r '.head_sha' <<<"$state")" after
 assert_eq "$(jq -r '.failed_checks | join(",")' <<<"$state")" lint
 assert_eq "$(jq -r '.pending_checks' <<<"$state")" true
 
+# GitHub retains cancelled check-runs from superseded duplicate workflows in
+# statusCheckRollup. A completed successful replacement for the same check on
+# this exact PR head is not a CI failure and must not consume a repair worker.
+superseded_cancelled='{"headRefOid":"after","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"test","conclusion":"CANCELLED","status":"COMPLETED"},{"name":"test","conclusion":"SUCCESS","status":"COMPLETED"}]}'
+state="$(pr_green_state_from_pr_json <<<"$superseded_cancelled")"
+assert_eq "$(jq -r '.failed_checks | join(",")' <<<"$state")" ''
+
 state_dir="$(mktemp -d)"
 trap 'rm -rf "$state_dir"' EXIT
 pr_green_write_snapshot "$state_dir" worldarchitect.ai 123 "$before"

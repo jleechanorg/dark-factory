@@ -49,10 +49,12 @@ pr_green_outcome_result() {
 
 # Emit a compact state from one authoritative gh pr view response. It supports
 # the REST-shaped status rollup returned by gh and intentionally treats only
-# terminal failures as blockers; pending checks are reported separately.
+# actionable terminal failures as blockers; pending checks are reported
+# separately. CANCELLED is excluded because GitHub keeps superseded workflow
+# runs in the rollup after their successful replacement completes.
 pr_green_state_from_pr_json() {
   jq -c '
-    def failed: ["FAILURE","FAILED","CANCELLED","TIMED_OUT","ACTION_REQUIRED"];
+    def failed: ["FAILURE","FAILED","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE"];
     {
       head_sha: (.headRefOid // .headRefName // ""),
       conflicting: ((.mergeable == "CONFLICTING") or (.mergeStateStatus == "DIRTY") or (.mergeStateStatus == "CONFLICTING")),
