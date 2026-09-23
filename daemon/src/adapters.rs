@@ -7963,7 +7963,9 @@ os.execv(real_git, [real_git] + args)
         let marker_a = root.join("healthy-a.marker");
         let marker_b = root.join("healthy-b.marker");
         let controller_home = root.join("controller-home");
+        let claude_config = root.join("claude-config");
         let log = root.join("calls.jsonl");
+        std::fs::create_dir_all(&claude_config).unwrap();
 
         let project_a = "afd-batch-recovery-project-a";
         let project_b = "afd-batch-recovery-project-b";
@@ -8077,6 +8079,8 @@ sys.exit(99)
         let old_path = std::env::var("PATH").unwrap_or_default();
         let old_fallback = std::env::var("DARK_FACTORY_CODER_FALLBACK_CHAIN").ok();
         let old_controller_home = std::env::var("DARK_FACTORY_AO_CONTROLLER_HOME").ok();
+        let old_minimax_key = std::env::var_os("MINIMAX_API_KEY");
+        let old_claude_config = std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR");
         std::env::set_var("PATH", format!("{}:{old_path}", root.display()));
         // Empty fallback chain: only the default agent is attempted, so each
         // project's recovery cycle is exactly one rejected spawn -> one
@@ -8084,6 +8088,8 @@ sys.exit(99)
         // reason about.
         std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", "");
         std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", &controller_home);
+        std::env::set_var("MINIMAX_API_KEY", "test-fake-minimax-key");
+        std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_config);
 
         let mut spec_a = spec("batch recovery prompt a", branch_a);
         spec_a.ao_project = project_a.to_string();
@@ -8103,6 +8109,14 @@ sys.exit(99)
         match old_controller_home {
             Some(v) => std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", v),
             None => std::env::remove_var("DARK_FACTORY_AO_CONTROLLER_HOME"),
+        }
+        match old_minimax_key {
+            Some(v) => std::env::set_var("MINIMAX_API_KEY", v),
+            None => std::env::remove_var("MINIMAX_API_KEY"),
+        }
+        match old_claude_config {
+            Some(v) => std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR"),
         }
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&root);
@@ -8163,6 +8177,8 @@ sys.exit(99)
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let claude_config = root.join("claude-config");
+        std::fs::create_dir_all(&claude_config).unwrap();
         let _ready_controller = ReadyAoControllerEnv::seed(&root);
         let log = root.join("calls.jsonl");
         let fake_ao = root.join("ao");
@@ -8189,9 +8205,13 @@ raise SystemExit(9)
         let old_path = std::env::var("PATH").unwrap_or_default();
         let old_log = std::env::var("AO_FAKE_CLEANUP_LOG").ok();
         let old_fallback = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+        let old_minimax_key = std::env::var_os("MINIMAX_API_KEY");
+        let old_claude_config = std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR");
         std::env::set_var("PATH", format!("{}:{old_path}", root.display()));
         std::env::set_var("AO_FAKE_CLEANUP_LOG", &log);
         std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax");
+        std::env::set_var("MINIMAX_API_KEY", "test-fake-minimax-key");
+        std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_config);
 
         let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
         let result = sessions.spawn(&spec(
@@ -8206,6 +8226,14 @@ raise SystemExit(9)
         match old_fallback {
             Some(value) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", value),
             None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
+        }
+        match old_minimax_key {
+            Some(value) => std::env::set_var("MINIMAX_API_KEY", value),
+            None => std::env::remove_var("MINIMAX_API_KEY"),
+        }
+        match old_claude_config {
+            Some(value) => std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR"),
         }
         let calls: Vec<serde_json::Value> = std::fs::read_to_string(&log)
             .unwrap_or_default()
@@ -8232,6 +8260,8 @@ raise SystemExit(9)
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let claude_config = root.join("claude-config");
+        std::fs::create_dir_all(&claude_config).unwrap();
         let _ready_controller = ReadyAoControllerEnv::seed(&root);
         let log = root.join("calls.jsonl");
         let fake_ao = root.join("ao");
@@ -8258,9 +8288,13 @@ raise SystemExit(9)
         let old_path = std::env::var("PATH").unwrap_or_default();
         let old_log = std::env::var("AO_FAKE_CLEANUP_LOG").ok();
         let old_fallback = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+        let old_minimax_key = std::env::var_os("MINIMAX_API_KEY");
+        let old_claude_config = std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR");
         std::env::set_var("PATH", format!("{}:{old_path}", root.display()));
         std::env::set_var("AO_FAKE_CLEANUP_LOG", &log);
         std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax->claude-code");
+        std::env::set_var("MINIMAX_API_KEY", "test-fake-minimax-key");
+        std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_config);
 
         let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
         let result = sessions.spawn(&spec(
@@ -8275,6 +8309,14 @@ raise SystemExit(9)
         match old_fallback {
             Some(value) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", value),
             None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
+        }
+        match old_minimax_key {
+            Some(value) => std::env::set_var("MINIMAX_API_KEY", value),
+            None => std::env::remove_var("MINIMAX_API_KEY"),
+        }
+        match old_claude_config {
+            Some(value) => std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR"),
         }
         let calls: Vec<serde_json::Value> = std::fs::read_to_string(&log)
             .unwrap_or_default()
@@ -8685,9 +8727,11 @@ export const isTerminalSession = () => false;
         let core = root.join("node_modules/@jleechanorg/ao-core");
         let calls = root.join("calls.jsonl");
         let lock = root.join("spawn.lock");
+        let claude_config = root.join("claude-config");
         let first_workspace = root.join("df-batch-alpha");
         let second_workspace = root.join("df-batch-beta");
         std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&claude_config).unwrap();
         let _ready_controller = ReadyAoControllerEnv::seed(&root);
         std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
         std::fs::create_dir_all(core.join("dist")).unwrap();
@@ -8809,6 +8853,11 @@ os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["A
                 "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
                 std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok(),
             ),
+            ("MINIMAX_API_KEY", std::env::var("MINIMAX_API_KEY").ok()),
+            (
+                "DARK_FACTORY_CLAUDE_CONFIG_DIR",
+                std::env::var("DARK_FACTORY_CLAUDE_CONFIG_DIR").ok(),
+            ),
         ];
         let old_path = saved[0].1.clone().unwrap_or_default();
         std::env::set_var("PATH", format!("{}:{old_path}", bin.display()));
@@ -8825,6 +8874,8 @@ os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["A
             .to_string(),
         );
         std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", "minimax->claude-code");
+        std::env::set_var("MINIMAX_API_KEY", "test-fake-minimax-key");
+        std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_config);
 
         let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
         let batch_result = sessions.spawn_batch(&[first.clone(), second.clone()]);

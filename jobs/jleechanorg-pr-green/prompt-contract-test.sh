@@ -30,6 +30,8 @@ assert_prompt_contains 'A bounded integration repair may edit production code an
 assert_prompt_contains 'Regenerate derived manifests and checksums last.'
 assert_prompt_contains 'Stop only when repository evidence leaves two or more genuinely plausible user-visible behaviors.'
 assert_prompt_contains 'Push normally only after the integrated tests and required checks are green.'
+assert_prompt_contains 'Never manufacture an empty or no-op commit, bypass hooks, or wrap/replace push tools to obtain a receipt or satisfy delivery metrics.'
+assert_prompt_contains 'If the push succeeds but receipt/verification remains pending or unavailable, preserve the exact before/after SHAs and logs, do not create another commit or push solely to obtain a metric/receipt, and report verification pending.'
 assert_prompt_does_not_contain 'Fix only easy, clearly scoped test failures or mechanical merge conflicts'
 assert_prompt_does_not_contain 'If the issue is ambiguous, risky, or not mechanically solvable, leave it untouched'
 

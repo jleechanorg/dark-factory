@@ -8,12 +8,16 @@ fixture_dir="$(mktemp -d)"
 trap 'rm -rf "$fixture_dir"' EXIT
 
 [[ -f "$TIMER" ]] || { echo 'FAIL: daily repair timer is missing' >&2; exit 1; }
-grep -Fq 'OnCalendar=*-*-* *:00/30:00' "$TIMER" || { echo 'FAIL: daily repair timer is not wall-clock 30-minute periodic' >&2; exit 1; }
+mapfile -t calendar_values < <(awk -F= '$1 == "OnCalendar" { print substr($0, index($0, "=") + 1) }' "$TIMER")
+[[ "${#calendar_values[@]}" -eq 1 && "${calendar_values[0]}" == '*-*-* *:00/30:00' ]] || {
+  echo 'FAIL: daily repair timer is not the exact wall-clock 30-minute calendar value' >&2
+  exit 1
+}
 if grep -Eq '^(OnBootSec|OnUnitActiveSec)=' "$TIMER"; then
   echo 'FAIL: daily repair timer still relies on monotonic anchors' >&2
   exit 1
 fi
-systemd-analyze calendar '*:0/30' >/dev/null || {
+systemd-analyze calendar "${calendar_values[0]}" >/dev/null || {
   echo 'FAIL: daily repair calendar expression is not understood by systemd' >&2
   exit 1
 }

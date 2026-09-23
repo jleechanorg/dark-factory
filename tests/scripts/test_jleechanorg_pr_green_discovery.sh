@@ -7,7 +7,9 @@ fixture_dir="$(mktemp -d)"
 trap 'rm -rf "$fixture_dir"' EXIT
 export PR_GREEN_AO_SPAWN_LOCK_DIR="$fixture_dir/locks"
 mock_bin="$fixture_dir/bin"
-mkdir -p "$mock_bin"
+lock_dir="$fixture_dir/locks"
+mkdir -p "$mock_bin" "$lock_dir"
+export PR_GREEN_AO_SPAWN_LOCK_DIR="$lock_dir"
 
 cat >"$mock_bin/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -153,7 +155,9 @@ if [[ "${PR_GREEN_BUSY_FAIRNESS:-0}" == 1 ]]; then
     fi
     if [[ -n "${PR_GREEN_CONCURRENT_MARKER:-}" ]]; then
       : >"$PR_GREEN_CONCURRENT_MARKER"
-      sleep 0.5
+      while [[ ! -e "${PR_GREEN_CONCURRENT_RELEASE:?}" ]]; do
+        sleep 0.02
+      done
     fi
     sleep 0.2
     exit 0
@@ -406,7 +410,7 @@ for iteration in 1 2; do
     sleep 0.4
   fi
 done
-if ! grep -Fq 'repo-a#13' "$fixture_dir/fairness-1.out" && ! grep -Fq 'repo-a#13' "$fixture_dir/fairness-2.out"; then
+if ! grep -Fq '[pr-green-daily] selected repo-a#13' "$fixture_dir/fairness-1.out" && ! grep -Fq '[pr-green-daily] selected repo-a#13' "$fixture_dir/fairness-2.out"; then
   cat "$fixture_dir/fairness-2.out" >&2
   cat "$fixture_dir/fairness-2.err" >&2
   cat "$fair_metrics/selection-cursor" >&2 || true
@@ -444,7 +448,7 @@ PATH="$mock_bin:$PATH" \
   AO_CALLS="$fixture_dir/ao-cap.log" \
   GH_CALLS="$fixture_dir/gh-cap.log" \
   bash "$JOB" >"$fixture_dir/cap.out" 2>"$fixture_dir/cap.err"
-if rg -q '^spawn ' "$fixture_dir/ao-cap.log"; then
+if grep -Eq '^spawn ' "$fixture_dir/ao-cap.log"; then
   echo 'FAIL: full active-session cap still spawned a new worker' >&2
   exit 1
 fi
@@ -477,7 +481,7 @@ PATH="$mock_bin:$PATH" \
   AO_CALLS="$fixture_dir/ao-cap-restore.log" \
   GH_CALLS="$fixture_dir/gh-cap-restore.log" \
   bash "$JOB" >"$fixture_dir/cap-restore.out" 2>"$fixture_dir/cap-restore.err"
-if rg -q 'session restore|^spawn ' "$fixture_dir/ao-cap-restore.log"; then
+if grep -Eq 'session restore|^spawn ' "$fixture_dir/ao-cap-restore.log"; then
   echo 'FAIL: terminated session was restored or replaced under active-session cap' >&2
   exit 1
 fi
@@ -490,20 +494,43 @@ printf '%s\n' '{"tokens":{}}' >"$concurrent_root/codex/auth.json"
 : >"$concurrent_root/one/ao.db"
 : >"$concurrent_root/two/ao.db"
 marker="$concurrent_root/spawn-started"
+release="$concurrent_root/spawn-release"
 PATH="$mock_bin:$PATH" HOME="$fixture_dir/home-concurrent-one" CODEX_HOME="$concurrent_root/codex" \
   PR_GREEN_DISCOVERY_CASE=cap PR_GREEN_BUSY_FAIRNESS=1 PR_GREEN_AO_DB_PATH="$concurrent_root/one/ao.db" \
   PR_GREEN_AO_SPAWN_LOCK_DIR="$concurrent_root/locks" PR_GREEN_CONCURRENT_MARKER="$marker" \
+  PR_GREEN_CONCURRENT_RELEASE="$release" \
   PR_GREEN_METRICS_DIR="$concurrent_root/one" PR_GREEN_MAX_PRS=1 PR_GREEN_DRY_RUN=0 \
   AO_CALLS="$concurrent_root/one/ao.log" GH_CALLS="$concurrent_root/one/gh.log" \
   bash "$JOB" >"$concurrent_root/one/out" 2>"$concurrent_root/one/err" &
 first_pid=$!
 for _ in {1..50}; do [[ -e "$marker" ]] && break; sleep 0.02; done
-[[ -e "$marker" ]] || { echo 'FAIL: concurrent spawn fixture did not start' >&2; exit 1; }
+if [[ ! -e "$marker" ]]; then
+  : >"$release"
+  kill "$first_pid" 2>/dev/null || true
+  wait "$first_pid" || true
+  echo 'FAIL: concurrent spawn fixture did not start' >&2
+  exit 1
+fi
 PATH="$mock_bin:$PATH" HOME="$fixture_dir/home-concurrent-two" CODEX_HOME="$concurrent_root/codex" \
   PR_GREEN_DISCOVERY_CASE=cap PR_GREEN_BUSY_FAIRNESS=1 PR_GREEN_AO_DB_PATH="$concurrent_root/two/ao.db" \
   PR_GREEN_AO_SPAWN_LOCK_DIR="$concurrent_root/locks" PR_GREEN_METRICS_DIR="$concurrent_root/two" \
   PR_GREEN_MAX_PRS=1 PR_GREEN_DRY_RUN=0 AO_CALLS="$concurrent_root/two/ao.log" GH_CALLS="$concurrent_root/two/gh.log" \
-  bash "$JOB" >"$concurrent_root/two/out" 2>"$concurrent_root/two/err"
+  bash "$JOB" >"$concurrent_root/two/out" 2>"$concurrent_root/two/err" &
+second_pid=$!
+for _ in {1..250}; do
+  if ! kill -0 "$second_pid" 2>/dev/null; then break; fi
+  sleep 0.02
+done
+if kill -0 "$second_pid" 2>/dev/null; then
+  kill "$second_pid" 2>/dev/null || true
+  : >"$release"
+  wait "$second_pid" || true
+  wait "$first_pid" || true
+  echo 'FAIL: concurrent second scheduler run did not exit within timeout' >&2
+  exit 1
+fi
+: >"$release"
+wait "$second_pid"
 wait "$first_pid"
 [[ "$(jq -sr 'last.admission_deferred' "$concurrent_root/two/runs.jsonl")" == 1 ]] || {
   cat "$concurrent_root/two/err" >&2
@@ -574,7 +601,7 @@ retry_run="$(jq -s 'last' "$retry_metrics/runs.jsonl")"
   exit 1
 }
 
-if rg -q 'session kill|stale_recovery|outside AO-managed worktree directories' "$JOB"; then
+if grep -Eq 'session kill|stale_recovery|outside AO-managed worktree directories' "$JOB"; then
   echo 'FAIL: Go AO job retained unsupported stale-session kill/retry path' >&2
   exit 1
 fi

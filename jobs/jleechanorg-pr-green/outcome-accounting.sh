@@ -41,7 +41,9 @@ pr_green_same_head_cooldown_applies() {
       };
       [inputs
        | select(.repo == $repo and .number == $number)
-       | select(.session_action != "reconciled" and .session_action != "cooldown_deferred")]
+       | select(.session_action != "reconciled"
+         and .session_action != "cooldown_deferred"
+         and .session_action != "admission_cap_deferred")]
       | sort_by(.ts // 0)
       | last as $latest
       | $latest != null
@@ -152,6 +154,8 @@ pr_green_state_from_pr_json() {
     latest_checks as $checks |
     {
       head_sha: (.headRefOid // .headRefName // ""),
+      base_ref_name: (.baseRefName // ""),
+      head_repo_name: (.headRepository.nameWithOwner // ""),
       mergeability: ((.mergeable // "") | ascii_upcase),
       conflicting: ((.mergeable == "CONFLICTING") or (.mergeStateStatus == "DIRTY") or (.mergeStateStatus == "CONFLICTING")),
       failed_checks: [$checks[]?
@@ -180,18 +184,160 @@ pr_green_state_from_pr_json() {
     }'
 }
 
+pr_green_contract_view() {
+  gh pr view "$1" --json headRefOid,baseRefName,headRepository 2>/dev/null
+}
+
+pr_green_contract_pending() {
+  local state="$1" reason="$2" required_inventory="${3:-[]}"
+  jq -c --argjson required "$required_inventory" --arg reason "$reason" '
+    . + {required_checks: [$required[] | .name] | unique,
+         required_checks_missing: [$required[] | .name] | unique,
+         verification_pending: true, verification_reason: $reason}' <<<"$state"
+}
+
+pr_green_check_runs_for_repo() {
+  local repo="$1" head_sha="$2"
+  gh api --paginate --slurp "/repos/${repo}/commits/${head_sha}/check-runs?per_page=100" 2>/dev/null |
+    jq -c 'if type == "array" then [.[].check_runs[]?] else [.check_runs[]?] end'
+}
+
 pr_green_apply_required_contract() {
-  local repo="$1" state="$2"
-  if [[ "$repo" != "worldarchitect.ai" ]]; then
-    jq -c '. + {verification_pending:true,verification_reason:"required_check_contract_unknown"}' <<<"$state"
+  local repo="$1" state="$2" pr_url="${3:-}"
+  local wa_inventory='[]' required_inventory='[]' head_sha base_ref head_repo base_repo base_encoded
+  local observed classic_payload rules_payload classic_contexts='[]' classic_checks='[]' rules_checks='[]'
+  local classic_rc rules_rc classic_known=0 rules_known=0 base_runs='[]' head_runs='[]' all_runs='[]'
+  local app_sources_available=true required_missing final_state post_view post_rc
+
+  [[ -n "$state" ]] || return 0
+  [[ "$repo" == "worldarchitect.ai" ]] && wa_inventory='[{"name":"Green Gate","app_id":null},{"name":"Tests Required Gate","app_id":null}]'
+
+  if [[ -z "$pr_url" ]]; then
+    if [[ "$repo" != "worldarchitect.ai" ]]; then
+      jq -c '. + {verification_pending:true,verification_reason:"required_check_contract_unknown"}' <<<"$state"
+      return
+    fi
+    jq -c --argjson required "$wa_inventory" '. as $root
+      | . + {required_checks: [$required[] | .name]}
+      | .required_checks_missing=[$required[] | select(($root.check_statuses[.name]) != "SUCCESS") | .name]' <<<"$state"
     return
   fi
-  jq -c '. as $root | . + {required_checks:["Green Gate","Tests Required Gate"]}
-    | .required_checks_missing=[.required_checks[] | select(($root.check_statuses[.]) != "SUCCESS")]' <<<"$state"
+
+  head_sha="$(jq -r '.head_sha // empty' <<<"$state")"
+  base_ref="$(jq -r '.base_ref_name // empty' <<<"$state")"
+  head_repo="$(jq -r '.head_repo_name // empty' <<<"$state")"
+  if [[ -z "$head_sha" || -z "$base_ref" || -z "$head_repo" ]]; then
+    if [[ "$repo" == "worldarchitect.ai" ]]; then
+      jq -c --argjson required "$wa_inventory" '. as $root | . + {required_checks: [$required[] | .name]} | .required_checks_missing=[$required[] | select(($root.check_statuses[.name]) != "SUCCESS") | .name]' <<<"$state"
+    else
+      pr_green_contract_pending "$state" required_check_contract_unavailable "$wa_inventory"
+    fi
+    return
+  fi
+  observed="$(pr_green_contract_view "$pr_url" || true)"
+  [[ -n "$observed" ]] || { pr_green_contract_pending "$state" required_check_contract_unavailable "$wa_inventory"; return; }
+  if ! jq -e --arg head "$head_sha" --arg base "$base_ref" --arg repo "$head_repo" '
+      (.headRefOid // "") == $head and (.baseRefName // "") == $base
+      and (.headRepository.nameWithOwner // "") == $repo' <<<"$observed" >/dev/null; then
+    pr_green_contract_pending "$state" pr_head_changed_during_verification "$wa_inventory"; return
+  fi
+
+  base_repo="${pr_url#https://github.com/}"
+  base_repo="${base_repo%%/pull/*}"
+  base_encoded="$(jq -nr --arg branch "$base_ref" '$branch | @uri')" || { pr_green_contract_pending "$state" required_check_contract_unavailable "$wa_inventory"; return; }
+  [[ "$base_repo" != "$pr_url" && "$base_repo" == */* ]] || { pr_green_contract_pending "$state" required_check_contract_unavailable "$wa_inventory"; return; }
+
+  if classic_payload="$(gh api "/repos/${base_repo}/branches/${base_encoded}/protection" 2>/dev/null)"; then classic_rc=0; else classic_rc=$?; fi
+  if rules_payload="$(gh api "/repos/${base_repo}/rules/branches/${base_encoded}" 2>/dev/null)"; then rules_rc=0; else rules_rc=$?; fi
+
+  if (( classic_rc == 0 )); then
+    if jq -e '
+        type == "object" and has("required_status_checks") and
+        (.required_status_checks == null or ((.required_status_checks | type) == "object"
+          and ((.required_status_checks.contexts // []) | type) == "array"
+          and ((.required_status_checks.checks // []) | type) == "array"
+          and all((.required_status_checks.contexts // [])[]; type == "string")
+          and all((.required_status_checks.checks // [])[]; type == "object" and (.context | type) == "string"
+            and ((.app_id == null) or (.app_id | type) == "number"))))' <<<"$classic_payload" >/dev/null; then
+      classic_known=1
+      classic_contexts="$(jq -c '.required_status_checks.contexts // []' <<<"$classic_payload")"
+      classic_checks="$(jq -c '.required_status_checks.checks // []' <<<"$classic_payload")"
+    fi
+  elif [[ "$(jq -r '.message // empty' <<<"$classic_payload" 2>/dev/null || true)" == "Branch not protected" ]]; then
+    classic_known=1
+  fi
+
+  if (( rules_rc == 0 )) && jq -e '
+      type == "array" and all(.[]; (.type != "required_status_checks") or
+        ((.parameters | type) == "object" and ((.parameters.required_status_checks // []) | type) == "array"
+          and all((.parameters.required_status_checks // [])[]; type == "object" and (.context | type) == "string"
+            and ((.integration_id == null) or (.integration_id | type) == "number"))))' <<<"$rules_payload" >/dev/null; then
+    rules_known=1
+    rules_checks="$(jq -c '[.[] | select(.type == "required_status_checks")
+      | .parameters.required_status_checks[]? | {name:.context,app_id:(.integration_id // null)}]' <<<"$rules_payload")"
+  fi
+  if (( classic_known == 0 || rules_known == 0 )); then
+    pr_green_contract_pending "$state" required_check_contract_unavailable "$wa_inventory"; return
+  fi
+
+  required_inventory="$(jq -cn --argjson contexts "$classic_contexts" --argjson checks "$classic_checks" \
+      --argjson rules "$rules_checks" --argjson wa "$wa_inventory" '
+      ([$contexts[] | {name:.,app_id:null}]
+       + [$checks[] | {name:.context,app_id:(.app_id // null)}]
+       + $rules + $wa)
+      | map(select(.name != "")) | unique_by([.name, (.app_id // null)])')" || { pr_green_contract_pending "$state" required_check_contract_unavailable "$wa_inventory"; return; }
+
+  if [[ "$(jq '[.[] | select(.app_id != null)] | length' <<<"$required_inventory")" != 0 ]]; then
+    base_runs="$(pr_green_check_runs_for_repo "$base_repo" "$head_sha")" || { base_runs='[]'; app_sources_available=false; }
+    if [[ "$head_repo" != "$base_repo" ]]; then
+      head_runs="$(pr_green_check_runs_for_repo "$head_repo" "$head_sha")" || { head_runs='[]'; app_sources_available=false; }
+    fi
+    all_runs="$(jq -cn --argjson base "$base_runs" --argjson head "$head_runs" '$base + $head')" || { all_runs='[]'; app_sources_available=false; }
+  fi
+
+  required_missing="$(jq -cn --argjson required "$required_inventory" --arg head_sha "$head_sha" \
+      --argjson statuses "$(jq -c '.check_statuses // {}' <<<"$state")" \
+      --argjson runs "$all_runs" --argjson app_sources_available "$app_sources_available" '
+      [$required[] | . as $item | select(if ($item.app_id == null) then
+        (($statuses[$item.name] // "") != "SUCCESS")
+      else (($app_sources_available | not) or (([
+        $runs[]? | select((.head_sha // "") == $head_sha)
+        | select((.name // "") == $item.name)
+        | select(($item.app_id == -1 and (.app.id // null) != null)
+          or ($item.app_id != -1 and (.app.id // null) != null
+            and ((.app.id | tostring) == ($item.app_id | tostring))))
+      ] | sort_by([(.started_at // ""),(.completed_at // ""),(.id // 0)] ) | last
+      | ((.status // "") | ascii_downcase) == "completed"
+        and ((.conclusion // "") | ascii_downcase) == "success") | not)) end) | $item.name] | unique')" || { pr_green_contract_pending "$state" required_check_contract_unavailable "$required_inventory"; return; }
+  final_state="$(jq -c --argjson required "$required_inventory" --argjson missing "$required_missing" \
+      --argjson app_sources_available "$app_sources_available" '
+      . + {required_checks: [$required[] | .name] | unique,
+            required_checks_missing: $missing}
+      | if ($app_sources_available | not) then
+          . + {verification_pending:true,verification_reason:"required_check_contract_unavailable"}
+        elif ($missing | length) > 0 then
+          . + {verification_pending:true,verification_reason:"required_checks_pending"}
+        else
+          del(.verification_pending,.verification_reason) end' <<<"$state")" || { pr_green_contract_pending "$state" required_check_contract_unavailable "$required_inventory"; return; }
+
+  if post_view="$(pr_green_contract_view "$pr_url" 2>/dev/null)"; then
+    post_rc=0
+  else
+    post_rc=$?
+  fi
+  if (( post_rc != 0 )) || ! jq -e --arg head "$head_sha" --arg base "$base_ref" --arg repo "$head_repo" '(.headRefOid // "") == $head and (.baseRefName // "") == $base and (.headRepository.nameWithOwner // "") == $repo' <<<"$post_view" >/dev/null; then
+    if (( post_rc != 0 )); then
+      jq -c '. + {verification_pending:true,verification_reason:"required_check_contract_unavailable"}' <<<"$final_state"
+    else
+      jq -c '. + {verification_pending:true,verification_reason:"pr_head_changed_during_verification"}' <<<"$final_state"
+    fi
+    return
+  fi
+  printf '%s\n' "$final_state"
 }
 
 pr_green_fetch_live_state() {
   local url="$1" payload
-  payload="$(gh pr view "$url" --json headRefOid,mergeable,mergeStateStatus,statusCheckRollup 2>/dev/null)" || return 1
+  payload="$(gh pr view "$url" --json headRefOid,mergeable,mergeStateStatus,statusCheckRollup,baseRefName,headRepository 2>/dev/null)" || return 1
   pr_green_state_from_pr_json <<<"$payload"
 }

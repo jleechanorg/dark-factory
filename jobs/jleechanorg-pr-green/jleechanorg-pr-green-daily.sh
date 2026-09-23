@@ -268,7 +268,7 @@ record_outcome() {
 reconcile_pr() {
   local repo="$1" number="$2" url="$3" before="$4" action="$5" after classification snapshot_path
   after="$(pr_green_fetch_live_state "$url" 2>/dev/null || true)"
-  after="$(pr_green_apply_required_contract "$repo" "$after")"
+  after="$(pr_green_apply_required_contract "$repo" "$after" "$url")"
   [[ -n "$after" ]] || { echo "$LOG_PREFIX unable to re-read $repo#$number after $action" >&2; return 1; }
   classification="$(pr_green_classify_outcome "$before" "$after")"
   record_outcome "$repo" "$number" "$url" "$before" "$after" "$classification" "$action"
@@ -308,7 +308,7 @@ while IFS=$'\t' read -r repo number title url updated; do
   [[ -n "$repo" && -n "$number" ]] || continue
   : "$updated" # retained from discovery for the audit TSV ordering
   live_state="$(pr_green_fetch_live_state "$url" 2>/dev/null || true)"
-  live_state="$(pr_green_apply_required_contract "$repo" "$live_state")"
+  live_state="$(pr_green_apply_required_contract "$repo" "$live_state" "$url")"
   if [[ -z "$live_state" ]]; then
     analysis_failed=$((analysis_failed + 1))
     echo "$LOG_PREFIX unable to inspect $repo#$number" >&2
@@ -319,7 +319,6 @@ while IFS=$'\t' read -r repo number title url updated; do
   failures="$(jq -r '.failed_checks | join(",")' <<<"$live_state")"
   previous_snapshot="$(pr_green_read_snapshot "$STATE_DIR" "$repo" "$number" || true)"
   if [[ -n "$previous_snapshot" ]]; then
-    previous_snapshot="$(pr_green_apply_required_contract "$repo" "$previous_snapshot")"
     reconcile_pr "$repo" "$number" "$url" "$previous_snapshot" reconciled || true
   fi
   if [[ "$mergeable" == "UNKNOWN" ]]; then
@@ -369,6 +368,7 @@ SAFETY AND DELIVERY
 - Never force-push.
 - Never change credentials.
 - Never weaken tests merely to make them pass.
+- Never manufacture an empty or no-op commit, bypass hooks, or wrap/replace push tools to obtain a receipt or satisfy delivery metrics.
 - Run the narrowest relevant tests covering both the PR behavior and current-base contract, then the repository's required checks.
 - Commit with an explicit message. Push normally only after the integrated tests and required checks are green.
 - Before any push, invoke the job-owned receipt helper exactly as follows; do not use a bare git push:
@@ -381,6 +381,7 @@ SAFETY AND DELIVERY
     --commit-url "https://github.com/jleechanorg/${repo}/commit/\$after_sha" \
     --worktree "\$PWD" --ledger "${METRICS_DIR}/push-receipts.jsonl"
 - The helper performs the normal push and records the verified receipt. Never invent or copy an AO/native session id.
+- If the push succeeds but receipt/verification remains pending or unavailable, preserve the exact before/after SHAs and logs, do not create another commit or push solely to obtain a metric/receipt, and report verification pending.
 
 Current signals: mergeable=${mergeable:-unknown}; failing_checks=${failures:-none}.
 EOF

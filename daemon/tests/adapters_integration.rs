@@ -1508,6 +1508,8 @@ fn ao_recovery_failure_preserves_spawn_and_recovery_errors() {
     ));
     let _ = std::fs::remove_dir_all(&fake_bin_dir);
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    let claude_config = fake_bin_dir.join("claude-config");
+    std::fs::create_dir_all(&claude_config).unwrap();
 
     let log_file = fake_bin_dir.join("ao_recovery_failure_calls.log");
     let fake_ao = fake_bin_dir.join("ao");
@@ -1553,6 +1555,7 @@ sys.exit(1)
         ("PATH", &new_path),
         ("DARK_FACTORY_CODER_FALLBACK_CHAIN", "minimax"),
         ("MINIMAX_API_KEY", "test-fake-minimax-key"),
+        ("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_config.to_string_lossy()),
     ]);
 
     let repo = "jleechanorg/dark-factory";
