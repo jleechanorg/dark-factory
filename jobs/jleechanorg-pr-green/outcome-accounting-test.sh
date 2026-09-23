@@ -63,6 +63,41 @@ state="$(pr_green_state_from_pr_json <<<"$status_context_pr")"
 assert_eq "$(jq -r '.check_count' <<<"$state")" 1
 assert_eq "$(jq -r '.successful_completed_checks' <<<"$state")" 1
 
+# A newer successful attempt for the same logical CheckRun must retire an older
+# failure regardless of the order GitHub returns the rollup rows.
+failure_then_success='{"headRefOid":"after","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[
+  {"name":"unit","workflowName":"CI","conclusion":"SUCCESS","status":"COMPLETED","startedAt":"2026-09-23T08:05:00Z","completedAt":"2026-09-23T08:06:00Z","detailsUrl":"https://github.com/example/runs/2"},
+  {"name":"unit","workflowName":"CI","conclusion":"FAILURE","status":"COMPLETED","startedAt":"2026-09-23T08:00:00Z","completedAt":"2026-09-23T08:01:00Z","detailsUrl":"https://github.com/example/runs/1"}
+]}'
+state="$(pr_green_state_from_pr_json <<<"$failure_then_success")"
+assert_eq "$(jq -r '.failed_checks | length' <<<"$state")" 0
+assert_eq "$(jq -r '.check_count' <<<"$state")" 1
+assert_eq "$(jq -r '.successful_completed_checks' <<<"$state")" 1
+assert_eq "$(jq -r '.pending_checks' <<<"$state")" false
+
+# Conversely, a newer failed attempt remains actionable even when the stale
+# success appears after it in the payload.
+success_then_failure='{"headRefOid":"after","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[
+  {"name":"unit","workflowName":"CI","conclusion":"FAILURE","status":"COMPLETED","startedAt":"2026-09-23T08:05:00Z","completedAt":"2026-09-23T08:06:00Z","detailsUrl":"https://github.com/example/runs/2"},
+  {"name":"unit","workflowName":"CI","conclusion":"SUCCESS","status":"COMPLETED","startedAt":"2026-09-23T08:00:00Z","completedAt":"2026-09-23T08:01:00Z","detailsUrl":"https://github.com/example/runs/1"}
+]}'
+state="$(pr_green_state_from_pr_json <<<"$success_then_failure")"
+assert_eq "$(jq -r '.failed_checks | join(",")' <<<"$state")" unit
+assert_eq "$(jq -r '.successful_completed_checks' <<<"$state")" 0
+assert_eq "$(jq -r '.pending_checks' <<<"$state")" false
+
+# A newer pending retry retires an older failure but must keep verification
+# pending until that retry reaches a terminal conclusion.
+pending_retry='{"headRefOid":"after","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[
+  {"name":"unit","workflowName":"CI","conclusion":"","status":"QUEUED","startedAt":"2026-09-23T08:05:00Z","completedAt":"0001-01-01T00:00:00Z","detailsUrl":"https://github.com/example/runs/2"},
+  {"name":"unit","workflowName":"CI","conclusion":"FAILURE","status":"COMPLETED","startedAt":"2026-09-23T08:00:00Z","completedAt":"2026-09-23T08:01:00Z","detailsUrl":"https://github.com/example/runs/1"}
+]}'
+state="$(pr_green_state_from_pr_json <<<"$pending_retry")"
+assert_eq "$(jq -r '.failed_checks | length' <<<"$state")" 0
+assert_eq "$(jq -r '.check_count' <<<"$state")" 1
+assert_eq "$(jq -r '.successful_completed_checks' <<<"$state")" 0
+assert_eq "$(jq -r '.pending_checks' <<<"$state")" true
+
 # GitHub retains cancelled check-runs from superseded duplicate workflows in
 # statusCheckRollup. A completed successful replacement for the same check on
 # this exact PR head is not a CI failure and must not consume a repair worker.

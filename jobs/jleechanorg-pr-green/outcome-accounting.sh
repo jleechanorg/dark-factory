@@ -90,26 +90,46 @@ pr_green_outcome_result() {
 # separately.  Counts retain whether GitHub has registered and completed
 # successful evidence on this exact head. CANCELLED is excluded because GitHub
 # keeps superseded workflow runs in the rollup after their successful
-# replacement completes.
+# replacement completes. A context can still contain several attempts, so the
+# jq projection below collapses each exact name/context to its newest
+# timestamped attempt; detailsUrl and other provider IDs make equal-timestamp
+# attempts deterministic. GitHub's zero time is treated as absent for queued
+# CheckRuns.
 pr_green_state_from_pr_json() {
   jq -c '
+    def first_nonempty:
+      map(select(. != null and . != "" and . != "0001-01-01T00:00:00Z")) | .[0] // "";
     def failed: ["FAILURE","FAILED","ERROR","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE"];
-    def state: ((.conclusion // .state // "") | ascii_upcase);
+    def state: ([.conclusion, .state] | first_nonempty | ascii_upcase);
     def status: ((.status // "") | ascii_upcase);
     def completed: (status == "" or status == "COMPLETED");
+    def logical_context: ([.context, .name, .workflowName] | first_nonempty);
+    def attempt_timestamp: ([.completedAt, .startedAt, .updatedAt] | first_nonempty);
+    def attempt_identity: ([.detailsUrl, .externalId, .databaseId, .id] | first_nonempty);
+    def attempt_rank: [attempt_timestamp, attempt_identity];
+    def latest_checks:
+      reduce ((.statusCheckRollup // [])[]?) as $check ({};
+        ($check | logical_context) as $key
+        | .[$key] as $previous
+        | if ($previous == null or (($check | attempt_rank) > ($previous | attempt_rank)))
+          then .[$key] = $check
+          else .
+          end
+      ) | [.[]];
+    latest_checks as $checks |
     {
       head_sha: (.headRefOid // .headRefName // ""),
       mergeability: ((.mergeable // "") | ascii_upcase),
       conflicting: ((.mergeable == "CONFLICTING") or (.mergeStateStatus == "DIRTY") or (.mergeStateStatus == "CONFLICTING")),
-      failed_checks: [(.statusCheckRollup // [])[]?
+      failed_checks: [$checks[]?
         | select(state as $state | failed | index($state))
-        | (.name // .workflowName // "unnamed")],
-      check_count: [(.statusCheckRollup // [])[]?] | length,
-      successful_completed_checks: [(.statusCheckRollup // [])[]?
+        | logical_context],
+      check_count: ($checks | length),
+      successful_completed_checks: [$checks[]?
         | select(state == "SUCCESS" and completed)] | length,
-      check_statuses: (reduce ((.statusCheckRollup // [])[]?) as $check ({};
-        .[($check.name // $check.context // "")] = (($check.conclusion // $check.state // "") | ascii_upcase))),
-      pending_checks: (any((.statusCheckRollup // [])[]?;
+      check_statuses: (reduce $checks[] as $check ({};
+        .[($check | logical_context)] = ($check | state))),
+      pending_checks: (any($checks[]?;
         (state == "" and status != "COMPLETED")
         or (state | IN("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "REQUESTED"))
       ) or (((.mergeable // "") | ascii_upcase) == "UNKNOWN")
