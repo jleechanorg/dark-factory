@@ -18,6 +18,7 @@ LOG_PREFIX="[pr-green-daily]"
 AO_PROJECT_ROOT="${PR_GREEN_AO_PROJECT_ROOT:-$HOME/.ao/daily-projects}"
 METRICS_DIR="${PR_GREEN_METRICS_DIR:-$HOME/.local/state/jleechanorg-pr-green}"
 STATE_DIR="$METRICS_DIR/pr-state"
+export PR_GREEN_DELIVERY_STATE_DIR="${PR_GREEN_DELIVERY_STATE_DIR:-$METRICS_DIR/pending-delivery}"
 AO_SPAWN_LOCK_DIR="${PR_GREEN_AO_SPAWN_LOCK_DIR:-/run/user/${UID}}"
 export AO_CONFIG_PATH="${PR_GREEN_AO_CONFIG_PATH:-$HOME/agent-orchestrator.yaml}"
 mkdir -p "$METRICS_DIR"
@@ -185,7 +186,11 @@ fixed_confirmed=0
 # after a fresh GitHub read proves a new head cleared the original blocker.
 record_outcome() {
   local repo="$1" number="$2" url="$3" before="$4" after="$5" classification="$6" action="$7"
-  local result verified head_before head_after
+  local result verified head_before head_after native_ack_status=untracked
+  case "$action" in
+    reused|restored) native_ack_status=observed ;;
+    delivery_unconfirmed) native_ack_status=missing ;;
+  esac
   read -r result verified <<<"$(pr_green_outcome_result "$classification")"
   head_before="$(jq -r '.head_sha' <<<"$before")"
   head_after="$(jq -r '.head_sha' <<<"$after")"
@@ -194,8 +199,8 @@ record_outcome() {
     --arg head_before "$head_before" --arg head_after "$head_after" \
     --argjson blocker_before "$before" --argjson blocker_after "$after" \
     --arg classification "$classification" --arg action "$action" \
-    --arg result "$result" --argjson verified "$verified" \
-    '{ts:$ts,run_ts:$run_ts,repo:$repo,number:$number,url:$url,head_before:$head_before,head_after:$head_after,blocker_before:$blocker_before,blocker_after:$blocker_after,classification:$classification,session_action:$action,result:$result,verified:$verified,detail:($classification + "; " + $action)}' \
+    --arg result "$result" --argjson verified "$verified" --arg native_ack_status "$native_ack_status" \
+    '{ts:$ts,run_ts:$run_ts,repo:$repo,number:$number,url:$url,head_before:$head_before,head_after:$head_after,blocker_before:$blocker_before,blocker_after:$blocker_after,classification:$classification,session_action:$action,result:$result,verified:$verified,native_ack_status:$native_ack_status,detail:($classification + "; " + $action)}' \
     >> "$METRICS_DIR/outcomes.jsonl"
   [[ "$classification" == "fixed_confirmed" ]] && fixed_confirmed=$((fixed_confirmed + 1))
   # `[[ ... ]] &&` returns 1 for ordinary non-fix outcomes.  This helper is

@@ -414,6 +414,81 @@ pr_green_wait_for_native_prompt() {
   done
 }
 
+# A successful AO transport call is not durable delivery. Persist the exact
+# envelope before sending it so a later sweep can prove (or suppress) the same
+# request instead of appending another prompt to the native composer.
+pr_green_delivery_state_dir() {
+  printf '%s\n' "${PR_GREEN_DELIVERY_STATE_DIR:-${PR_GREEN_METRICS_DIR:-${TMPDIR:-/tmp}/jleechanorg-pr-green}/pending-delivery}"
+}
+
+pr_green_delivery_pending_path() {
+  local project_id="$1" pr_number="$2" state_dir
+  [[ "$project_id" =~ ^[[:alnum:]._-]+$ && "$pr_number" =~ ^[0-9]+$ ]] || return 1
+  state_dir="$(pr_green_delivery_state_dir)"
+  printf '%s/%s-%s.json\n' "$state_dir" "$project_id" "$pr_number"
+}
+
+pr_green_delivery_envelope() {
+  local prompt="$1" request_id="$2"
+  printf '%s [PR_GREEN_DELIVERY_ID:%s]\n' "$prompt" "$request_id"
+}
+
+pr_green_delivery_request_id() {
+  if [[ -n "${PR_GREEN_TEST_DELIVERY_ID:-}" ]]; then
+    printf '%s\n' "$PR_GREEN_TEST_DELIVERY_ID"
+  else
+    printf 'pr-green-%s-%s-%s\n' "$(date +%s%N)" "$$" "${RANDOM:-0}"
+  fi
+}
+
+pr_green_delivery_write_pending() {
+  local project_id="$1" pr_number="$2" session_id="$3" native_id="$4" workspace="$5" prompt="$6" envelope="$7" request_id="$8"
+  local path state_dir tmp
+  path="$(pr_green_delivery_pending_path "$project_id" "$pr_number")" || return 1
+  state_dir="$(dirname "$path")"
+  mkdir -p "$state_dir" || return 1
+  tmp="$(mktemp "${path}.tmp.XXXXXX")" || return 1
+  if ! jq -cn --arg project_id "$project_id" --argjson pr_number "$pr_number" \
+    --arg session_id "$session_id" --arg native_id "$native_id" --arg workspace "$workspace" \
+    --arg prompt "$prompt" --arg envelope "$envelope" --arg request_id "$request_id" \
+    --argjson created_at "$(date +%s)" \
+    '{project_id:$project_id,pr_number:$pr_number,session_id:$session_id,native_id:$native_id,workspace:$workspace,prompt:$prompt,envelope:$envelope,request_id:$request_id,created_at:$created_at}' \
+    >"$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  mv -- "$tmp" "$path"
+}
+
+pr_green_delivery_clear_pending() {
+  local path
+  path="$(pr_green_delivery_pending_path "$1" "$2")" || return 1
+  rm -f -- "$path"
+}
+
+# Return acked when the persisted request's exact native envelope exists,
+# pending when it does not, and none when no request is outstanding. A stale
+# or malformed record is deliberately pending: it must suppress a duplicate,
+# never become permission to send a new prompt.
+pr_green_delivery_pending_status() {
+  local project_id="$1" pr_number="$2" path pending listing count envelope native_id workspace
+  path="$(pr_green_delivery_pending_path "$project_id" "$pr_number")" || return 1
+  [[ -s "$path" ]] || { printf '%s\n' none; return 0; }
+  pending="$(cat -- "$path" 2>/dev/null || true)"
+  native_id="$(jq -r '.native_id // empty' <<<"$pending" 2>/dev/null || true)"
+  workspace="$(jq -r '.workspace // empty' <<<"$pending" 2>/dev/null || true)"
+  envelope="$(jq -r '.envelope // empty' <<<"$pending" 2>/dev/null || true)"
+  [[ -n "$native_id" && -n "$workspace" && -n "$envelope" ]] || { printf '%s\n' pending; return 0; }
+  listing="$(pr_green_find_native_rollouts "$workspace" '' "$native_id" 2>/dev/null || true)"
+  [[ -n "$listing" ]] || { printf '%s\n' pending; return 0; }
+  count="$(pr_green_native_prompt_count "$listing" "$envelope" 2>/dev/null || true)"
+  if [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]; then
+    printf '%s\n' acked
+  else
+    printf '%s\n' pending
+  fi
+}
+
 
 # Recognize both legacy and current Go AO spawn acknowledgements. The Go CLI
 # exits after claiming a PR and reports either a generic "claimed URL" or the
@@ -524,9 +599,21 @@ pr_green_reuse_session() {
   local pr_number="$2"
   local prompt="$3"
   local record session_id terminated restore_output native_row native_workspace native_id native_baseline native_listing
+  local pending_status request_id envelope
   local -a native_row_fields=()
 
   PR_GREEN_NATIVE_ROLLOUT_LISTING=''
+
+  pending_status="$(pr_green_delivery_pending_status "$project_id" "$pr_number" 2>/dev/null || true)"
+  case "$pending_status" in
+    acked)
+      pr_green_delivery_clear_pending "$project_id" "$pr_number" || return 4
+      ;;
+    pending)
+      printf '%s\n' "PR $project_id#$pr_number has an unresolved native delivery; suppressing duplicate prompt" >&2
+      return 4
+      ;;
+  esac
 
   record="$(pr_green_session_record "$project_id" "$pr_number" 2>/dev/null || true)"
   [[ -n "$record" ]] || return 1
@@ -576,17 +663,24 @@ pr_green_reuse_session() {
     printf '%s\n' "AO session $session_id native rollout is unavailable; delivery_unconfirmed" >&2
     return 4
   }
-  native_baseline="$(pr_green_native_prompt_count "$native_listing" "$prompt" 2>/dev/null || true)"
+  request_id="$(pr_green_delivery_request_id)"
+  envelope="$(pr_green_delivery_envelope "$prompt" "$request_id")"
+  native_baseline="$(pr_green_native_prompt_count "$native_listing" "$envelope" 2>/dev/null || true)"
   if [[ ! "$native_baseline" =~ ^[0-9]+$ ]]; then
     printf '%s\n' "AO session $session_id native rollout is unavailable; delivery_unconfirmed" >&2
     return 4
   fi
 
-  if ! ao send --session "$session_id" --message "$prompt" >/dev/null 2>&1; then
+  if ! pr_green_delivery_write_pending "$project_id" "$pr_number" "$session_id" "$native_id" "$native_workspace" "$prompt" "$envelope" "$request_id"; then
+    printf '%s\n' "AO session $session_id could not persist delivery state; suppressing prompt" >&2
+    return 4
+  fi
+  if ! ao send --session "$session_id" --message "$envelope" >/dev/null 2>&1; then
     printf '%s\n' "AO session $session_id did not accept the prompt after reuse/restore; suppressing duplicate spawn" >&2
     return 2
   fi
-  if pr_green_wait_for_native_prompt "$native_listing" "$prompt" "$native_baseline"; then
+  if pr_green_wait_for_native_prompt "$native_listing" "$envelope" "$native_baseline"; then
+    pr_green_delivery_clear_pending "$project_id" "$pr_number" || return 4
     return 0
   fi
   printf '%s\n' "AO session $session_id transport returned success without a native user turn; delivery_unconfirmed" >&2

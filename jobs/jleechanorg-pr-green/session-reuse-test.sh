@@ -38,6 +38,7 @@ printf '%s\n' '{"pid":1234,"port":43123}' >"$PR_GREEN_AO_RUN_FILE"
 recovery_state="$recovery_dir/recovery-state.tsv"
 printf '%s||1|2026-09-23T16:00:00Z\n' "$recovery_workspace" >"$recovery_state"
 export PR_GREEN_RECOVERY_STATE="$recovery_state"
+export PR_GREEN_DELIVERY_STATE_DIR="$recovery_dir/delivery"
 cat >"$recovery_bin/sqlite3" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$*" == *"SELECT runtime_handle_id"* && "$*" == *"'wa-busy'"* ]]; then
@@ -131,7 +132,7 @@ rm -f "$action_file"
 assert_eq "$action" reused
 mapfile -t ao_calls <"$ao_calls_file"
 assert_eq "${#ao_calls[@]}" 2
-assert_eq "${ao_calls[1]}" 'send --session wa-live --message updated prompt'
+[[ "${ao_calls[1]}" == 'send --session wa-live --message updated prompt [PR_GREEN_DELIVERY_ID:'*']' ]]
 if rg -q '^spawn ' "$ao_calls_file"; then
   printf 'live-session reuse must not spawn a second session\n' >&2
   exit 1
@@ -148,6 +149,40 @@ if [[ "$rc" -ne 4 ]]; then
   printf 'missing native acknowledgement must return delivery-unconfirmed code 4 (got %s)\n' "$rc" >&2
   exit 1
 fi
+
+# A later invocation must not append a new request while the old request is
+# unresolved. A delayed acknowledgement for the old envelope is not an
+# acknowledgement for a future request; only after it is observed may the
+# next request be sent with a distinct nonce.
+pending_path="$(pr_green_delivery_pending_path worldarchitect.ai 123)"
+pending_envelope="$(jq -r '.envelope' "$pending_path")"
+: >"$ao_calls_file"
+set +e
+pr_green_reuse_session worldarchitect.ai 123 'new prompt before old ack' >/dev/null
+rc=$?
+set -e
+if [[ "$rc" -ne 4 ]]; then
+  printf 'unresolved old delivery must suppress a new prompt (got %s)\n' "$rc" >&2
+  exit 1
+fi
+if rg -q '^send ' "$ao_calls_file"; then
+  printf 'unresolved old delivery appended a new prompt\n' >&2
+  exit 1
+fi
+jq -cn --arg prompt "$pending_envelope" '{type:"response_item",payload:{role:"user",content:[{type:"input_text",text:$prompt}]},timestamp:"2026-09-23T16:01:00Z"}' >>"$live_rollout"
+native_ack_file="$live_rollout"
+PR_GREEN_TEST_DELIVERY_ID='new-delivery-id'
+action_file="$(mktemp)"
+pr_green_reuse_session worldarchitect.ai 123 'new prompt after old ack' >"$action_file"
+action="$(<"$action_file")"
+rm -f "$action_file"
+native_ack_file=''
+unset PR_GREEN_TEST_DELIVERY_ID
+assert_eq "$action" reused
+mapfile -t ao_calls <"$ao_calls_file"
+assert_eq "${#ao_calls[@]}" 2
+[[ "${ao_calls[1]}" == 'send --session wa-live --message new prompt after old ack [PR_GREEN_DELIVERY_ID:new-delivery-id]' ]]
+[[ ! -e "$pending_path" ]]
 
 # Sessions created before the AO hook-path repair can still say idle in AO's
 # database while their actual Codex pane visibly works.  Such a session must
@@ -178,7 +213,7 @@ rm -f "$action_file"
 assert_eq "$action" reused
 mapfile -t ao_calls <"$ao_calls_file"
 assert_eq "${ao_calls[1]}" 'session get wa-fallback -p worldarchitect.ai --json'
-assert_eq "${ao_calls[2]}" 'send --session wa-fallback --message hydrated prompt'
+[[ "${ao_calls[2]}" == 'send --session wa-fallback --message hydrated prompt [PR_GREEN_DELIVERY_ID:'*']' ]]
 
 fixture='{"data":[{"id":"wa-dead-old","displayName":"pr-321","isTerminated":true,"status":"terminated","updatedAt":"2026-09-23T00:01:00Z"},{"id":"wa-live-new","displayName":"pr-321","isTerminated":false,"status":"pr_open","updatedAt":"2026-09-23T00:00:00Z"}]}'
 session_get_fixture=''
@@ -191,7 +226,7 @@ action="$(<"$action_file")"
 rm -f "$action_file"
 assert_eq "$action" reused
 mapfile -t ao_calls <"$ao_calls_file"
-assert_eq "${ao_calls[1]}" 'send --session wa-live-new --message prefer live prompt'
+[[ "${ao_calls[1]}" == 'send --session wa-live-new --message prefer live prompt [PR_GREEN_DELIVERY_ID:'*']' ]]
 
 fixture='{"data":[{"id":"wa-dead","displayName":"pr-456","isTerminated":true,"status":"terminated","updatedAt":"2026-09-23T00:00:00Z"}]}'
 : >"$ao_calls_file"
@@ -205,7 +240,7 @@ assert_eq "$action" restored
 mapfile -t ao_calls <"$ao_calls_file"
 assert_eq "${#ao_calls[@]}" 3
 assert_eq "${ao_calls[1]}" 'session restore wa-dead -p worldarchitect.ai'
-assert_eq "${ao_calls[2]}" 'send --session wa-dead --message restore prompt'
+[[ "${ao_calls[2]}" == 'send --session wa-dead --message restore prompt [PR_GREEN_DELIVERY_ID:'*']' ]]
 
 # A successful restore followed by a rejected prompt still identifies the
 # exact existing session. The caller must suppress duplicate spawn rather than
@@ -224,10 +259,10 @@ fi
 mapfile -t ao_calls <"$ao_calls_file"
 assert_eq "${ao_calls[0]}" 'session ls -p worldarchitect.ai --include-terminated --json'
 assert_eq "${ao_calls[1]}" 'session restore wa-dead -p worldarchitect.ai'
-assert_eq "${ao_calls[2]}" 'send --session wa-dead --message restore retry prompt'
+[[ "${ao_calls[2]}" == 'send --session wa-dead --message restore retry prompt [PR_GREEN_DELIVERY_ID:'*']' ]]
 
-# A restore command can partially launch a worker before returning an error;
-# never fall through to a duplicate spawn after that ambiguous outcome.
+# A prior send failure leaves a durable pending request. A later invocation
+# must not restore/send again while that exact request lacks native ack.
 restore_fail=1
 : >"$ao_calls_file"
 set +e
@@ -235,8 +270,8 @@ pr_green_reuse_session worldarchitect.ai 456 'restore failure prompt' >/dev/null
 rc=$?
 set -e
 restore_fail=0
-if [[ "$rc" -ne 2 ]]; then
-  printf 'restore failure must return duplicate-suppression code 2 (got %s)\n' "$rc" >&2
+if [[ "$rc" -ne 4 ]]; then
+  printf 'pending delivery must return delivery-unconfirmed code 4 (got %s)\n' "$rc" >&2
   exit 1
 fi
 
