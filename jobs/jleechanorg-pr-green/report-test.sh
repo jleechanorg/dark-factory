@@ -24,6 +24,7 @@ cat >"$fixture_dir/outcomes.jsonl" <<'EOF'
 {"ts":1100,"repo":"worldarchitect.ai","number":3,"url":"https://example.test/3","run_ts":1000,"result":"blocked","verified":false,"detail":"ambiguous"}
 {"ts":1100,"repo":"worldarchitect.ai","number":4,"url":"https://example.test/4","run_ts":1000,"head_before":"old-head","head_after":"new-head","session_action":"recovery_blocked","result":"dispatch_failed","verified":false,"detail":"native recovery blocked"}
 {"ts":1100,"repo":"worldarchitect.ai","number":5,"url":"https://example.test/5","run_ts":1000,"head_before":"same-head","head_after":"same-head","session_action":"delivery_unconfirmed","result":"dispatch_failed","native_ack_status":"missing","verified":false,"detail":"native user turn not observed"}
+{"ts":1100,"repo":"worldarchitect.ai","number":7,"url":"https://example.test/7","run_ts":1000,"head_before":"","head_after":"new-head-without-baseline","session_action":"reused","result":"fixed","verified":true,"detail":"missing baseline"}
 EOF
 cat >"$fixture_dir/push-receipts.jsonl" <<'EOF'
 {"repo":"worldarchitect.ai","number":6,"session_id":"session-six","before_sha":"before-six","after_sha":"after-six","commit_url":"https://github.com/jleechanorg/worldarchitect.ai/commit/after-six","pushed_at":1100,"push_exit_code":0,"verified":true}

@@ -141,6 +141,8 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" \
     push_receipts_available: (any($pushes[]; true)),
     green_new_head_outcomes: ($outcomes
       | map(select(.result == "fixed" and (.verified == true)
+        and (((.head_before // "") | tostring | length) > 0)
+        and (((.head_after // "") | tostring | length) > 0)
         and ((.head_before // "") != (.head_after // ""))))
       | unique_by([.repo, .number, .head_after])
       | length),

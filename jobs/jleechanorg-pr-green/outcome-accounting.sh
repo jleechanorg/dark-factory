@@ -41,7 +41,9 @@ pr_green_same_head_cooldown_applies() {
       };
       [inputs
        | select(.repo == $repo and .number == $number)
-       | select(.session_action != "reconciled" and .session_action != "cooldown_deferred")]
+       | select(.session_action != "reconciled"
+         and .session_action != "cooldown_deferred"
+         and .session_action != "admission_cap_deferred")]
       | sort_by(.ts // 0)
       | last as $latest
       | $latest != null

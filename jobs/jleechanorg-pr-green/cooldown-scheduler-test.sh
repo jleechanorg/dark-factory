@@ -10,6 +10,18 @@ mock_bin="$fixture_dir/bin"
 metrics_dir="$fixture_dir/metrics"
 mkdir -p "$mock_bin" "$metrics_dir"
 
+# Capacity deferral is an admission result, not evidence that inference ran.
+# It must not become the same-head cooldown anchor for the next sweep.
+# shellcheck disable=SC1091 # dynamic source is anchored to this test's directory
+source "$job_dir/outcome-accounting.sh"
+capacity_outcomes="$fixture_dir/capacity-outcomes.jsonl"
+printf '%s\n' '{"ts":999,"repo":"worldarchitect.ai","number":9942,"head_after":"same-head","blocker_after":{"conflicting":true,"failed_checks":[]},"classification":"no_change","session_action":"admission_cap_deferred"}' >"$capacity_outcomes"
+capacity_state='{"head_sha":"same-head","conflicting":true,"failed_checks":[]}'
+if pr_green_same_head_cooldown_applies "$capacity_outcomes" worldarchitect.ai 9942 "$capacity_state" 1000 28800; then
+  echo 'capacity deferral unexpectedly consumed inference cooldown' >&2
+  exit 1
+fi
+
 now="$(date +%s)"
 cat >"$metrics_dir/outcomes.jsonl" <<EOF
 {"ts":$((now - 1)),"repo":"worldarchitect.ai","number":9941,"head_after":"same-head","blocker_after":{"conflicting":true,"failed_checks":[]},"classification":"no_change","session_action":"reused"}

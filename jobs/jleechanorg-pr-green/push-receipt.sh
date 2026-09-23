@@ -105,7 +105,10 @@ main() {
     return 1
   fi
 
-  push_output="$(git -C "$worktree" push --porcelain "$remote" "HEAD:refs/heads/$target_branch" 2>&1)" \
+  # Push the object validated above, not the mutable checkout name. The
+  # worker may advance local HEAD while git is preparing the transport; that
+  # must not alter the receipt's claimed after SHA.
+  push_output="$(git -C "$worktree" push --porcelain "$remote" "$after_sha:refs/heads/$target_branch" 2>&1)" \
     || { printf '%s\n' "$push_output" >&2; fail 'normal git push failed'; return 1; }
   printf '%s\n' "$push_output" >&2
   [[ "$push_output" != *'up to date'* && "$push_output" != *'Everything up-to-date'* ]] \
@@ -117,12 +120,23 @@ main() {
   remote_after="${ls_line%%$'\t'*}"
   [[ "$remote_after" == "$after_sha" ]] || { fail 'remote ref does not equal after SHA after push'; return 1; }
 
-  local post_json post_branch post_oid post_repo
-  post_json="$(gh pr view "$pr_url" --json headRefName,headRefOid,headRepository,baseRefName 2>/dev/null)" \
-    || { fail 'post-push GitHub PR read failed'; return 1; }
-  post_branch="$(jq -r '.headRefName // empty' <<<"$post_json")"
-  post_oid="$(jq -r '.headRefOid // empty' <<<"$post_json")"
-  post_repo="$(jq -r '.headRepository.nameWithOwner // empty' <<<"$post_json")"
+  local post_json='' post_branch='' post_oid='' post_repo='' post_poll_attempts post_poll_seconds post_attempt
+  post_poll_attempts="${PR_GREEN_PUSH_POST_POLL_ATTEMPTS:-3}"
+  post_poll_seconds="${PR_GREEN_PUSH_POST_POLL_SECONDS:-1}"
+  [[ "$post_poll_attempts" =~ ^[1-9][0-9]*$ ]] || { fail 'invalid post-push poll attempts'; return 1; }
+  [[ "$post_poll_seconds" =~ ^[0-9]+$ ]] || { fail 'invalid post-push poll seconds'; return 1; }
+  for ((post_attempt = 1; post_attempt <= post_poll_attempts; post_attempt++)); do
+    post_json="$(gh pr view "$pr_url" --json headRefName,headRefOid,headRepository,baseRefName 2>/dev/null || true)"
+    post_branch="$(jq -r '.headRefName // empty' <<<"$post_json" 2>/dev/null || true)"
+    post_oid="$(jq -r '.headRefOid // empty' <<<"$post_json" 2>/dev/null || true)"
+    post_repo="$(jq -r '.headRepository.nameWithOwner // empty' <<<"$post_json" 2>/dev/null || true)"
+    if [[ "$post_repo" == "jleechanorg/$repo" && "$post_branch" == "$head_branch" && "$post_oid" == "$after_sha" ]]; then
+      break
+    fi
+    if (( post_attempt < post_poll_attempts && post_poll_seconds > 0 )); then
+      sleep "$post_poll_seconds"
+    fi
+  done
   [[ "$post_repo" == "jleechanorg/$repo" && "$post_branch" == "$head_branch" && "$post_oid" == "$after_sha" ]] \
     || { fail 'post-push GitHub PR head verification failed'; return 1; }
 
