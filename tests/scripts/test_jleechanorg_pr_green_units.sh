@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SERVICE="$ROOT/jobs/jleechanorg-pr-green/jleechanorg-pr-green-daily.service"
 TIMER="$ROOT/jobs/jleechanorg-pr-green/jleechanorg-pr-green-daily.timer"
+fixture_dir="$(mktemp -d)"
+trap 'rm -rf "$fixture_dir"' EXIT
 
 [[ -f "$TIMER" ]] || { echo 'FAIL: daily repair timer is missing' >&2; exit 1; }
 grep -Fq 'OnUnitActiveSec=30min' "$TIMER" || { echo 'FAIL: daily repair timer is not 30-minute periodic' >&2; exit 1; }
@@ -16,7 +18,20 @@ grep -Fq 'ExecStartPre=/usr/bin/test -s %h/.codex-dark-factory/auth.json' "$SERV
   echo 'FAIL: repair service does not fail closed when the intended Codex login is absent' >&2
   exit 1
 }
-if grep -Fq 'Environment=CODEX_HOME=%h/.codex$' "$SERVICE"; then
+default_codex_home_re='^Environment=CODEX_HOME=%h/\.codex/?$'
+positive_fixture="$fixture_dir/default-codex-home.service"
+negative_fixture="$fixture_dir/scoped-codex-home.service"
+printf '%s\n' 'Environment=CODEX_HOME=%h/.codex/' >"$positive_fixture"
+printf '%s\n' 'Environment=CODEX_HOME=%h/.codex-dark-factory' >"$negative_fixture"
+grep -Eq "$default_codex_home_re" "$positive_fixture" || {
+  echo 'FAIL: default CODEX_HOME detector did not match its positive fixture' >&2
+  exit 1
+}
+if grep -Eq "$default_codex_home_re" "$negative_fixture"; then
+  echo 'FAIL: default CODEX_HOME detector matched its negative fixture' >&2
+  exit 1
+fi
+if grep -Eq "$default_codex_home_re" "$SERVICE"; then
   echo 'FAIL: repair service still uses operator-default CODEX_HOME' >&2
   exit 1
 fi

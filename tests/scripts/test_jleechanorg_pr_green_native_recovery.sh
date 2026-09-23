@@ -204,8 +204,8 @@ latest_id="${latest_rollouts%%$'\n'*}"
 # no rollout copy or daemon mutation is allowed.
 ambiguous_workspace="$fixture_dir/ambiguous-worktree"
 mkdir -p "$ambiguous_workspace"
-printf '%s\n' '{"type":"session_meta","payload":{"id":"ambiguous-a","cwd":"'"$ambiguous_workspace"'"}}' >"$source_home/sessions/2026/09/23/rollout-a.jsonl"
-printf '%s\n' '{"type":"session_meta","payload":{"session_id":"ambiguous-b","cwd":"'"$ambiguous_workspace"'"}}' >"$source_home/sessions/2026/09/23/rollout-b.jsonl"
+printf '%s\n' '{"type":"session_meta","timestamp":"2026-09-23T08:10:00Z","payload":{"id":"ambiguous-aaaaaaaaaaaa","cwd":"'"$ambiguous_workspace"'"}}' >"$source_home/sessions/2026/09/23/rollout-a.jsonl"
+printf '%s\n' '{"type":"session_meta","timestamp":"2026-09-23T08:10:00Z","payload":{"session_id":"ambiguous-bbbbbbbbbbbb","cwd":"'"$ambiguous_workspace"'"}}' >"$source_home/sessions/2026/09/23/rollout-b.jsonl"
 printf '%s||1\n' "$ambiguous_workspace" >"$PR_GREEN_TEST_DB_STATE"
 set +e
 pr_green_recover_native_conversation worldarchitect.ai worldarchitect.ai-ambiguous
