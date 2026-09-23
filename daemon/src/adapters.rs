@@ -4809,6 +4809,7 @@ impl CliSessions {
                 } else {
                     match validate_spawned_workspace(spec, workspace_path, is_go_ao()) {
                         Ok(()) => None,
+                        Err(error @ DaemonError::WorktreeCwdMismatch { .. }) => Some(error),
                         Err(error) => Some(if is_go_ao() {
                             DaemonError::Config(format!(
                                 "Go AO worker workspace for session {} is not bound to repo {} at expected revision {}: {error}",
