@@ -696,6 +696,12 @@ pr_green_reuse_session() {
   terminated="$(jq -r 'if (.isTerminated // false) then "true" else "false" end' <<<"$record")"
 
   if [[ "$terminated" == "true" ]]; then
+    if declare -F pr_green_before_restore_admission >/dev/null 2>&1; then
+      pr_green_before_restore_admission "$project_id" "$pr_number" "$session_id" || {
+        printf '%s\n' "AO terminated session $session_id is not admitted for restore; suppressing duplicate spawn" >&2
+        return 2
+      }
+    fi
     if ! pr_green_recover_native_conversation "$project_id" "$session_id"; then
       printf '%s\n' "AO terminated session $session_id has no unambiguous recoverable native conversation; suppressing duplicate spawn" >&2
       return 3

@@ -256,6 +256,19 @@ mapfile -t ao_calls <"$ao_calls_file"
 [[ "${ao_calls[1]}" == 'send --session wa-live-new --message Read and execute '* ]]
 
 fixture='{"data":[{"id":"wa-dead","displayName":"pr-456","isTerminated":true,"status":"terminated","updatedAt":"2026-09-23T00:00:00Z"}]}'
+restore_admission=1
+pr_green_before_restore_admission() { return "$restore_admission"; }
+: >"$ao_calls_file"
+set +e
+pr_green_reuse_session worldarchitect.ai 456 'restore must respect cap' >/dev/null
+rc=$?
+set -e
+[[ "$rc" -eq 2 ]] || { printf 'restore admission hook must suppress capped restore (got %s)\n' "$rc" >&2; exit 1; }
+if rg -q '^session restore ' "$ao_calls_file"; then
+  printf 'capped restore reached AO restore\n' >&2
+  exit 1
+fi
+restore_admission=0
 : >"$ao_calls_file"
 action_file="$(mktemp)"
 native_ack_file="$recovery_home/sessions/2026/09/23/rollout-native-session-dead.jsonl"

@@ -26,6 +26,7 @@ STATE_DIR="$METRICS_DIR/pr-state"
 export PR_GREEN_DELIVERY_STATE_DIR="${PR_GREEN_DELIVERY_STATE_DIR:-$METRICS_DIR/pending-delivery}"
 AO_SPAWN_LOCK_DIR="${PR_GREEN_AO_SPAWN_LOCK_DIR:-/run/user/${UID}}"
 GLOBAL_ADMISSION_LOCK_FILE="$AO_SPAWN_LOCK_DIR/jleechanorg-pr-green-global-admission.lock"
+PUSH_RECEIPT_HELPER="$SCRIPT_DIR/push-receipt.sh"
 export AO_CONFIG_PATH="${PR_GREEN_AO_CONFIG_PATH:-$HOME/agent-orchestrator.yaml}"
 mkdir -p "$METRICS_DIR"
 mkdir -p "$AO_SPAWN_LOCK_DIR"
@@ -63,6 +64,23 @@ pr_green_admission_available() {
 
 pr_green_release_admission_lock() {
   flock -u 8 2>/dev/null || true
+}
+
+# session-reuse.sh calls this immediately before restoring a terminated row.
+# The row is re-read by that helper, so a live->terminated transition cannot
+# bypass the same global cap used by new spawns.
+pr_green_before_restore_admission() {
+  if (( admission_lock_held == 1 )); then
+    pr_green_admission_available
+    return
+  fi
+  flock -n 8 || return 1
+  admission_lock_held=1
+  if ! pr_green_admission_available; then
+    pr_green_release_admission_lock
+    admission_lock_held=0
+    return 1
+  fi
 }
 
 command -v gh >/dev/null || { echo "$LOG_PREFIX gh is required" >&2; exit 127; }
@@ -353,6 +371,14 @@ SAFETY AND DELIVERY
 - Never weaken tests merely to make them pass.
 - Run the narrowest relevant tests covering both the PR behavior and current-base contract, then the repository's required checks.
 - Commit with an explicit message. Push normally only after the integrated tests and required checks are green.
+- Before any push, invoke the job-owned receipt helper exactly as follows; do not use a bare git push:
+  session_id="\${AO_SESSION_ID:-\${AGENT_ORCHESTRATOR_SESSION_ID:-}}"
+  [[ -n "\$session_id" ]] || { echo 'exact AO session id unavailable; refusing push' >&2; exit 1; }
+  "${PUSH_RECEIPT_HELPER}" --repo "${repo}" --number "${number}" --session-id "\$session_id" \
+    --before-sha "\$before_sha" --after-sha "\$after_sha" \
+    --commit-url "https://github.com/jleechanorg/${repo}/commit/\$after_sha" \
+    --worktree "\$PWD" --ledger "${METRICS_DIR}/push-receipts.jsonl"
+- The helper performs the normal push and records the verified receipt. Never invent or copy an AO/native session id.
 
 Current signals: mergeable=${mergeable:-unknown}; failing_checks=${failures:-none}.
 EOF
@@ -465,7 +491,16 @@ EOF
       continue
     fi
   fi
-  if (( admission_lock_held == 1 )) && ! pr_green_admission_available; then
+  if (( admission_lock_held == 0 )); then
+    if ! flock -n 8; then
+      admission_deferred=$((admission_deferred + 1))
+      record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" no_change admission_cap_deferred
+      echo "$LOG_PREFIX another bounded run holds the admission lock before spawn; deferring $repo#$number" >&2
+      continue
+    fi
+    admission_lock_held=1
+  fi
+  if ! pr_green_admission_available; then
     admission_deferred=$((admission_deferred + 1))
     record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" no_change admission_cap_deferred
     pr_green_release_admission_lock

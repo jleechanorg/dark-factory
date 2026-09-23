@@ -54,6 +54,16 @@ printf 'unexpected ao invocation: %s\n' "$*" >&2
 exit 1
 EOF
 chmod +x "$mock_bin/gh" "$mock_bin/ao"
+cat >"$mock_bin/sqlite3" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *COUNT* && "$*" == *sessions* ]]; then
+  printf '%s\n' 0
+else
+  printf '%s\n' runtime-1
+fi
+EOF
+chmod +x "$mock_bin/sqlite3"
+: >"$fixture_dir/ao.db"
 
 capture="$fixture_dir/prompt.txt"
 PATH="$mock_bin:$PATH" \
@@ -61,6 +71,7 @@ PATH="$mock_bin:$PATH" \
   CODEX_HOME="$codex_home" \
   PR_GREEN_METRICS_DIR="$fixture_dir/metrics" \
   PR_GREEN_AO_SPAWN_LOCK_DIR="$fixture_dir/spawn-locks" \
+  PR_GREEN_AO_DB_PATH="$fixture_dir/ao.db" \
   PR_GREEN_AO_CONFIG_PATH="$fixture_dir/ao-config" \
   PR_GREEN_SPAWN_PROBE_SECONDS=0.1 \
   AO_PROMPT_CAPTURE="$capture" \
@@ -97,6 +108,9 @@ assert_prompt_contains 'Never force-push.'
 assert_prompt_contains 'Never change credentials.'
 assert_prompt_contains 'Never weaken tests merely to make them pass.'
 assert_prompt_contains 'Push normally only after the integrated tests and required checks are green.'
+assert_prompt_contains 'push-receipt.sh'
+assert_prompt_contains 'AO_SESSION_ID'
+assert_prompt_contains '--session-id "$session_id"'
 assert_prompt_does_not_contain 'Fix only easy, clearly scoped test failures or mechanical merge conflicts'
 assert_prompt_does_not_contain 'leave it untouched and report the blocker'
 
