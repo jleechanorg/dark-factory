@@ -40,6 +40,16 @@ if [[ "$1" == api && "$endpoint" == /search/issues ]]; then
     fallback)
       jq -cn '[{total_count:1001,incomplete_results:false,items:[]}]'
       ;;
+    missing-gate)
+      missing_item="$(item worldarchitect.ai 43)"
+      jq -cn --argjson missing_item "$missing_item" \
+        '[{total_count:1,incomplete_results:false,items:[$missing_item]}]'
+      ;;
+    fairness)
+      fairness_items="$(jq -cn --arg updated "$updated" '[range(1;14) | {repository_url:"https://api.github.com/repos/jleechanorg/repo-a",number:.,title:("pr-" + (.|tostring)),html_url:("https://github.com/jleechanorg/repo-a/pull/" + (.|tostring)),updated_at:$updated,draft:false}]')"
+      jq -cn --argjson fairness_items "$fairness_items" \
+        '[{total_count:13,incomplete_results:false,items:$fairness_items}]'
+      ;;
     ao)
       ao_item="$(item agent-orchestrator 42)"
       jq -cn --argjson ao_item "$ao_item" \
@@ -72,6 +82,10 @@ if [[ "$1" == api && "$endpoint" == /repos/jleechanorg/repo-b/pulls ]]; then
 fi
 
 if [[ "$1 $2" == 'pr view' ]]; then
+  if [[ "${PR_GREEN_DISCOVERY_CASE:?}" == missing-gate ]]; then
+    printf '%s\n' '{"headRefOid":"head-clean","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"unit","status":"COMPLETED","conclusion":"SUCCESS"}]}'
+    exit 0
+  fi
   printf '%s\n' '{"headRefOid":"head-before","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","statusCheckRollup":[]}'
   exit 0
 fi
@@ -82,10 +96,50 @@ EOF
 
 cat >"$mock_bin/ao" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${PR_GREEN_BUSY_FAIRNESS:-0}" == 1 ]]; then
+  if [[ "$1" == spawn ]]; then
+    sleep 0.2
+    exit 0
+  fi
+  case "$1 $2" in
+    "session ls")
+      printf '%s\n' '{"data":[{"id":"busy-1","displayName":"pr-1","isTerminated":false,"status":"pr_open"}]}'
+      exit 0
+      ;;
+    "project get")
+      printf '%s\n' '{"project":{"config":{"env":{"CODEX_HOME":"'"${CODEX_HOME:-}"'"}}}}'
+      exit 0
+      ;;
+    "project set-config")
+      printf '%s\n' '{"status":"ok"}'
+      exit 0
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+fi
 printf '%s\n' "$*" >>"${AO_CALLS:?}"
 exit 99
 EOF
 chmod +x "$mock_bin/gh" "$mock_bin/ao"
+
+cat >"$mock_bin/sqlite3" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'runtime-1'
+EOF
+cat >"$mock_bin/tmux" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == has-session ]]; then
+  exit 0
+fi
+if [[ "$1" == capture-pane ]]; then
+  printf '%s\n' 'Working (4m 12s)'
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$mock_bin/sqlite3" "$mock_bin/tmux"
 
 run_case() {
   local name="$1" expected_discovered="$2" dry_run="${3:-1}" max_prs="${4:-0}"
@@ -146,6 +200,61 @@ ao_metrics="$(run_case ao 1 0 1)"
 }
 grep -Fq 'authorization_excluded' "$ao_metrics/outcomes.jsonl" || {
   echo 'FAIL: excluded AO repository was not durably accounted for' >&2
+  exit 1
+}
+
+# Missing required gates on an otherwise clean PR are pending verification,
+# not a repair admission, and must not contact AO.
+missing_metrics="$(run_case missing-gate 1 0 1)"
+[[ ! -s "$fixture_dir/ao-missing-gate.log" ]] || {
+  echo 'FAIL: clean missing-gate PR contacted AO' >&2
+  exit 1
+}
+missing_run="$(jq -s 'last' "$missing_metrics/runs.jsonl")"
+[[ "$(jq -r '.actionable' <<<"$missing_run")" == 0 && "$(jq -r '.selected' <<<"$missing_run")" == 0 ]] || {
+  echo 'FAIL: clean missing-gate PR was admitted as actionable' >&2
+  exit 1
+}
+
+# A bounded cap must rotate across runs. PR #1 is visibly busy, but PR #13
+# must still be selected on the second run instead of being starved forever.
+fair_metrics="$fixture_dir/metrics-fairness"
+fair_calls="$fixture_dir/ao-fairness.log"
+fair_codex="$fixture_dir/codex-fairness"
+mkdir -p "$fair_metrics" "$fair_codex"
+printf '%s\n' '{"tokens":{}}' >"$fair_codex/auth.json"
+: >"$fair_calls"
+for iteration in 1 2; do
+  PATH="$mock_bin:$PATH" \
+    HOME="$fixture_dir/home-fairness" \
+    CODEX_HOME="$fair_codex" \
+    PR_GREEN_DISCOVERY_CASE=fairness \
+    PR_GREEN_BUSY_FAIRNESS=1 \
+    PR_GREEN_AO_DB_PATH="$fixture_dir/ao.db" \
+    PR_GREEN_METRICS_DIR="$fair_metrics" \
+    PR_GREEN_MAX_PRS=12 \
+    PR_GREEN_DRY_RUN=0 \
+    PR_GREEN_SPAWN_PROBE_SECONDS=0.05 \
+    AO_CALLS="$fair_calls" \
+    GH_CALLS="$fixture_dir/gh-fairness-$iteration.log" \
+    bash "$JOB" >"$fixture_dir/fairness-$iteration.out" 2>"$fixture_dir/fairness-$iteration.err"
+  if [[ "$iteration" == 1 ]]; then
+    cp "$fair_metrics/selection-cursor" "$fixture_dir/cursor-before"
+    sleep 0.4
+  fi
+done
+grep -Fq 'repo-a#13' "$fixture_dir/fairness-2.out" || {
+  cat "$fixture_dir/fairness-2.out" >&2
+  cat "$fixture_dir/fairness-2.err" >&2
+  cat "$fair_metrics/selection-cursor" >&2 || true
+  cat "$fixture_dir/cursor-before" >&2 || true
+  cat "$fair_metrics/runs.jsonl" >&2 || true
+  echo 'FAIL: PR #13 remained starved after the second bounded run' >&2
+  exit 1
+}
+second_fair_run="$(jq -s 'last' "$fair_metrics/runs.jsonl")"
+[[ "$(jq -r '.selected' <<<"$second_fair_run")" -gt 0 ]] || {
+  echo 'FAIL: fairness second run did not select any rotated candidate' >&2
   exit 1
 }
 

@@ -95,6 +95,37 @@ printf '%s\n' "$prs" > "$discovery_file"
 discovered_count="$(awk 'NF {n++} END {print n+0}' "$discovery_file")"
 echo "$LOG_PREFIX discovered=$discovered_count eligible_recent_non_draft_prs (dispatch cap=$MAX_PRS)"
 
+# Rotate the bounded admission window from the last selected PR. A fixed
+# updated-time ordering would repeatedly spend the cap on the same prefix and
+# starve older eligible PRs; the cursor survives runs and naturally resets
+# when its previous key is no longer in the discovery set.
+selection_cursor_file="$METRICS_DIR/selection-cursor"
+ordered_prs="$prs"
+if [[ -n "$prs" ]]; then
+  mapfile -t discovery_rows <<<"$prs"
+  row_count="${#discovery_rows[@]}"
+  start_index=0
+  cursor_key=""
+  [[ -s "$selection_cursor_file" ]] && cursor_key="$(head -n 1 "$selection_cursor_file")"
+  if [[ -n "$cursor_key" ]]; then
+    for ((i = 0; i < row_count; i++)); do
+      IFS=$'\t' read -r cursor_repo cursor_number _ <<<"${discovery_rows[i]}"
+      if [[ "$cursor_repo#$cursor_number" == "$cursor_key" ]]; then
+        start_index=$(((i + 1) % row_count))
+        break
+      fi
+    done
+  fi
+  if (( start_index > 0 )); then
+    ordered_prs="$(
+      for ((offset = 0; offset < row_count; offset++)); do
+        index=$(((start_index + offset) % row_count))
+        printf '%s\n' "${discovery_rows[index]}"
+      done
+    )"
+  fi
+fi
+
 if [[ -z "$prs" ]]; then
   echo "$LOG_PREFIX no recently updated open PRs"
   exit 0
@@ -156,7 +187,6 @@ while IFS=$'\t' read -r repo number title url updated; do
   [[ -n "$live_state" ]] || { echo "$LOG_PREFIX unable to inspect $repo#$number" >&2; continue; }
   mergeable="$(jq -r '.mergeability // (if .conflicting then "CONFLICTING" else "MERGEABLE" end)' <<<"$live_state")"
   failures="$(jq -r '.failed_checks | join(",")' <<<"$live_state")"
-  required_missing="$(jq -r '(.required_checks_missing // []) | length' <<<"$live_state")"
   previous_snapshot="$(pr_green_read_snapshot "$STATE_DIR" "$repo" "$number" || true)"
   if [[ -n "$previous_snapshot" ]]; then
     previous_snapshot="$(pr_green_apply_required_contract "$repo" "$previous_snapshot")"
@@ -166,7 +196,7 @@ while IFS=$'\t' read -r repo number title url updated; do
     echo "$LOG_PREFIX skip $repo#$number (mergeability unknown; pending)"
     continue
   fi
-  if [[ "$mergeable" != "CONFLICTING" && -z "$failures" && "$required_missing" == 0 ]]; then
+  if [[ "$mergeable" != "CONFLICTING" && -z "$failures" ]]; then
     echo "$LOG_PREFIX skip $repo#$number (no conflict or failed check)"
     continue
   fi
@@ -187,6 +217,9 @@ while IFS=$'\t' read -r repo number title url updated; do
     continue
   fi
   selected=$((selected + 1))
+  cursor_tmp="${selection_cursor_file}.tmp.$$"
+  printf '%s#%s\n' "$repo" "$number" >"$cursor_tmp"
+  mv -- "$cursor_tmp" "$selection_cursor_file"
 
   prompt="$(cat <<EOF
 Work on ${url} in ${repo}. This is an automated daily repair pass for a PR updated in the last ${WINDOW_HOURS} hours. Inspect the exact current PR head and base first.
@@ -330,7 +363,7 @@ EOF
     continue
   fi
   rm -f "$spawn_err"
-done <<< "$prs"
+done <<< "$ordered_prs"
 
 jq -n --argjson ts "$run_started" --argjson analyzed "$analyzed" \
   --argjson discovered "$discovered_count" \
