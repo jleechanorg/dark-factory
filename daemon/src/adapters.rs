@@ -4197,9 +4197,15 @@ fn validate_spawned_workspace(
     // The legacy bridge is expected to report the exact configured checkout.
     // Native Go AO creates its own per-session worktree, so comparing it with
     // dispatch's base checkout would reject a valid isolated workspace.
-    if !native_go_workspace {
-        crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), path)?;
+    if native_go_workspace {
+        return crate::target_worktree::validate_existing_target_worktree(
+            &spec.repo,
+            path,
+            spec.expected_revision.as_deref(),
+        )
+        .map(|_| ());
     }
+    crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), path)?;
     validate_target_identity_if_expected(&spec.repo, path, spec.expected_revision.as_deref())
 }
 
@@ -4303,8 +4309,6 @@ pub fn verify_ao_bridge_compatibility(
         let mut command = Command::new("ao-go");
         command
             .arg("status")
-            .arg("-p")
-            .arg(ao_project)
             .arg("--json")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -13883,6 +13887,10 @@ mod go_ao_lifecycle_tests {
 
         let script = format!(
             r#"#!/bin/sh
+if [ "$1" = "status" ] && [ "$2" = "-p" ]; then
+  echo "unknown flag: -p" >&2
+  exit 2
+fi
 printf '%s\n' "$*" > "{}"
 cat "{}"
 "#,
@@ -13900,7 +13908,7 @@ cat "{}"
         // 1. health == ok
         assert!(verify_ao_bridge_compatibility("proj", "antigravity", &[]).is_ok());
         let calls = std::fs::read_to_string(&calls_file).unwrap();
-        assert_eq!(calls.trim(), "status -p proj --json");
+        assert_eq!(calls.trim(), "status --json");
 
         // 2. state == ready
         std::fs::write(&state_file, r#"{"state":"ready"}"#).unwrap();
@@ -13990,6 +13998,47 @@ exit 1
             .expect_err("Go AO must validate the reported workspace identity");
         assert!(error.to_string().contains("expected snapshot"), "{error}");
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn go_ao_workspace_validation_always_checks_repo_without_expected_revision() {
+        let (valid_workspace, _) = fixture_repo("repo_identity_valid");
+        let valid_spec = SpawnSpec {
+            bead_id: "go-repo-identity-valid".to_string(),
+            branch: "factory/go-repo-identity-valid".to_string(),
+            prompt: "test".to_string(),
+            repo: "jleechanorg/dark-factory".to_string(),
+            ao_project: "dark-factory".to_string(),
+            remote: "origin".to_string(),
+            local_checkout: None,
+            expected_revision: None,
+            managed_checkout: false,
+            expected_cwd: None,
+        };
+        assert!(validate_spawned_workspace(&valid_spec, &valid_workspace, true).is_ok());
+
+        let (wrong_workspace, _) = fixture_repo("repo_identity_wrong");
+        assert!(std::process::Command::new("git")
+            .args(["remote", "set-url", "origin", "https://github.com/other/repo.git"])
+            .current_dir(&wrong_workspace)
+            .status()
+            .unwrap()
+            .success());
+        let wrong_spec = SpawnSpec {
+            bead_id: "go-repo-identity-wrong".to_string(),
+            branch: "factory/go-repo-identity-wrong".to_string(),
+            prompt: "test".to_string(),
+            repo: "jleechanorg/dark-factory".to_string(),
+            ao_project: "dark-factory".to_string(),
+            remote: "origin".to_string(),
+            local_checkout: None,
+            expected_revision: None,
+            managed_checkout: false,
+            expected_cwd: None,
+        };
+        assert!(validate_spawned_workspace(&wrong_spec, &wrong_workspace, true).is_err());
+        let _ = std::fs::remove_dir_all(valid_workspace);
+        let _ = std::fs::remove_dir_all(wrong_workspace);
     }
 
     #[test]
