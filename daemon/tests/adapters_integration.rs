@@ -1552,6 +1552,7 @@ sys.exit(1)
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
         ("DARK_FACTORY_CODER_FALLBACK_CHAIN", "minimax"),
+        ("MINIMAX_API_KEY", "test-fake-minimax-key"),
     ]);
 
     let repo = "jleechanorg/dark-factory";
