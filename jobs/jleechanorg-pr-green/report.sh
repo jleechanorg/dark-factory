@@ -21,6 +21,11 @@ RUNS_FILE="$METRICS_DIR/runs.jsonl"
 OUTCOMES_FILE="$METRICS_DIR/outcomes.jsonl"
 
 mkdir -p "$METRICS_DIR"
+# Delivery and cadence updates share one lock, including Slack/email overlap.
+if [[ "$MODE" != "stdout" ]]; then
+  exec 9>"${STATE_FILE}.lock"
+  flock -x 9
+fi
 [[ -f "$RUNS_FILE" ]] || : >"$RUNS_FILE"
 [[ -f "$OUTCOMES_FILE" ]] || : >"$OUTCOMES_FILE"
 
@@ -89,8 +94,17 @@ mark_sent() {
   mv "$tmp" "$STATE_FILE"
 }
 
-send_smtp_email() {
-  local recipient="$1" subject="$2" smtp_user smtp_pass smtp_config smtp_body
+curl_config_value() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\n'/\\n}"
+  printf '"%s"' "$value"
+}
+
+send_smtp_email() (
+  local recipient="$1" subject="$2" smtp_user smtp_pass smtp_body
   smtp_user="${PR_GREEN_SMTP_USER:-${EMAIL_USER:-}}"
   smtp_pass="${PR_GREEN_SMTP_PASS:-${EMAIL_PASS:-}}"
   if [[ -z "$smtp_user" || -z "$smtp_pass" ]]; then
@@ -102,25 +116,21 @@ send_smtp_email() {
     return 1
   fi
 
-  # Keep the app password out of argv and remove the 0600 transport files on
-  # every return path. curl's config is used only because it keeps credentials
-  # out of process listings; it is not persisted with the cadence state.
+  # Stream credentials to curl: neither argv nor a temporary file contains them.
   umask 077
-  smtp_config="$(mktemp "$METRICS_DIR/smtp-config.XXXXXX")"
   smtp_body="$(mktemp "$METRICS_DIR/smtp-body.XXXXXX")"
-  trap 'rm -f "$smtp_config" "$smtp_body"' RETURN
+  trap 'rm -f "$smtp_body"' EXIT
   printf 'From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s\r\n' \
     "$smtp_user" "$recipient" "$subject" "$body" >"$smtp_body"
   {
     printf 'url = "smtps://smtp.gmail.com:465"\n'
-    printf 'user = "%s:%s"\n' "$smtp_user" "$smtp_pass"
-    printf 'mail-from = "%s"\n' "$smtp_user"
-    printf 'mail-rcpt = "%s"\n' "$recipient"
-    printf 'upload-file = "%s"\n' "$smtp_body"
+    printf 'user = '; curl_config_value "$smtp_user:$smtp_pass"; printf '\n'
+    printf 'mail-from = '; curl_config_value "$smtp_user"; printf '\n'
+    printf 'mail-rcpt = '; curl_config_value "$recipient"; printf '\n'
+    printf 'upload-file = '; curl_config_value "$smtp_body"; printf '\n'
     printf 'ssl-reqd\nconnect-timeout = 10\nmax-time = 30\nsilent\nshow-error\nfail\n'
-  } >"$smtp_config"
-  curl --config "$smtp_config"
-}
+  } | curl --config -
+)
 
 if [[ "$MODE" == "stdout" ]]; then
   printf '%s\n' "$body"
@@ -137,11 +147,12 @@ case "$MODE" in
     token="${HERMES_SLACK_BOT_TOKEN:-${SLACK_BOT_TOKEN:-}}"
     if [[ -z "$token" ]]; then
       echo "pr-green Slack report not sent: no Slack bot token in service environment" >&2
-      exit 0
+      exit 1
     fi
     channel="${PR_GREEN_SLACK_CHANNEL_ID:-C0AJQ5M0A0Y}"
-    if curl --fail --silent --show-error --max-time 20 -X POST https://slack.com/api/chat.postMessage \
-      -H "Authorization: Bearer $token" -H 'Content-Type: application/json; charset=utf-8' \
+    if { printf 'header = '; curl_config_value "Authorization: Bearer $token"; printf '\n'; } \
+      | curl --config - --fail --silent --show-error --max-time 20 -X POST https://slack.com/api/chat.postMessage \
+      -H 'Content-Type: application/json; charset=utf-8' \
       --data "$(jq -n --arg channel "$channel" --arg text "$body" '{channel:$channel,text:$text}')" \
       | jq -e '.ok == true' >/dev/null; then
       mark_sent
