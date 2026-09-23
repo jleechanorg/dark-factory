@@ -604,19 +604,18 @@ pr_green_reuse_session() {
 
   PR_GREEN_NATIVE_ROLLOUT_LISTING=''
 
-  pending_status="$(pr_green_delivery_pending_status "$project_id" "$pr_number" 2>/dev/null || true)"
-  case "$pending_status" in
-    acked)
-      pr_green_delivery_clear_pending "$project_id" "$pr_number" || return 4
-      ;;
-    pending)
-      printf '%s\n' "PR $project_id#$pr_number has an unresolved native delivery; suppressing duplicate prompt" >&2
-      return 4
-      ;;
-  esac
-
   record="$(pr_green_session_record "$project_id" "$pr_number" 2>/dev/null || true)"
-  [[ -n "$record" ]] || return 1
+  if [[ -z "$record" ]]; then
+    pending_status="$(pr_green_delivery_pending_status "$project_id" "$pr_number" 2>/dev/null || true)"
+    case "$pending_status" in
+      acked) pr_green_delivery_clear_pending "$project_id" "$pr_number" || return 4 ;;
+      pending)
+        printf '%s\n' "PR $project_id#$pr_number has an unresolved native delivery; suppressing duplicate prompt" >&2
+        return 4
+        ;;
+    esac
+    return 1
+  fi
 
   session_id="$(jq -r '.id // empty' <<<"$record")"
   [[ -n "$session_id" ]] || return 1
@@ -663,6 +662,14 @@ pr_green_reuse_session() {
     printf '%s\n' "AO session $session_id native rollout is unavailable; delivery_unconfirmed" >&2
     return 4
   }
+  pending_status="$(pr_green_delivery_pending_status "$project_id" "$pr_number" 2>/dev/null || true)"
+  case "$pending_status" in
+    acked) pr_green_delivery_clear_pending "$project_id" "$pr_number" || return 4 ;;
+    pending)
+      printf '%s\n' "PR $project_id#$pr_number has an unresolved native delivery; suppressing duplicate prompt" >&2
+      return 4
+      ;;
+  esac
   request_id="$(pr_green_delivery_request_id)"
   envelope="$(pr_green_delivery_envelope "$prompt" "$request_id")"
   native_baseline="$(pr_green_native_prompt_count "$native_listing" "$envelope" 2>/dev/null || true)"

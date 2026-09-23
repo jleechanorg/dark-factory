@@ -93,7 +93,7 @@ Durable PR outcomes: $(jq -r '.outcome_records' <<<"$summary")
 Green new-head outcomes (verified state; push attribution unverified, unique PR/head): $(jq -r '.green_new_head_outcomes' <<<"$summary")
 Explicit push-receipt green outcomes (unique PR/head): $(jq -r '.explicit_push_receipt_green_outcomes' <<<"$summary")
 Recovery-blocked sessions (no prompt sent; duplicate suppressed): $(jq -r '.recovery_blocked' <<<"$summary")
-Delivery-unconfirmed sessions (transport accepted but no native user turn; duplicate suppressed): $(jq -r '.delivery_unconfirmed' <<<"$summary")
+Delivery-unconfirmed/blocked sessions (native acknowledgement not observed; duplicate suppressed): $(jq -r '.delivery_unconfirmed' <<<"$summary")
 Native-ack tracking (new records only): observed $(jq -r '.native_ack_observed' <<<"$summary"), missing $(jq -r '.native_ack_missing' <<<"$summary"), untracked/legacy $(jq -r '.native_ack_untracked' <<<"$summary")
 Note: untracked/legacy outcomes have no native-ack field; zero observed does not mean all historical deliveries were confirmed.
 Blocked: $(jq -r '.blockers' <<<"$summary")

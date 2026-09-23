@@ -172,6 +172,7 @@ fi
 jq -cn --arg prompt "$pending_envelope" '{type:"response_item",payload:{role:"user",content:[{type:"input_text",text:$prompt}]},timestamp:"2026-09-23T16:01:00Z"}' >>"$live_rollout"
 native_ack_file="$live_rollout"
 PR_GREEN_TEST_DELIVERY_ID='new-delivery-id'
+: >"$ao_calls_file"
 action_file="$(mktemp)"
 pr_green_reuse_session worldarchitect.ai 123 'new prompt after old ack' >"$action_file"
 action="$(<"$action_file")"
@@ -261,8 +262,8 @@ assert_eq "${ao_calls[0]}" 'session ls -p worldarchitect.ai --include-terminated
 assert_eq "${ao_calls[1]}" 'session restore wa-dead -p worldarchitect.ai'
 [[ "${ao_calls[2]}" == 'send --session wa-dead --message restore retry prompt [PR_GREEN_DELIVERY_ID:'*']' ]]
 
-# A prior send failure leaves a durable pending request. A later invocation
-# must not restore/send again while that exact request lacks native ack.
+# A restore command can fail after partially launching the existing worker;
+# never fall through to a duplicate spawn.
 restore_fail=1
 : >"$ao_calls_file"
 set +e
@@ -270,8 +271,8 @@ pr_green_reuse_session worldarchitect.ai 456 'restore failure prompt' >/dev/null
 rc=$?
 set -e
 restore_fail=0
-if [[ "$rc" -ne 4 ]]; then
-  printf 'pending delivery must return delivery-unconfirmed code 4 (got %s)\n' "$rc" >&2
+if [[ "$rc" -ne 2 ]]; then
+  printf 'restore failure must return duplicate-suppression code 2 (got %s)\n' "$rc" >&2
   exit 1
 fi
 
