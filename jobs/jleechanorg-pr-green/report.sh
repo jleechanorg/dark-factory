@@ -143,7 +143,7 @@ body="PR green repair report (last ${WINDOW_HOURS}h)
 
 PRs analyzed: ${analyzed_label}
 PRs with successful remote commits: ${pushed_label}
-Verified green PR/heads (push attribution not established): $(jq -r '.green_new_head_outcomes' <<<"$summary")
+Verified green PR/heads (unattributed to this job): $(jq -r '.green_new_head_outcomes' <<<"$summary")
 
 Verified pushed PRs (receipt evidence):
 ${push_lines}

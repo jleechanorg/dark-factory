@@ -31,7 +31,7 @@ body="$(PR_GREEN_METRICS_DIR="$fixture_dir" PR_GREEN_REPORT_NOW=4600 PR_GREEN_RE
 rg -q 'PRs analyzed: 4' <<<"$body"
 rg -q 'PRs with successful remote commits: 1' <<<"$body"
 rg -q 'https://github.com/jleechanorg/worldarchitect.ai/commit/after-six' <<<"$body"
-rg -q 'Verified green PR/heads \(push attribution not established\): 1' <<<"$body"
+rg -q 'Verified green PR/heads \(unattributed to this job\): 1' <<<"$body"
 rg -q 'Exceptions: recovery-blocked 1; delivery-unconfirmed 1' <<<"$body"
 rg -q 'native ack observed 1, missing 1, untracked/legacy 5' <<<"$body"
 rg -q 'Repair attempts \(dispatch or session reuse\): 2' <<<"$body"
