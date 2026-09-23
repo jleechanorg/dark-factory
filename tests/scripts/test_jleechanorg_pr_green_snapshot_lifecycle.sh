@@ -5,7 +5,6 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 JOB="$ROOT/jobs/jleechanorg-pr-green/jleechanorg-pr-green-daily.sh"
 fixture_dir="$(mktemp -d)"
 trap 'rm -rf "$fixture_dir"' EXIT
-export PR_GREEN_AO_SPAWN_LOCK_DIR="$fixture_dir/locks"
 mock_bin="$fixture_dir/bin"
 metrics_dir="$fixture_dir/metrics"
 state_file="$fixture_dir/state.json"
