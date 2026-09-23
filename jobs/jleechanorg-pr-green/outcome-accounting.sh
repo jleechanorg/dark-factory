@@ -106,18 +106,38 @@ pr_green_state_from_pr_json() {
     def logical_context: ([.context, .name, .workflowName] | first_nonempty);
     def attempt_timestamp: ([.startedAt, .createdAt, .updatedAt, .completedAt] | first_nonempty);
     def attempt_identity:
-      ([.databaseId, .id, .externalId, .detailsUrl] | first_nonempty) as $identity
-      | if ($identity | type) == "number" then $identity
-        elif (($identity | type) == "string" and ($identity | test("^[0-9]+$"))) then ($identity | tonumber)
-        else $identity
+      if ((.detailsUrl // "") | type) == "string"
+        and ((.detailsUrl // "") | test("^https://github\\.com/[^/]+/[^/]+/actions/runs/[0-9]+/job/[0-9]+"))
+      then (.detailsUrl | capture("^https://github\\.com/[^/]+/[^/]+/actions/runs/(?<run>[0-9]+)/job/(?<job>[0-9]+)")
+        | [(.run | tonumber), (.job | tonumber)])
+      elif (([.databaseId, .id, .externalId] | first_nonempty) != "")
+      then ([.databaseId, .id, .externalId] | first_nonempty)
+      else null
+      end;
+    def attempt_rank:
+      (attempt_identity) as $identity
+      | (attempt_timestamp) as $timestamp
+      | if $identity != null then [2, $identity, $timestamp]
+        elif $timestamp != "" then [1, $timestamp]
+        else null
         end;
-    def attempt_rank: [attempt_timestamp, attempt_identity];
     def latest_checks:
       reduce ((.statusCheckRollup // [])[]?) as $check ({};
         ($check | logical_context) as $key
+        | ($check | attempt_identity) as $identity
+        | ($check | attempt_rank) as $rank
         | .[$key] as $previous
-        | if ($previous == null or (($check | attempt_rank) > ($previous | attempt_rank)))
-          then .[$key] = $check
+        | if $previous == null then
+            .[$key] = {check: $check, identity: $identity, rank: $rank, ambiguous: false}
+          elif ($rank == null and $previous.rank == null) then
+            .[$key].ambiguous = true
+          elif $rank == null then .
+          elif $previous.rank == null then
+            .[$key] = {check: $check, identity: $identity, rank: $rank, ambiguous: false}
+          elif ($rank > $previous.rank) then
+            .[$key] = {check: $check, identity: $identity, rank: $rank, ambiguous: false}
+          elif ($rank == $previous.rank and $identity != null and $identity == $previous.identity) then .
+          elif ($rank == $previous.rank) then .[$key].ambiguous = true
           else .
           end
       ) | [.[]];
@@ -127,16 +147,22 @@ pr_green_state_from_pr_json() {
       mergeability: ((.mergeable // "") | ascii_upcase),
       conflicting: ((.mergeable == "CONFLICTING") or (.mergeStateStatus == "DIRTY") or (.mergeStateStatus == "CONFLICTING")),
       failed_checks: [$checks[]?
+        | select(.ambiguous | not)
+        | .check
         | select(state as $state | failed | index($state))
         | logical_context],
       check_count: ($checks | length),
       successful_completed_checks: [$checks[]?
+        | select(.ambiguous | not)
+        | .check
         | select(state == "SUCCESS" and completed)] | length,
       check_statuses: (reduce $checks[] as $check ({};
-        .[($check | logical_context)] = ($check | state))),
+        .[($check.check | logical_context)] =
+          (if $check.ambiguous then "AMBIGUOUS" else ($check.check | state) end))),
       pending_checks: (any($checks[]?;
-        (state == "" and status != "COMPLETED")
-        or (state | IN("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "REQUESTED"))
+        .ambiguous
+        or ((.check | state) == "" and (.check | status) != "COMPLETED")
+        or ((.check | state) | IN("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "REQUESTED"))
       ) or (((.mergeable // "") | ascii_upcase) == "UNKNOWN")
         or (((.mergeStateStatus // "") | ascii_upcase) == "UNKNOWN"))
     }'

@@ -101,12 +101,34 @@ assert_eq "$(jq -r '.pending_checks' <<<"$state")" true
 # When attempt timestamps tie, prefer the provider's exact numeric identity,
 # not lexical detailsUrl ordering (for example run/9 versus run/10).
 numeric_identity_tie='{"headRefOid":"after","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[
-  {"name":"unit","workflowName":"CI","id":10,"conclusion":"SUCCESS","status":"COMPLETED","startedAt":"2026-09-23T08:10:00Z","completedAt":"2026-09-23T08:11:00Z","detailsUrl":"https://github.com/example/runs/10"},
-  {"name":"unit","workflowName":"CI","id":9,"conclusion":"FAILURE","status":"COMPLETED","startedAt":"2026-09-23T08:10:00Z","completedAt":"2026-09-23T08:11:00Z","detailsUrl":"https://github.com/example/runs/9"}
+  {"name":"unit","workflowName":"CI","conclusion":"SUCCESS","status":"COMPLETED","startedAt":"2026-09-23T08:10:00Z","completedAt":"2026-09-23T08:11:00Z","detailsUrl":"https://github.com/example/repo/actions/runs/10/job/100"},
+  {"name":"unit","workflowName":"CI","conclusion":"FAILURE","status":"COMPLETED","startedAt":"2026-09-23T08:10:00Z","completedAt":"2026-09-23T08:11:00Z","detailsUrl":"https://github.com/example/repo/actions/runs/9/job/999"}
 ]}'
 state="$(pr_green_state_from_pr_json <<<"$numeric_identity_tie")"
 assert_eq "$(jq -r '.failed_checks | length' <<<"$state")" 0
 assert_eq "$(jq -r '.successful_completed_checks' <<<"$state")" 1
+
+# A queued retry may have neither useful timestamp (GitHub's zero completedAt
+# sentinel included), but its newer Actions run identity still supersedes an
+# older terminal failure.
+queued_identity_only='{"headRefOid":"after","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[
+  {"name":"unit","workflowName":"CI","conclusion":"","status":"QUEUED","startedAt":"","completedAt":"0001-01-01T00:00:00Z","detailsUrl":"https://github.com/example/repo/actions/runs/10/job/100"},
+  {"name":"unit","workflowName":"CI","conclusion":"FAILURE","status":"COMPLETED","startedAt":"2026-09-23T08:00:00Z","completedAt":"2026-09-23T08:20:00Z","detailsUrl":"https://github.com/example/repo/actions/runs/9/job/999"}
+]}'
+state="$(pr_green_state_from_pr_json <<<"$queued_identity_only")"
+assert_eq "$(jq -r '.failed_checks | length' <<<"$state")" 0
+assert_eq "$(jq -r '.pending_checks' <<<"$state")" true
+
+# Opaque equal-rank attempts cannot be ordered safely; keep the context
+# pending rather than letting payload order or lexical URL order decide.
+opaque_tie='{"headRefOid":"after","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[
+  {"name":"unit","workflowName":"CI","conclusion":"SUCCESS","status":"COMPLETED","startedAt":"2026-09-23T08:10:00Z","completedAt":"2026-09-23T08:11:00Z","detailsUrl":"https://ci.example/jobs/10"},
+  {"name":"unit","workflowName":"CI","conclusion":"FAILURE","status":"COMPLETED","startedAt":"2026-09-23T08:10:00Z","completedAt":"2026-09-23T08:11:00Z","detailsUrl":"https://ci.example/jobs/9"}
+]}'
+state="$(pr_green_state_from_pr_json <<<"$opaque_tie")"
+assert_eq "$(jq -r '.failed_checks | length' <<<"$state")" 0
+assert_eq "$(jq -r '.successful_completed_checks' <<<"$state")" 0
+assert_eq "$(jq -r '.pending_checks' <<<"$state")" true
 
 # GitHub retains cancelled check-runs from superseded duplicate workflows in
 # statusCheckRollup. A completed successful replacement for the same check on
