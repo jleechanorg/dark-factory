@@ -57,6 +57,16 @@ if [[ "$1" == api && "$endpoint" == /search/issues ]]; then
       jq -cn --argjson fairness_items "$fairness_items" \
         '[{total_count:13,incomplete_results:false,items:$fairness_items}]'
       ;;
+    cap)
+      cap_item="$(item repo-a 44)"
+      jq -cn --argjson cap_item "$cap_item" \
+        '[{total_count:1,incomplete_results:false,items:[$cap_item]}]'
+      ;;
+    cap-restore)
+      cap_restore_item="$(item repo-a 44)"
+      jq -cn --argjson cap_restore_item "$cap_restore_item" \
+        '[{total_count:1,incomplete_results:false,items:[$cap_restore_item]}]'
+      ;;
     spawn-failure)
       failed_item="$(item repo-a 44)"
       jq -cn --argjson failed_item "$failed_item" \
@@ -145,6 +155,10 @@ if [[ "${PR_GREEN_BUSY_FAIRNESS:-0}" == 1 ]]; then
   fi
   case "$1 $2" in
     "session ls")
+      if [[ "${PR_GREEN_CAP_TERMINATED_RESTORE:-0}" == 1 ]]; then
+        printf '%s\n' '{"data":[{"id":"terminated-44","displayName":"pr-44","isTerminated":true,"status":"pr_open"}]}'
+        exit 0
+      fi
       printf '%s\n' '{"data":[{"id":"busy-1","displayName":"pr-1","isTerminated":false,"status":"pr_open"}]}'
       exit 0
       ;;
@@ -155,6 +169,10 @@ if [[ "${PR_GREEN_BUSY_FAIRNESS:-0}" == 1 ]]; then
     "project set-config")
       printf '%s\n' '{"status":"ok"}'
       exit 0
+      ;;
+    "session restore")
+      printf '%s\n' 'unexpected terminated restore under active-session cap' >&2
+      exit 91
       ;;
     *)
       exit 0
@@ -168,6 +186,10 @@ chmod +x "$mock_bin/gh" "$mock_bin/ao"
 
 cat >"$mock_bin/sqlite3" <<'EOF'
 #!/usr/bin/env bash
+if [[ "$*" == *COUNT* && "$*" == *sessions* && "$*" == *is_terminated* ]]; then
+  printf '%s\n' "${PR_GREEN_ACTIVE_SESSION_COUNT:-0}"
+  exit 0
+fi
 printf '%s\n' 'runtime-1'
 EOF
 cat >"$mock_bin/tmux" <<'EOF'
@@ -209,6 +231,7 @@ run_case() {
   local name="$1" expected_discovered="$2" dry_run="${3:-1}" max_prs="${4:-0}"
   local metrics="$fixture_dir/metrics-$name" calls="$fixture_dir/ao-$name.log"
   mkdir -p "$metrics"
+  : >"$metrics/ao.db"
   : >"$calls"
   set +e
   PATH="$mock_bin:$PATH" \
@@ -219,6 +242,7 @@ run_case() {
     PR_GREEN_DRY_RUN="$dry_run" \
     AO_CALLS="$calls" \
     GH_CALLS="$fixture_dir/gh-$name.log" \
+    PR_GREEN_AO_DB_PATH="$metrics/ao.db" \
     bash "$JOB" >"$fixture_dir/stdout-$name" 2>"$fixture_dir/stderr-$name"
   local rc=$?
   set -e
@@ -299,6 +323,7 @@ registration_root="$fixture_dir/registered-projects"
 registration_codex="$fixture_dir/codex-registration"
 mkdir -p "$registration_metrics" "$registration_codex"
 printf '%s\n' '{"tokens":{}}' >"$registration_codex/auth.json"
+: >"$registration_metrics/ao.db"
 : >"$registration_calls"
 PATH="$mock_bin:$PATH" \
   HOME="$fixture_dir/home-registration" \
@@ -354,6 +379,7 @@ fair_calls="$fixture_dir/ao-fairness.log"
 fair_codex="$fixture_dir/codex-fairness"
 mkdir -p "$fair_metrics" "$fair_codex"
 printf '%s\n' '{"tokens":{}}' >"$fair_codex/auth.json"
+: >"$fair_metrics/ao.db"
 : >"$fair_calls"
 for iteration in 1 2; do
   PATH="$mock_bin:$PATH" \
@@ -361,7 +387,7 @@ for iteration in 1 2; do
     CODEX_HOME="$fair_codex" \
     PR_GREEN_DISCOVERY_CASE=fairness \
     PR_GREEN_BUSY_FAIRNESS=1 \
-    PR_GREEN_AO_DB_PATH="$fixture_dir/ao.db" \
+    PR_GREEN_AO_DB_PATH="$fair_metrics/ao.db" \
     PR_GREEN_METRICS_DIR="$fair_metrics" \
     PR_GREEN_MAX_PRS=12 \
     PR_GREEN_DRY_RUN=0 \
@@ -389,12 +415,73 @@ second_fair_run="$(jq -s 'last' "$fair_metrics/runs.jsonl")"
   exit 1
 }
 
+# A full global active-session source leaves no room for a new spawn, even
+# though the per-sweep cap still has capacity. The admission is fail-closed.
+cap_metrics="$fixture_dir/metrics-cap"
+cap_codex="$fixture_dir/codex-cap"
+mkdir -p "$cap_metrics" "$cap_codex"
+printf '%s\n' '{"tokens":{}}' >"$cap_codex/auth.json"
+: >"$cap_metrics/ao.db"
+: >"$fixture_dir/ao-cap.log"
+PATH="$mock_bin:$PATH" \
+  HOME="$fixture_dir/home-cap" \
+  CODEX_HOME="$cap_codex" \
+  PR_GREEN_DISCOVERY_CASE=cap \
+  PR_GREEN_BUSY_FAIRNESS=1 \
+  PR_GREEN_ACTIVE_SESSION_COUNT=30 \
+  PR_GREEN_AO_DB_PATH="$cap_metrics/ao.db" \
+  PR_GREEN_METRICS_DIR="$cap_metrics" \
+  PR_GREEN_MAX_PRS=12 \
+  PR_GREEN_DRY_RUN=0 \
+  PR_GREEN_SPAWN_PROBE_SECONDS=0.01 \
+  AO_CALLS="$fixture_dir/ao-cap.log" \
+  GH_CALLS="$fixture_dir/gh-cap.log" \
+  bash "$JOB" >"$fixture_dir/cap.out" 2>"$fixture_dir/cap.err"
+if rg -q '^spawn ' "$fixture_dir/ao-cap.log"; then
+  echo 'FAIL: full active-session cap still spawned a new worker' >&2
+  exit 1
+fi
+[[ "$(jq -sr 'last.admission_deferred' "$cap_metrics/runs.jsonl")" == 1 ]] || {
+  echo 'FAIL: full active-session cap was not durably deferred' >&2
+  exit 1
+}
+
+# The same cap must block a terminated-session restore before the restore call;
+# live reuse remains covered by the existing fairness fixture.
+restore_metrics="$fixture_dir/metrics-cap-restore"
+restore_codex="$fixture_dir/codex-cap-restore"
+mkdir -p "$restore_metrics" "$restore_codex"
+printf '%s\n' '{"tokens":{}}' >"$restore_codex/auth.json"
+: >"$restore_metrics/ao.db"
+: >"$fixture_dir/ao-cap-restore.log"
+PATH="$mock_bin:$PATH" \
+  HOME="$fixture_dir/home-cap-restore" \
+  CODEX_HOME="$restore_codex" \
+  PR_GREEN_DISCOVERY_CASE=cap-restore \
+  PR_GREEN_BUSY_FAIRNESS=1 \
+  PR_GREEN_CAP_TERMINATED_RESTORE=1 \
+  PR_GREEN_ACTIVE_SESSION_COUNT=30 \
+  PR_GREEN_AO_DB_PATH="$restore_metrics/ao.db" \
+  PR_GREEN_METRICS_DIR="$restore_metrics" \
+  PR_GREEN_MAX_PRS=12 \
+  PR_GREEN_DRY_RUN=0 \
+  PR_GREEN_SPAWN_PROBE_SECONDS=0.01 \
+  AO_CALLS="$fixture_dir/ao-cap-restore.log" \
+  GH_CALLS="$fixture_dir/gh-cap-restore.log" \
+  bash "$JOB" >"$fixture_dir/cap-restore.out" 2>"$fixture_dir/cap-restore.err"
+if rg -q 'session restore|^spawn ' "$fixture_dir/ao-cap-restore.log"; then
+  echo 'FAIL: terminated session was restored or replaced under active-session cap' >&2
+  exit 1
+fi
+
 # An exited, empty-output spawn is a failed attempt, not a dispatch. It must
 # still emit durable accounting so attempted and outcome records reconcile.
 failure_metrics="$fixture_dir/metrics-spawn-failure"
 failure_codex="$fixture_dir/codex-spawn-failure"
 mkdir -p "$failure_metrics" "$failure_codex"
 printf '%s\n' '{"tokens":{}}' >"$failure_codex/auth.json"
+: >"$failure_metrics/ao.db"
+: >"$fixture_dir/ao-failure.db"
 PATH="$mock_bin:$PATH" \
   HOME="$fixture_dir/home-spawn-failure" \
   CODEX_HOME="$failure_codex" \
@@ -421,6 +508,8 @@ failure_run="$(jq -s 'last' "$failure_metrics/runs.jsonl")"
 
 retry_metrics="$fixture_dir/metrics-spawn-retry-failure"
 mkdir -p "$retry_metrics"
+: >"$retry_metrics/ao.db"
+: >"$fixture_dir/ao-retry.db"
 PATH="$mock_bin:$PATH" \
   HOME="$fixture_dir/home-spawn-retry-failure" \
   CODEX_HOME="$failure_codex" \
