@@ -50,6 +50,11 @@ if [[ "$1" == api && "$endpoint" == /search/issues ]]; then
       jq -cn --argjson fairness_items "$fairness_items" \
         '[{total_count:13,incomplete_results:false,items:$fairness_items}]'
       ;;
+    spawn-failure)
+      failed_item="$(item repo-a 44)"
+      jq -cn --argjson failed_item "$failed_item" \
+        '[{total_count:1,incomplete_results:false,items:[$failed_item]}]'
+      ;;
     ao)
       ao_item="$(item agent-orchestrator 42)"
       jq -cn --argjson ao_item "$ao_item" \
@@ -98,6 +103,10 @@ cat >"$mock_bin/ao" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${PR_GREEN_BUSY_FAIRNESS:-0}" == 1 ]]; then
   if [[ "$1" == spawn ]]; then
+    if [[ "${PR_GREEN_SPAWN_FAILURE:-0}" == 1 ]]; then
+      [[ "${PR_GREEN_SPAWN_FAILURE_OUTPUT:-0}" == 1 ]] && printf '%s\n' 'spawn failed'
+      exit 23
+    fi
     sleep 0.2
     exit 0
   fi
@@ -255,6 +264,63 @@ grep -Fq 'repo-a#13' "$fixture_dir/fairness-2.out" || {
 second_fair_run="$(jq -s 'last' "$fair_metrics/runs.jsonl")"
 [[ "$(jq -r '.selected' <<<"$second_fair_run")" -gt 0 ]] || {
   echo 'FAIL: fairness second run did not select any rotated candidate' >&2
+  exit 1
+}
+
+# An exited, empty-output spawn is a failed attempt, not a dispatch. It must
+# still emit durable accounting so attempted and outcome records reconcile.
+failure_metrics="$fixture_dir/metrics-spawn-failure"
+failure_codex="$fixture_dir/codex-spawn-failure"
+mkdir -p "$failure_metrics" "$failure_codex"
+printf '%s\n' '{"tokens":{}}' >"$failure_codex/auth.json"
+PATH="$mock_bin:$PATH" \
+  HOME="$fixture_dir/home-spawn-failure" \
+  CODEX_HOME="$failure_codex" \
+  PR_GREEN_DISCOVERY_CASE=spawn-failure \
+  PR_GREEN_BUSY_FAIRNESS=1 \
+  PR_GREEN_SPAWN_FAILURE=1 \
+  PR_GREEN_AO_DB_PATH="$fixture_dir/ao-failure.db" \
+  PR_GREEN_METRICS_DIR="$failure_metrics" \
+  PR_GREEN_MAX_PRS=1 \
+  PR_GREEN_DRY_RUN=0 \
+  PR_GREEN_SPAWN_PROBE_SECONDS=0.05 \
+  AO_CALLS="$fixture_dir/ao-spawn-failure.log" \
+  GH_CALLS="$fixture_dir/gh-spawn-failure.log" \
+  bash "$JOB" >/dev/null
+failure_run="$(jq -s 'last' "$failure_metrics/runs.jsonl")"
+[[ "$(jq -r '.attempted' <<<"$failure_run")" == 1 && "$(jq -r '.dispatched' <<<"$failure_run")" == 0 ]] || {
+  echo 'FAIL: failed spawn was counted as dispatched' >&2
+  exit 1
+}
+[[ "$(jq -sr 'last.session_action' "$failure_metrics/outcomes.jsonl")" == spawn_failed ]] || {
+  echo 'FAIL: failed spawn did not emit durable spawn_failed outcome' >&2
+  exit 1
+}
+
+retry_metrics="$fixture_dir/metrics-spawn-retry-failure"
+mkdir -p "$retry_metrics"
+PATH="$mock_bin:$PATH" \
+  HOME="$fixture_dir/home-spawn-retry-failure" \
+  CODEX_HOME="$failure_codex" \
+  PR_GREEN_DISCOVERY_CASE=spawn-failure \
+  PR_GREEN_BUSY_FAIRNESS=1 \
+  PR_GREEN_SPAWN_FAILURE=1 \
+  PR_GREEN_SPAWN_FAILURE_OUTPUT=1 \
+  PR_GREEN_AO_DB_PATH="$fixture_dir/ao-retry.db" \
+  PR_GREEN_METRICS_DIR="$retry_metrics" \
+  PR_GREEN_MAX_PRS=1 \
+  PR_GREEN_DRY_RUN=0 \
+  PR_GREEN_SPAWN_PROBE_SECONDS=0.05 \
+  AO_CALLS="$fixture_dir/ao-spawn-retry-failure.log" \
+  GH_CALLS="$fixture_dir/gh-spawn-retry-failure.log" \
+  bash "$JOB" >/dev/null
+[[ "$(jq -sr 'last.session_action' "$retry_metrics/outcomes.jsonl")" == spawn_retry_failed ]] || {
+  echo 'FAIL: failed registration retry did not emit durable retry outcome' >&2
+  exit 1
+}
+retry_run="$(jq -s 'last' "$retry_metrics/runs.jsonl")"
+[[ "$(jq -r '.dispatched' <<<"$retry_run")" == 0 ]] || {
+  echo 'FAIL: failed registration retry was counted as dispatched' >&2
   exit 1
 }
 

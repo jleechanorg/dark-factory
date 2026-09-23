@@ -323,6 +323,8 @@ EOF
     reconcile_pr "$repo" "$number" "$url" "$live_state" dispatched || true
     continue
   fi
+  spawn_rc=0
+  wait "$spawn_pid" || spawn_rc=$?
   if [[ -s "$spawn_err" ]]; then
     cat "$spawn_err" >&2
     # `ao spawn` may successfully create/claim a session and then remain
@@ -353,15 +355,38 @@ EOF
     mkdir -p "$AO_PROJECT_ROOT"
     if ! (cd "$AO_PROJECT_ROOT" && ao start "https://github.com/jleechanorg/${repo}" --no-dashboard --no-orchestrator --no-open >/dev/null 2>&1); then
       echo "$LOG_PREFIX failed to register $repo#$number" >&2
+      record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed ao_registration_failed
+      rm -f "$spawn_err"
       continue
     fi
-    "${spawn_cmd[@]}" >/dev/null 2>&1 &
-    echo "$LOG_PREFIX dispatched $repo#$number after AO registration"
-    dispatched=$((dispatched + 1))
-    rm -f "$spawn_err"
-    reconcile_pr "$repo" "$number" "$url" "$live_state" registered_and_dispatched || true
+    retry_err="$(mktemp)"
+    "${spawn_cmd[@]}" >"$retry_err" 2>&1 &
+    retry_pid=$!
+    sleep "${PR_GREEN_SPAWN_PROBE_SECONDS:-5}"
+    if kill -0 "$retry_pid" 2>/dev/null; then
+      echo "$LOG_PREFIX dispatched $repo#$number after AO registration"
+      dispatched=$((dispatched + 1))
+      rm -f "$spawn_err" "$retry_err"
+      reconcile_pr "$repo" "$number" "$url" "$live_state" registered_and_dispatched || true
+      continue
+    fi
+    retry_rc=0
+    wait "$retry_pid" || retry_rc=$?
+    if [[ -s "$retry_err" ]] && pr_green_spawn_output_is_success "$retry_err"; then
+      echo "$LOG_PREFIX dispatched $repo#$number after AO registration (session acknowledged)"
+      dispatched=$((dispatched + 1))
+      rm -f "$spawn_err" "$retry_err"
+      reconcile_pr "$repo" "$number" "$url" "$live_state" registered_and_dispatched || true
+      continue
+    fi
+    [[ ! -s "$retry_err" ]] || cat "$retry_err" >&2
+    echo "$LOG_PREFIX AO retry failed for $repo#$number (rc=$retry_rc)" >&2
+    record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_retry_failed
+    rm -f "$spawn_err" "$retry_err"
     continue
   fi
+  record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_failed
+  echo "$LOG_PREFIX AO spawn failed for $repo#$number (rc=$spawn_rc)" >&2
   rm -f "$spawn_err"
 done <<< "$ordered_prs"
 
