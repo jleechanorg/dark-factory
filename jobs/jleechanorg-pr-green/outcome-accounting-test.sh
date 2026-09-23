@@ -62,4 +62,37 @@ trap 'rm -rf "$state_dir"' EXIT
 pr_green_write_snapshot "$state_dir" worldarchitect.ai 123 "$before"
 assert_eq "$(pr_green_read_snapshot "$state_dir" worldarchitect.ai 123)" "$before"
 
+# A concrete blocker that was already sent to a worker at this exact head must
+# not consume another Codex turn every 30 minutes.  Reconciliation records are
+# deliberately ignored as anchors because the scheduler emits those on every
+# scan; otherwise the cooldown would renew forever.
+outcomes_file="$state_dir/outcomes.jsonl"
+cat >"$outcomes_file" <<'EOF'
+{"ts":900,"repo":"worldarchitect.ai","number":9941,"head_after":"same-head","blocker_after":{"conflicting":true,"failed_checks":[]},"classification":"no_change","session_action":"reused"}
+{"ts":990,"repo":"worldarchitect.ai","number":9941,"head_after":"same-head","blocker_after":{"conflicting":true,"failed_checks":[]},"classification":"no_change","session_action":"reconciled"}
+EOF
+current_blocker='{"head_sha":"same-head","conflicting":true,"failed_checks":[]}'
+if ! pr_green_same_head_cooldown_applies "$outcomes_file" worldarchitect.ai 9941 "$current_blocker" 1000 28800; then
+  printf 'expected unchanged concrete blocker to enter cooldown\n' >&2
+  exit 1
+fi
+
+# A head or meaningful blocker change is fresh work, and an awaiting-CI result
+# remains eligible for reconciliation rather than being suppressed.
+changed_head='{"head_sha":"new-head","conflicting":true,"failed_checks":[]}'
+if pr_green_same_head_cooldown_applies "$outcomes_file" worldarchitect.ai 9941 "$changed_head" 1000 28800; then
+  printf 'head change must bypass cooldown\n' >&2
+  exit 1
+fi
+changed_blocker='{"head_sha":"same-head","conflicting":false,"failed_checks":["unit"]}'
+if pr_green_same_head_cooldown_applies "$outcomes_file" worldarchitect.ai 9941 "$changed_blocker" 1000 28800; then
+  printf 'blocker change must bypass cooldown\n' >&2
+  exit 1
+fi
+printf '%s\n' '{"ts":999,"repo":"worldarchitect.ai","number":9941,"head_after":"same-head","blocker_after":{"conflicting":true,"failed_checks":[]},"classification":"pushed_ci_pending","session_action":"reused"}' >"$outcomes_file"
+if pr_green_same_head_cooldown_applies "$outcomes_file" worldarchitect.ai 9941 "$current_blocker" 1000 28800; then
+  printf 'pushed_ci_pending must bypass cooldown\n' >&2
+  exit 1
+fi
+
 printf 'outcome accounting tests passed\n'

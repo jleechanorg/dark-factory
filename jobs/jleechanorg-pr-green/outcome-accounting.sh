@@ -24,6 +24,34 @@ pr_green_read_snapshot() {
   [[ -f "$path" ]] && cat "$path"
 }
 
+# Return success when an unchanged, concretely blocked PR was already offered
+# to a worker recently.  The durable outcomes log is the source of truth: a
+# reconciliation entry is emitted on every scan, so it must never renew this
+# cooldown.  A head/blocker change and pending CI verification both remain
+# fresh work.
+pr_green_same_head_cooldown_applies() {
+  local outcomes_file="$1" repo="$2" pr_number="$3" current_state="$4" now="$5" cooldown_seconds="$6"
+  [[ -s "$outcomes_file" ]] || return 1
+
+  jq -ne --arg repo "$repo" --argjson number "$pr_number" \
+    --argjson current "$current_state" --argjson now "$now" --argjson cooldown "$cooldown_seconds" '
+      def signature($state): {
+        conflicting: ($state.conflicting // false),
+        failed_checks: (($state.failed_checks // []) | sort)
+      };
+      [inputs
+       | select(.repo == $repo and .number == $number)
+       | select(.session_action != "reconciled" and .session_action != "cooldown_deferred")]
+      | sort_by(.ts // 0)
+      | last as $latest
+      | $latest != null
+        and (($latest.ts // 0) >= ($now - $cooldown))
+        and ($latest.classification | IN("no_change", "pushed_still_blocked"))
+        and ($latest.head_after == $current.head_sha)
+        and (signature($latest.blocker_after) == signature($current))
+    ' "$outcomes_file" >/dev/null
+}
+
 # Classify an exact-current-head state against the blocker snapshot saved before
 # AO was contacted. A changed head alone is never a successful repair.
 pr_green_classify_outcome() {

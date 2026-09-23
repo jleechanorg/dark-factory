@@ -56,6 +56,7 @@ selected=0
 reused=0
 restored=0
 busy_deferred=0
+cooldown_deferred=0
 fixed_confirmed=0
 
 # outcomes.jsonl is the stable reporting contract. `verified` is true only
@@ -75,6 +76,10 @@ record_outcome() {
     '{ts:$ts,run_ts:$run_ts,repo:$repo,number:$number,url:$url,head_before:$head_before,head_after:$head_after,blocker_before:$blocker_before,blocker_after:$blocker_after,classification:$classification,session_action:$action,result:$result,verified:$verified,detail:($classification + "; " + $action)}' \
     >> "$METRICS_DIR/outcomes.jsonl"
   [[ "$classification" == "fixed_confirmed" ]] && fixed_confirmed=$((fixed_confirmed + 1))
+  # `[[ ... ]] &&` returns 1 for ordinary non-fix outcomes.  This helper is
+  # called under `set -e`, so explicitly keep recording a no-change/cooldown
+  # result from aborting the whole sweep before its run metrics are persisted.
+  return 0
 }
 
 reconcile_pr() {
@@ -102,6 +107,12 @@ while IFS=$'\t' read -r repo number title url updated; do
     continue
   fi
   actionable=$((actionable + 1))
+  if pr_green_same_head_cooldown_applies "$METRICS_DIR/outcomes.jsonl" "$repo" "$number" "$live_state" "$(date +%s)" "${PR_GREEN_SAME_HEAD_COOLDOWN_SECONDS:-28800}"; then
+    cooldown_deferred=$((cooldown_deferred + 1))
+    record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" no_change cooldown_deferred
+    echo "$LOG_PREFIX unchanged blocker cooldown for $repo#$number; no AO/Codex inference"
+    continue
+  fi
   if (( selected >= MAX_PRS )); then
     echo "$LOG_PREFIX cap reached ($MAX_PRS); deferring $repo#$number to the next run"
     continue
@@ -219,7 +230,8 @@ jq -n --argjson ts "$run_started" --argjson analyzed "$analyzed" \
   --argjson attempted "$attempted" \
   --argjson dispatched "$dispatched" --argjson reused "$reused" \
   --argjson restored "$restored" --argjson busy_deferred "$busy_deferred" \
+  --argjson cooldown_deferred "$cooldown_deferred" \
   --argjson fixed_confirmed "$fixed_confirmed" \
-  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, busy_deferred:$busy_deferred, fixed_confirmed:$fixed_confirmed}' \
+  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, busy_deferred:$busy_deferred, cooldown_deferred:$cooldown_deferred, fixed_confirmed:$fixed_confirmed}' \
   >> "$METRICS_DIR/runs.jsonl"
-echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored busy_deferred=$busy_deferred fixed_confirmed=$fixed_confirmed"
+echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored busy_deferred=$busy_deferred cooldown_deferred=$cooldown_deferred fixed_confirmed=$fixed_confirmed"

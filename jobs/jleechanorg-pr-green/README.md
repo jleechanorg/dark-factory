@@ -19,6 +19,14 @@ Each selected PR records an exact GitHub blocker snapshot before AO is contacted
 new head with both the original conflict and failed checks cleared. Dispatch or
 session reuse is never counted as a fix.
 
+To prevent a 30-minute scan from repeatedly spending inference on an unchanged
+concrete blocker, `no_change` and `pushed_still_blocked` outcomes impose an
+eight-hour cooldown for the same head and conflict/failed-check signature. The
+PR remains analyzed and counted as actionable, with
+`session_action=cooldown_deferred`, but AO/Codex is not contacted. A head or
+blocker change and `pushed_ci_pending` always bypass this guard. Override the
+default with `PR_GREEN_SAME_HEAD_COOLDOWN_SECONDS`.
+
 `report.sh` produces the 8-hour Slack and daily email summaries. It reads
 `runs.jsonl` plus per-PR `outcomes.jsonl`; a repair is counted only when an
 outcome says `result=fixed` and `verified=true`. Dispatches and AO session reuse
