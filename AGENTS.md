@@ -56,7 +56,7 @@ Operational rules:
    token budget on adversarial validation, it is probably under-testing.
 6. Treat `.dot` graphs as the durable process code. Runner code is disposable;
    graph shape, specs, holdouts, and scoring contracts are the important assets.
-7. **Deprecate human interactive hat**: All coding LLM work must be shifted to the auto-factory. Humans only define intent (create GitHub issues/beads) and write comments on PRs for feedback. The auto-factory autonomously processes and drives branches to green without human-interactive coding sessions (exception: explicitly authorized factory infrastructure repair missions may diagnose and repair factory infrastructure in separate worktrees/branches, but product/pilot branches remain strictly autonomous).
+7. **Deprecate human interactive hat**: Product and pilot coding under `/af` must use the auto-factory. Humans only define intent (create GitHub issues/beads) and write comments on PRs for feedback. The auto-factory autonomously processes and drives branches to green without human-interactive coding sessions (exception: explicitly authorized factory infrastructure repair missions may diagnose and repair factory infrastructure in separate worktrees/branches, but product/pilot branches remain strictly autonomous). Outside `/af`, follow the delegated coding policy below.
 
 ## /af — ZERO direct work; monitoring only (operator hard rule)
 
@@ -68,7 +68,7 @@ no coding sub-agent lanes. The session's ONLY jobs:
    prompt cap is 4096 characters; a long bead body makes its own dispatch
    fail) with `target_repo:` / `existing_pr:` / `existing_branch:` fields
    when driving an existing PR.
-2. Monitor daemon telemetry (`~/Library/Logs/dark-factory/daemon.jsonl`) and
+2. Monitor daemon telemetry over SSH on `jeff-ubuntu` (`/home/jleechan/Library/Logs/dark-factory/daemon.jsonl`) and
    report each lifecycle stage.
 3. Escalate blockers the factory cannot self-fix to the OPERATOR, naming the
    exact blocker — never hand-fix them. "The factory is broken so I'll do it
