@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily jleechanorg PR repair email report
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash %h/projects/dark-factory/jobs/jleechanorg-pr-green/report.sh email
+Environment=PR_GREEN_REPORT_WINDOW_HOURS=24
+Environment=PR_GREEN_GMAIL_ACCOUNT=jleechan@gmail.com
+Environment=PR_GREEN_EMAIL_TO=jleechan@gmail.com
+TimeoutStartSec=120
