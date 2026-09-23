@@ -268,7 +268,7 @@ record_outcome() {
 reconcile_pr() {
   local repo="$1" number="$2" url="$3" before="$4" action="$5" after classification snapshot_path
   after="$(pr_green_fetch_live_state "$url" 2>/dev/null || true)"
-  after="$(pr_green_apply_required_contract "$repo" "$after")"
+  after="$(pr_green_apply_required_contract "$repo" "$after" "$url")"
   [[ -n "$after" ]] || { echo "$LOG_PREFIX unable to re-read $repo#$number after $action" >&2; return 1; }
   classification="$(pr_green_classify_outcome "$before" "$after")"
   record_outcome "$repo" "$number" "$url" "$before" "$after" "$classification" "$action"
@@ -308,7 +308,7 @@ while IFS=$'\t' read -r repo number title url updated; do
   [[ -n "$repo" && -n "$number" ]] || continue
   : "$updated" # retained from discovery for the audit TSV ordering
   live_state="$(pr_green_fetch_live_state "$url" 2>/dev/null || true)"
-  live_state="$(pr_green_apply_required_contract "$repo" "$live_state")"
+  live_state="$(pr_green_apply_required_contract "$repo" "$live_state" "$url")"
   if [[ -z "$live_state" ]]; then
     analysis_failed=$((analysis_failed + 1))
     echo "$LOG_PREFIX unable to inspect $repo#$number" >&2
@@ -319,7 +319,6 @@ while IFS=$'\t' read -r repo number title url updated; do
   failures="$(jq -r '.failed_checks | join(",")' <<<"$live_state")"
   previous_snapshot="$(pr_green_read_snapshot "$STATE_DIR" "$repo" "$number" || true)"
   if [[ -n "$previous_snapshot" ]]; then
-    previous_snapshot="$(pr_green_apply_required_contract "$repo" "$previous_snapshot")"
     reconcile_pr "$repo" "$number" "$url" "$previous_snapshot" reconciled || true
   fi
   if [[ "$mergeable" == "UNKNOWN" ]]; then
