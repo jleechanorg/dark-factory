@@ -8,7 +8,15 @@ fixture_dir="$(mktemp -d)"
 trap 'rm -rf "$fixture_dir"' EXIT
 
 [[ -f "$TIMER" ]] || { echo 'FAIL: daily repair timer is missing' >&2; exit 1; }
-grep -Fq 'OnUnitActiveSec=30min' "$TIMER" || { echo 'FAIL: daily repair timer is not 30-minute periodic' >&2; exit 1; }
+grep -Fq 'OnCalendar=*-*-* *:00/30:00' "$TIMER" || { echo 'FAIL: daily repair timer is not wall-clock 30-minute periodic' >&2; exit 1; }
+if grep -Eq '^(OnBootSec|OnUnitActiveSec)=' "$TIMER"; then
+  echo 'FAIL: daily repair timer still relies on monotonic anchors' >&2
+  exit 1
+fi
+systemd-analyze calendar '*:0/30' >/dev/null || {
+  echo 'FAIL: daily repair calendar expression is not understood by systemd' >&2
+  exit 1
+}
 grep -Fq 'Unit=jleechanorg-pr-green-daily.service' "$TIMER" || { echo 'FAIL: timer does not activate daily repair service' >&2; exit 1; }
 grep -Fq 'Environment=CODEX_HOME=%h/.codex-dark-factory' "$SERVICE" || {
   echo 'FAIL: repair service does not use its project-scoped CODEX_HOME' >&2
