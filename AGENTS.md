@@ -155,7 +155,7 @@ When `--pipeline` is omitted, `/f` and `/factory` default to `pipelines/slim/two
 This repo is layer 1 only.
 
 ### Agent Orchestrator (AO) Repository Policy
-- The canonical AO engine used by dark-factory is upstream **Golang `agent-orchestrator`** (`https://github.com/strongdm/agent-orchestrator` / `jleechanorg/agent-orchestrator`). We do NOT use `agent-orchestrator-ts`.
+- The canonical AO engine is **Golang `agent-orchestrator`**, maintained in `https://github.com/jleechanorg/agent-orchestrator-golang` with upstream `https://github.com/Untrivial-ai/agent-orchestrator`. Verify the installed binary against that checkout's Go build revision. We do NOT use `agent-orchestrator-ts`.
 - The AO repository is **read-only / reference only**. We almost never want to modify or open PRs against AO; all session liveness interpretation, reaping triggers, timeout logic, and promotion handling must live within `dark-factory` itself (e.g. in `daemon/src/adapters.rs` and `daemon/src/tick.rs`).
 - **Hard Safety Gate**: Agents must **NEVER** write or modify `agent-orchestrator` code unless the human operator explicitly provides the verbatim authorization: `AO CODE APPROVED`.
 - **AO CLI Wrapper Fidelity**: Host CLI wrappers for `ao` or any external tool must never modify, strip, or suppress machine-readable flags (such as `--json`, `--format`, `--porcelain`). Wrappers must pass through all arguments transparently to preserve downstream parsing contracts.

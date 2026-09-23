@@ -139,9 +139,9 @@ pipeline before invoking `dark-factory`, unless the user passed `--pipeline`.
 ## Architecture
 
 ### Agent Orchestrator (AO) Repository Policy
-- The canonical engine is Go `agent-orchestrator` (`ao-go`, upstream
-  `https://github.com/strongdm/agent-orchestrator` /
-  `jleechanorg/agent-orchestrator`). Set `DARK_FACTORY_AO_ENGINE=strongdm-go`
+- The canonical engine is Go `agent-orchestrator` (`ao-go`, fork
+  `https://github.com/jleechanorg/agent-orchestrator-golang`, upstream
+  `https://github.com/Untrivial-ai/agent-orchestrator`). Set `DARK_FACTORY_AO_ENGINE=strongdm-go`
   for `ao_spawn_command_with_mode()` in `daemon/src/adapters.rs` to select
   its Go dispatch path. Verify the deployed binary and effective service
   configuration; source support alone does not prove runtime activation.
