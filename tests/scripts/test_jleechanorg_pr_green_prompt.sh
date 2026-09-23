@@ -60,6 +60,7 @@ PATH="$mock_bin:$PATH" \
   HOME="$fixture_dir/home" \
   CODEX_HOME="$codex_home" \
   PR_GREEN_METRICS_DIR="$fixture_dir/metrics" \
+  PR_GREEN_AO_SPAWN_LOCK_DIR="$fixture_dir/spawn-locks" \
   PR_GREEN_AO_CONFIG_PATH="$fixture_dir/ao-config" \
   PR_GREEN_SPAWN_PROBE_SECONDS=0.1 \
   AO_PROMPT_CAPTURE="$capture" \
