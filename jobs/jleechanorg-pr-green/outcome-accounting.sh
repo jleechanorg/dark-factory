@@ -103,15 +103,23 @@ pr_green_state_from_pr_json() {
     def state: ([.conclusion, .state] | first_nonempty | ascii_upcase);
     def status: ((.status // "") | ascii_upcase);
     def completed: (status == "" or status == "COMPLETED");
-    def logical_context: ([.context, .name, .workflowName] | first_nonempty);
+    def context_key:
+      if ((.context // "") != "") then ("status:" + .context)
+      elif ((.workflowName // "") != "" and (.name // "") != "") then ("check:" + .workflowName + "\u0000" + .name)
+      else ("check:" + ([.name, .workflowName] | first_nonempty))
+      end;
+    def context_label: ([.context, .name, .workflowName] | first_nonempty);
     def attempt_timestamp: ([.startedAt, .createdAt, .updatedAt, .completedAt] | first_nonempty);
     def attempt_identity:
       if ((.detailsUrl // "") | type) == "string"
         and ((.detailsUrl // "") | test("^https://github\\.com/[^/]+/[^/]+/actions/runs/[0-9]+/job/[0-9]+"))
       then (.detailsUrl | capture("^https://github\\.com/[^/]+/[^/]+/actions/runs/(?<run>[0-9]+)/job/(?<job>[0-9]+)")
         | [(.run | tonumber), (.job | tonumber)])
-      elif (([.databaseId, .id, .externalId] | first_nonempty) != "")
-      then ([.databaseId, .id, .externalId] | first_nonempty)
+      elif (([.databaseId, .id] | first_nonempty) as $identity
+        | (($identity | type) == "number"
+          or (($identity | type) == "string" and ($identity | test("^[0-9]+$")))))
+      then ([.databaseId, .id] | first_nonempty) as $identity
+        | if ($identity | type) == "number" then $identity else ($identity | tonumber) end
       else null
       end;
     def attempt_rank:
@@ -123,7 +131,7 @@ pr_green_state_from_pr_json() {
         end;
     def latest_checks:
       reduce ((.statusCheckRollup // [])[]?) as $check ({};
-        ($check | logical_context) as $key
+        ($check | context_key) as $key
         | ($check | attempt_identity) as $identity
         | ($check | attempt_rank) as $rank
         | .[$key] as $previous
@@ -150,15 +158,19 @@ pr_green_state_from_pr_json() {
         | select(.ambiguous | not)
         | .check
         | select(state as $state | failed | index($state))
-        | logical_context],
+        | context_label],
       check_count: ($checks | length),
       successful_completed_checks: [$checks[]?
         | select(.ambiguous | not)
         | .check
         | select(state == "SUCCESS" and completed)] | length,
       check_statuses: (reduce $checks[] as $check ({};
-        .[($check.check | logical_context)] =
-          (if $check.ambiguous then "AMBIGUOUS" else ($check.check | state) end))),
+        ($check.check | context_label) as $label
+        | (if $check.ambiguous then "AMBIGUOUS" else ($check.check | state) end) as $status
+        | if .[$label] == null then .[$label] = $status
+          elif .[$label] == $status then .
+          else .[$label] = "MIXED"
+          end)),
       pending_checks: (any($checks[]?;
         .ambiguous
         or ((.check | state) == "" and (.check | status) != "COMPLETED")

@@ -108,6 +108,18 @@ state="$(pr_green_state_from_pr_json <<<"$numeric_identity_tie")"
 assert_eq "$(jq -r '.failed_checks | length' <<<"$state")" 0
 assert_eq "$(jq -r '.successful_completed_checks' <<<"$state")" 1
 
+# Same display name from different workflows is not one attempt stream: a
+# failure in either workflow remains actionable and the shared gate label is
+# conservative rather than overwritten by success from the other workflow.
+cross_workflow_same_name='{"headRefOid":"after","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[
+  {"name":"unit","workflowName":"Other CI","conclusion":"SUCCESS","status":"COMPLETED","startedAt":"2026-09-23T08:10:00Z","completedAt":"2026-09-23T08:11:00Z","detailsUrl":"https://github.com/example/repo/actions/runs/10/job/100"},
+  {"name":"unit","workflowName":"CI","conclusion":"FAILURE","status":"COMPLETED","startedAt":"2026-09-23T08:10:00Z","completedAt":"2026-09-23T08:11:00Z","detailsUrl":"https://github.com/example/repo/actions/runs/9/job/999"}
+]}'
+state="$(pr_green_state_from_pr_json <<<"$cross_workflow_same_name")"
+assert_eq "$(jq -r '.failed_checks | join(",")' <<<"$state")" unit
+assert_eq "$(jq -r '.check_count' <<<"$state")" 2
+assert_eq "$(jq -r '.check_statuses.unit' <<<"$state")" MIXED
+
 # A queued retry may have neither useful timestamp (GitHub's zero completedAt
 # sentinel included), but its newer Actions run identity still supersedes an
 # older terminal failure.
