@@ -8,6 +8,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=session-reuse.sh
 source "$SCRIPT_DIR/session-reuse.sh"
+# shellcheck source=outcome-accounting.sh
+source "$SCRIPT_DIR/outcome-accounting.sh"
 
 WINDOW_HOURS="${PR_GREEN_WINDOW_HOURS:-24}"
 MAX_PRS="${PR_GREEN_MAX_PRS:-12}"
@@ -15,6 +17,7 @@ DRY_RUN="${PR_GREEN_DRY_RUN:-0}"
 LOG_PREFIX="[pr-green-daily]"
 AO_PROJECT_ROOT="${PR_GREEN_AO_PROJECT_ROOT:-$HOME/.ao/daily-projects}"
 METRICS_DIR="${PR_GREEN_METRICS_DIR:-$HOME/.local/state/jleechanorg-pr-green}"
+STATE_DIR="$METRICS_DIR/pr-state"
 export AO_CONFIG_PATH="${PR_GREEN_AO_CONFIG_PATH:-$HOME/agent-orchestrator.yaml}"
 mkdir -p "$METRICS_DIR"
 run_started="$(date +%s)"
@@ -52,14 +55,47 @@ dispatched=0
 selected=0
 reused=0
 restored=0
+fixed_confirmed=0
+
+# outcomes.jsonl is the stable reporting contract. `verified` is true only
+# after a fresh GitHub read proves a new head cleared the original blocker.
+record_outcome() {
+  local repo="$1" number="$2" url="$3" before="$4" after="$5" classification="$6" action="$7"
+  local result verified head_before head_after
+  read -r result verified <<<"$(pr_green_outcome_result "$classification")"
+  head_before="$(jq -r '.head_sha' <<<"$before")"
+  head_after="$(jq -r '.head_sha' <<<"$after")"
+  jq -cn --argjson ts "$(date +%s)" --argjson run_ts "$run_started" \
+    --arg repo "$repo" --argjson number "$number" --arg url "$url" \
+    --arg head_before "$head_before" --arg head_after "$head_after" \
+    --argjson blocker_before "$before" --argjson blocker_after "$after" \
+    --arg classification "$classification" --arg action "$action" \
+    --arg result "$result" --argjson verified "$verified" \
+    '{ts:$ts,run_ts:$run_ts,repo:$repo,number:$number,url:$url,head_before:$head_before,head_after:$head_after,blocker_before:$blocker_before,blocker_after:$blocker_after,classification:$classification,session_action:$action,result:$result,verified:$verified,detail:($classification + "; " + $action)}' \
+    >> "$METRICS_DIR/outcomes.jsonl"
+  [[ "$classification" == "fixed_confirmed" ]] && fixed_confirmed=$((fixed_confirmed + 1))
+}
+
+reconcile_pr() {
+  local repo="$1" number="$2" url="$3" before="$4" action="$5" after classification
+  after="$(pr_green_fetch_live_state "$url" 2>/dev/null || true)"
+  [[ -n "$after" ]] || { echo "$LOG_PREFIX unable to re-read $repo#$number after $action" >&2; return 1; }
+  classification="$(pr_green_classify_outcome "$before" "$after")"
+  record_outcome "$repo" "$number" "$url" "$before" "$after" "$classification" "$action"
+  echo "$LOG_PREFIX outcome $repo#$number $classification ($action)"
+}
 while IFS=$'\t' read -r repo number title url updated; do
   [[ -n "$repo" && -n "$number" ]] || continue
+  : "$updated" # retained from discovery for the audit TSV ordering
   analyzed=$((analyzed + 1))
-  details="$(gh pr view "$url" --json mergeable,statusCheckRollup,isDraft \
-    --jq '[.mergeable, ([.statusCheckRollup[]? | select(.conclusion=="FAILURE" or .conclusion=="TIMED_OUT" or .conclusion=="CANCELLED") | .name] | join(","))] | @tsv' 2>/dev/null || true)"
-  # jq emits exactly two fields: mergeability and the comma-separated failed
-  # check names. Keep this arity aligned or failed-CI PRs get silently skipped.
-  IFS=$'\t' read -r mergeable failures <<< "$details"
+  live_state="$(pr_green_fetch_live_state "$url" 2>/dev/null || true)"
+  [[ -n "$live_state" ]] || { echo "$LOG_PREFIX unable to inspect $repo#$number" >&2; continue; }
+  mergeable="$(jq -r 'if .conflicting then "CONFLICTING" else "MERGEABLE" end' <<<"$live_state")"
+  failures="$(jq -r '.failed_checks | join(",")' <<<"$live_state")"
+  previous_snapshot="$(pr_green_read_snapshot "$STATE_DIR" "$repo" "$number" || true)"
+  if [[ -n "$previous_snapshot" ]]; then
+    reconcile_pr "$repo" "$number" "$url" "$previous_snapshot" reconciled || true
+  fi
   if [[ "$mergeable" != "CONFLICTING" && -z "$failures" ]]; then
     echo "$LOG_PREFIX skip $repo#$number (no conflict or failed check)"
     continue
@@ -78,6 +114,9 @@ while IFS=$'\t' read -r repo number title url updated; do
     continue
   fi
 
+  # Save the exact blocker/head snapshot immediately before contacting AO.
+  pr_green_write_snapshot "$STATE_DIR" "$repo" "$number" "$live_state"
+
   # Reuse an already configured AO project. For a new repo, clone it into a
   # dedicated non-repository directory before registering it; never clone into
   # the scheduler's working directory.
@@ -89,20 +128,22 @@ while IFS=$'\t' read -r repo number title url updated; do
     attempted=$((attempted + 1))
     case "$session_action" in
       restored)
-        restored=$((restored + 1))
-        echo "$LOG_PREFIX restored and reused AO session for $repo#$number"
+      restored=$((restored + 1))
+      echo "$LOG_PREFIX restored and reused AO session for $repo#$number"
         ;;
       *)
         reused=$((reused + 1))
-        echo "$LOG_PREFIX reused AO session for $repo#$number"
-        ;;
+      echo "$LOG_PREFIX reused AO session for $repo#$number"
+      ;;
     esac
+    reconcile_pr "$repo" "$number" "$url" "$live_state" "$session_action" || true
     continue
   else
     session_reuse_rc=$?
     if [[ "$session_reuse_rc" -eq 2 ]]; then
       attempted=$((attempted + 1))
       echo "$LOG_PREFIX existing AO session for $repo#$number rejected update; skipping duplicate spawn" >&2
+      reconcile_pr "$repo" "$number" "$url" "$live_state" reuse_rejected || true
       continue
     fi
   fi
@@ -121,6 +162,7 @@ while IFS=$'\t' read -r repo number title url updated; do
     echo "$LOG_PREFIX dispatched $repo#$number (AO worker detached)"
     dispatched=$((dispatched + 1))
     rm -f "$spawn_err"
+    reconcile_pr "$repo" "$number" "$url" "$live_state" dispatched || true
     continue
   fi
   if [[ -s "$spawn_err" ]]; then
@@ -133,6 +175,7 @@ while IFS=$'\t' read -r repo number title url updated; do
       echo "$LOG_PREFIX dispatched $repo#$number (AO session created; CLI wait bounded)"
       dispatched=$((dispatched + 1))
       rm -f "$spawn_err"
+      reconcile_pr "$repo" "$number" "$url" "$live_state" dispatched || true
       continue
     fi
     # AO can retain a reservation for a terminated session whose worktree was
@@ -146,6 +189,7 @@ while IFS=$'\t' read -r repo number title url updated; do
       echo "$LOG_PREFIX dispatched $repo#$number after stale-session recovery"
       dispatched=$((dispatched + 1))
       rm -f "$spawn_err"
+      reconcile_pr "$repo" "$number" "$url" "$live_state" stale_recovery || true
       continue
     fi
     mkdir -p "$AO_PROJECT_ROOT"
@@ -157,6 +201,7 @@ while IFS=$'\t' read -r repo number title url updated; do
     echo "$LOG_PREFIX dispatched $repo#$number after AO registration"
     dispatched=$((dispatched + 1))
     rm -f "$spawn_err"
+    reconcile_pr "$repo" "$number" "$url" "$live_state" registered_and_dispatched || true
     continue
   fi
   rm -f "$spawn_err"
@@ -167,7 +212,7 @@ jq -n --argjson ts "$run_started" --argjson analyzed "$analyzed" \
   --argjson actionable "$actionable" --argjson selected "$selected" \
   --argjson attempted "$attempted" \
   --argjson dispatched "$dispatched" --argjson reused "$reused" \
-  --argjson restored "$restored" --argjson fixed_confirmed 0 \
+  --argjson restored "$restored" --argjson fixed_confirmed "$fixed_confirmed" \
   '{ts:$ts, discovered:$discovered, analyzed:$analyzed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, fixed_confirmed:$fixed_confirmed}' \
   >> "$METRICS_DIR/runs.jsonl"
-echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored fixed_confirmed=0"
+echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored fixed_confirmed=$fixed_confirmed"
