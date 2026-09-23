@@ -29,7 +29,12 @@ default with `PR_GREEN_SAME_HEAD_COOLDOWN_SECONDS`.
 
 `report.sh` produces the 8-hour Slack and daily email summaries. It reads
 `runs.jsonl` plus per-PR `outcomes.jsonl`; a repair is counted only when an
-outcome says `result=fixed` and `verified=true`. Dispatches and AO session reuse
-remain attempts. Its report-state file advances only after delivery succeeds,
-so manual service starts cannot spam Slack or email. The supplied reporting
-service/timer templates are named `jleechanorg-pr-green-*-report.*`.
+outcome says `result=fixed` and `verified=true`. A green new-head observation
+does not prove this job pushed the head unless the record contains an explicit
+push receipt; session action alone is never attribution. Dispatches and AO
+session reuse remain attempts. A successful AO send is also not delivery proof:
+the native Codex rollout must record the exact submitted prompt, otherwise the
+outcome is `delivery_unconfirmed` and duplicate replay is suppressed. Its
+report-state file advances only after delivery succeeds, so manual service
+starts cannot spam Slack or email. The supplied reporting service/timer
+templates are named `jleechanorg-pr-green-*-report.*`.

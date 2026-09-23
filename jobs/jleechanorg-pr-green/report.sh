@@ -58,6 +58,10 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" --argjson since "$SINCE" 
       | map(select(.session_action == "recovery_blocked"))
       | unique_by([.repo, .number, .head_after])
       | length),
+    delivery_unconfirmed: ($outcomes
+      | map(select(.session_action == "delivery_unconfirmed"))
+      | unique_by([.repo, .number, .head_after])
+      | length),
     blockers: ($outcomes | map(select(.result == "blocked")) | length),
     unchanged: ($outcomes | map(select(.result == "no_change")) | length),
     in_progress: ($outcomes | map(select(.result == "in_progress")) | length),
@@ -80,6 +84,7 @@ Durable PR outcomes: $(jq -r '.outcome_records' <<<"$summary")
 Green new-head outcomes (verified state; push attribution unverified, unique PR/head): $(jq -r '.green_new_head_outcomes' <<<"$summary")
 Explicit push-receipt green outcomes (unique PR/head): $(jq -r '.explicit_push_receipt_green_outcomes' <<<"$summary")
 Recovery-blocked sessions (no prompt sent; duplicate suppressed): $(jq -r '.recovery_blocked' <<<"$summary")
+Delivery-unconfirmed sessions (transport accepted but no native user turn; duplicate suppressed): $(jq -r '.delivery_unconfirmed' <<<"$summary")
 Blocked: $(jq -r '.blockers' <<<"$summary")
 No change: $(jq -r '.unchanged' <<<"$summary")
 In progress: $(jq -r '.in_progress' <<<"$summary")

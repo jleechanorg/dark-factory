@@ -95,6 +95,20 @@ pr_green_find_native_rollouts() {
     home="${home%/}"
     [[ -n "${seen_homes[$home]+yes}" ]] && continue
     seen_homes["$home"]=1
+    if [[ -n "$wanted_id" ]]; then
+      while IFS= read -r -d '' file; do
+        first="$(head -n 1 "$file" 2>/dev/null || true)"
+        metadata_id="$(jq -r 'select(.type == "session_meta") | (.payload.session_id // .payload.id // empty)' <<<"$first" 2>/dev/null || true)"
+        metadata_cwd="$(jq -r 'select(.type == "session_meta") | .payload.cwd // empty' <<<"$first" 2>/dev/null || true)"
+        metadata_timestamp="$(jq -r 'select(.type == "session_meta") | .timestamp // .payload.timestamp // empty' <<<"$first" 2>/dev/null || true)"
+        [[ "$metadata_id" == "$wanted_id" && "$metadata_cwd" == "$workspace" ]] || continue
+        seen_ids["$metadata_id"]=1
+        id_timestamps["$metadata_id"]="$metadata_timestamp"
+        relative="${file#"$home/"}"
+        matches+=("$metadata_id"$'\t'"$home"$'\t'"$relative")
+      done < <(find "$home/sessions" -type f -name "*${wanted_id}*.jsonl" -print0 2>/dev/null)
+      continue
+    fi
     while IFS= read -r -d '' file; do
       first="$(head -n 1 "$file" 2>/dev/null || true)"
       metadata_id="$(jq -r 'select(.type == "session_meta") | (.payload.session_id // .payload.id // empty)' <<<"$first" 2>/dev/null || true)"
@@ -347,7 +361,9 @@ pr_green_preserve_live_native_conversation() {
     # termination and the stable recovery path above.
     return 0
   fi
-  mapfile -t native_rollouts < <(pr_green_find_native_rollouts "$workspace" "$created_at") || return 1
+  local native_listing
+  native_listing="$(pr_green_find_native_rollouts "$workspace" "$created_at" 2>/dev/null)" || return 1
+  mapfile -t native_rollouts <<<"$native_listing"
   ((${#native_rollouts[@]} >= 2)) || return 1
   native_id="${native_rollouts[0]}"
   source_home=''
@@ -358,8 +374,46 @@ pr_green_preserve_live_native_conversation() {
     source_home=''
   done
   [[ "$source_home" == "$intended_home" ]] || return 1
+  PR_GREEN_NATIVE_ROLLOUT_LISTING="$native_listing"
   pr_green_register_native_conversation "$project_id" "$session_id" "$native_id"
 }
+
+# Count native Codex user-turns whose exact submitted prompt body is present for
+# one exact workspace/conversation. This is a transport acknowledgement, not
+# semantic inspection: a successful AO HTTP response is insufficient until the
+# native rollout records the requested body.
+pr_green_native_prompt_count() {
+  local listing="$1" prompt="$2" line home relative file count total=0
+  local -a entries=()
+  mapfile -t entries <<<"$listing"
+  ((${#entries[@]} >= 2)) || return 1
+  for line in "${entries[@]:1}"; do
+    [[ -n "$line" ]] || continue
+    home="${line#*$'\t'}"
+    relative="${home#*$'\t'}"
+    home="${home%%$'\t'*}"
+    file="$home/$relative"
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    count="$(jq -s --arg prompt "$prompt" '[.[] | select(.type == "response_item" and .payload.role == "user") | ([.payload.content[]? | select(.type == "input_text") | .text] | join("")) | select(. == $prompt)] | length' "$file" 2>/dev/null)" || return 1
+    total=$((total + count))
+  done
+  printf '%s\n' "$total"
+}
+
+pr_green_wait_for_native_prompt() {
+  local listing="$1" prompt="$2" baseline="$3"
+  local timeout_seconds="${4:-${PR_GREEN_NATIVE_ACK_TIMEOUT_SECONDS:-8}}"
+  local current deadline
+  [[ "$baseline" =~ ^[0-9]+$ && "$timeout_seconds" =~ ^[0-9]+$ ]] || return 1
+  deadline=$((SECONDS + timeout_seconds))
+  while :; do
+    current="$(pr_green_native_prompt_count "$listing" "$prompt" 2>/dev/null || true)"
+    [[ "$current" =~ ^[0-9]+$ && "$current" -gt "$baseline" ]] && return 0
+    (( SECONDS >= deadline )) && return 1
+    sleep 0.25
+  done
+}
+
 
 # Recognize both legacy and current Go AO spawn acknowledgements. The Go CLI
 # exits after claiming a PR and reports either a generic "claimed URL" or the
@@ -462,11 +516,17 @@ pr_green_live_session_is_busy() {
 #       a duplicate fleet member
 #   3 — native recovery/identity could not be proven; caller must suppress
 #       duplicate spawn without counting an inference attempt
+#   4 — AO accepted transport, but no native user turn was observed and no
+#       safe replay path was proven; caller must persist delivery_unconfirmed
+#       without sending a duplicate
 pr_green_reuse_session() {
   local project_id="$1"
   local pr_number="$2"
   local prompt="$3"
-  local record session_id terminated restore_output
+  local record session_id terminated restore_output native_row native_workspace native_id native_baseline native_listing
+  local -a native_row_fields=()
+
+  PR_GREEN_NATIVE_ROLLOUT_LISTING=''
 
   record="$(pr_green_session_record "$project_id" "$pr_number" 2>/dev/null || true)"
   [[ -n "$record" ]] || return 1
@@ -500,8 +560,35 @@ pr_green_reuse_session() {
     printf '%s\n' "reused"
   fi
 
+  native_row="$(pr_green_session_recovery_row "$project_id" "$session_id" 2>/dev/null || true)"
+  IFS='|' read -r -a native_row_fields <<<"$native_row"
+  native_workspace="${native_row_fields[0]:-}"
+  native_id="${native_row_fields[1]:-}"
+  if [[ -z "$native_workspace" || -z "$native_id" ]]; then
+    printf '%s\n' "AO session $session_id has no exact native conversation identity; delivery_unconfirmed" >&2
+    return 4
+  fi
+  native_listing="${PR_GREEN_NATIVE_ROLLOUT_LISTING:-}"
+  if [[ -z "$native_listing" ]]; then
+    native_listing="$(pr_green_find_native_rollouts "$native_workspace" '' "$native_id" 2>/dev/null || true)"
+  fi
+  [[ -n "$native_listing" ]] || {
+    printf '%s\n' "AO session $session_id native rollout is unavailable; delivery_unconfirmed" >&2
+    return 4
+  }
+  native_baseline="$(pr_green_native_prompt_count "$native_listing" "$prompt" 2>/dev/null || true)"
+  if [[ ! "$native_baseline" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "AO session $session_id native rollout is unavailable; delivery_unconfirmed" >&2
+    return 4
+  fi
+
   if ! ao send --session "$session_id" --message "$prompt" >/dev/null 2>&1; then
     printf '%s\n' "AO session $session_id did not accept the prompt after reuse/restore; suppressing duplicate spawn" >&2
     return 2
   fi
+  if pr_green_wait_for_native_prompt "$native_listing" "$prompt" "$native_baseline"; then
+    return 0
+  fi
+  printf '%s\n' "AO session $session_id transport returned success without a native user turn; delivery_unconfirmed" >&2
+  return 4
 }

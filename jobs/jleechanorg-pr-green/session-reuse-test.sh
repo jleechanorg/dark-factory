@@ -11,14 +11,24 @@ busy_runtime_handle=''
 busy_pane_output=''
 send_fail=0
 restore_fail=0
+native_ack_file=''
 recovery_dir="$(mktemp -d)"
 recovery_home="$recovery_dir/codex"
 recovery_source="$recovery_dir/old-codex"
 recovery_workspace="$recovery_dir/worktree"
 recovery_bin="$recovery_dir/bin"
-mkdir -p "$recovery_home" "$recovery_source/sessions/2026/09/23" "$recovery_workspace" "$recovery_bin"
+mkdir -p "$recovery_home/sessions/2026/09/23" "$recovery_source/sessions/2026/09/23" "$recovery_workspace" "$recovery_bin"
 printf '%s\n' '{"tokens":{}}' >"$recovery_home/auth.json"
-printf '%s\n' '{"type":"session_meta","payload":{"session_id":"native-session-dead","cwd":"'"$recovery_workspace"'"}}' >"$recovery_source/sessions/2026/09/23/rollout-native-session-dead.jsonl"
+printf '%s\n' '{"type":"session_meta","payload":{"session_id":"native-session-dead","cwd":"'"$recovery_workspace"'"},"timestamp":"2026-09-23T16:01:00Z"}' >"$recovery_source/sessions/2026/09/23/rollout-native-session-dead.jsonl"
+live_rollout="$recovery_home/sessions/2026/09/23/rollout-native-session-live.jsonl"
+fallback_rollout="$recovery_home/sessions/2026/09/23/rollout-native-session-fallback.jsonl"
+live_new_rollout="$recovery_home/sessions/2026/09/23/rollout-native-session-live-new.jsonl"
+for rollout in "$live_rollout" "$fallback_rollout" "$live_new_rollout"; do
+  native_id="${rollout##*rollout-}"
+  native_id="${native_id%.jsonl}"
+  printf '%s\n' '{"type":"session_meta","payload":{"session_id":"'"$native_id"'","cwd":"'"$recovery_workspace"'"}}' >"$rollout"
+  printf '%s\n' '{"type":"response_item","payload":{"role":"user","content":[]},"timestamp":"2026-09-23T15:51:12Z"}' >>"$rollout"
+done
 export CODEX_HOME="$recovery_home"
 export PR_GREEN_CODEX_HOME_CANDIDATES="$recovery_source:$recovery_home"
 export PR_GREEN_AO_DB_PATH="$recovery_dir/ao.db"
@@ -26,12 +36,24 @@ export PR_GREEN_AO_RUN_FILE="$recovery_dir/running.json"
 : >"$PR_GREEN_AO_DB_PATH"
 printf '%s\n' '{"pid":1234,"port":43123}' >"$PR_GREEN_AO_RUN_FILE"
 recovery_state="$recovery_dir/recovery-state.tsv"
-printf '%s||1\n' "$recovery_workspace" >"$recovery_state"
+printf '%s||1|2026-09-23T16:00:00Z\n' "$recovery_workspace" >"$recovery_state"
 export PR_GREEN_RECOVERY_STATE="$recovery_state"
 cat >"$recovery_bin/sqlite3" <<'EOF'
 #!/usr/bin/env bash
-if [[ "$*" == *"'wa-busy'"* ]]; then
+if [[ "$*" == *"SELECT runtime_handle_id"* && "$*" == *"'wa-busy'"* ]]; then
   printf '%s\n' 'worldarchitect-ai-777-deadbeef'
+elif [[ "$*" == *"SELECT runtime_handle_id"* && "$*" == *"'wa-live'"* ]]; then
+  printf '%s\n' 'worldarchitect-ai-123-native'
+elif [[ "$*" == *"SELECT runtime_handle_id"* && "$*" == *"'wa-fallback'"* ]]; then
+  printf '%s\n' 'worldarchitect-ai-654-native'
+elif [[ "$*" == *"SELECT runtime_handle_id"* && "$*" == *"'wa-live-new'"* ]]; then
+  printf '%s\n' 'worldarchitect-ai-321-native'
+elif [[ "$*" == *"'wa-live'"* ]]; then
+  printf '%s|native-session-live|0|2026-09-23T15:51:11Z\n' "$PR_GREEN_RECOVERY_WORKSPACE"
+elif [[ "$*" == *"'wa-fallback'"* ]]; then
+  printf '%s|native-session-fallback|0|2026-09-23T15:51:11Z\n' "$PR_GREEN_RECOVERY_WORKSPACE"
+elif [[ "$*" == *"'wa-live-new'"* ]]; then
+  printf '%s|native-session-live-new|0|2026-09-23T15:51:11Z\n' "$PR_GREEN_RECOVERY_WORKSPACE"
 elif [[ "$*" == *"'wa-dead'"* ]]; then
   cat "$PR_GREEN_RECOVERY_STATE"
 elif [[ "$*" == *"'wa-dead-missing'"* ]]; then
@@ -53,7 +75,12 @@ ao() {
     "status --json") printf '%s\n' '{"port":43123}' ;;
     "session ls") printf '%s\n' "$fixture" ;;
     "session restore") [[ "$restore_fail" -eq 0 ]] ;;
-    "send --session") [[ "$send_fail" -eq 0 ]] ;;
+    "send --session")
+      [[ "$send_fail" -eq 0 ]] || return 1
+      if [[ -n "$native_ack_file" ]]; then
+        jq -cn --arg prompt "$5" '{type:"response_item",payload:{role:"user",content:[{type:"input_text",text:$prompt}]},timestamp:"2026-09-23T16:00:00Z"}' >>"$native_ack_file"
+      fi
+      ;;
     *) printf 'unexpected ao call: %s\n' "$*" >&2; return 1 ;;
   esac
 }
@@ -74,6 +101,10 @@ tmux() {
   esac
 }
 
+# Transport tests provide the exact native identity rows above; the separate
+# live-process identity contract is covered by native-recovery tests.
+pr_green_preserve_live_native_conversation() { return 0; }
+
 assert_eq() {
   [[ "$1" == "$2" ]] || { printf 'assertion failed: %s != %s\n' "$1" "$2" >&2; exit 1; }
 }
@@ -92,7 +123,9 @@ fi
 rm -f "$success_fixture"
 
 action_file="$(mktemp)"
+native_ack_file="$live_rollout"
 pr_green_reuse_session worldarchitect.ai 123 'updated prompt' >"$action_file"
+native_ack_file=''
 action="$(<"$action_file")"
 rm -f "$action_file"
 assert_eq "$action" reused
@@ -101,6 +134,18 @@ assert_eq "${#ao_calls[@]}" 2
 assert_eq "${ao_calls[1]}" 'send --session wa-live --message updated prompt'
 if rg -q '^spawn ' "$ao_calls_file"; then
   printf 'live-session reuse must not spawn a second session\n' >&2
+  exit 1
+fi
+
+# A successful AO transport response without the exact prompt appearing as a
+# new native user turn is unconfirmed; it must not be reported as reused.
+: >"$ao_calls_file"
+set +e
+pr_green_reuse_session worldarchitect.ai 123 'transport acknowledgement missing' >/dev/null
+rc=$?
+set -e
+if [[ "$rc" -ne 4 ]]; then
+  printf 'missing native acknowledgement must return delivery-unconfirmed code 4 (got %s)\n' "$rc" >&2
   exit 1
 fi
 
@@ -125,7 +170,9 @@ fixture='{"data":[{"id":"wa-fallback","isTerminated":false,"status":"pr_open","u
 session_get_fixture='{"session":{"id":"wa-fallback","displayName":"pr-654","isTerminated":false,"status":"pr_open","updatedAt":"2026-09-23T00:02:00Z"}}'
 : >"$ao_calls_file"
 action_file="$(mktemp)"
+native_ack_file="$fallback_rollout"
 pr_green_reuse_session worldarchitect.ai 654 'hydrated prompt' >"$action_file"
+native_ack_file=''
 action="$(<"$action_file")"
 rm -f "$action_file"
 assert_eq "$action" reused
@@ -137,7 +184,9 @@ fixture='{"data":[{"id":"wa-dead-old","displayName":"pr-321","isTerminated":true
 session_get_fixture=''
 : >"$ao_calls_file"
 action_file="$(mktemp)"
+native_ack_file="$live_new_rollout"
 pr_green_reuse_session worldarchitect.ai 321 'prefer live prompt' >"$action_file"
+native_ack_file=''
 action="$(<"$action_file")"
 rm -f "$action_file"
 assert_eq "$action" reused
@@ -147,7 +196,9 @@ assert_eq "${ao_calls[1]}" 'send --session wa-live-new --message prefer live pro
 fixture='{"data":[{"id":"wa-dead","displayName":"pr-456","isTerminated":true,"status":"terminated","updatedAt":"2026-09-23T00:00:00Z"}]}'
 : >"$ao_calls_file"
 action_file="$(mktemp)"
+native_ack_file="$recovery_home/sessions/2026/09/23/rollout-native-session-dead.jsonl"
 pr_green_reuse_session worldarchitect.ai 456 'restore prompt' >"$action_file"
+native_ack_file=''
 action="$(<"$action_file")"
 rm -f "$action_file"
 assert_eq "$action" restored

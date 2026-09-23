@@ -14,12 +14,14 @@ cat >"$fixture_dir/outcomes.jsonl" <<'EOF'
 {"ts":1100,"repo":"worldarchitect.ai","number":2,"url":"https://example.test/2","run_ts":1000,"result":"fixed","verified":false,"detail":"unverified claim"}
 {"ts":1100,"repo":"worldarchitect.ai","number":3,"url":"https://example.test/3","run_ts":1000,"result":"blocked","verified":false,"detail":"ambiguous"}
 {"ts":1100,"repo":"worldarchitect.ai","number":4,"url":"https://example.test/4","run_ts":1000,"head_before":"old-head","head_after":"new-head","session_action":"recovery_blocked","result":"dispatch_failed","verified":false,"detail":"native recovery blocked"}
+{"ts":1100,"repo":"worldarchitect.ai","number":5,"url":"https://example.test/5","run_ts":1000,"head_before":"same-head","head_after":"same-head","session_action":"delivery_unconfirmed","result":"dispatch_failed","verified":false,"detail":"native user turn not observed"}
 EOF
 
 body="$(PR_GREEN_METRICS_DIR="$fixture_dir" PR_GREEN_REPORT_NOW=1200 PR_GREEN_REPORT_WINDOW_HOURS=1 "$job_dir/report.sh" stdout)"
 rg -q 'Green new-head outcomes \(verified state; push attribution unverified, unique PR/head\): 1' <<<"$body"
 rg -q 'Explicit push-receipt green outcomes \(unique PR/head\): 0' <<<"$body"
 rg -q 'Recovery-blocked sessions \(no prompt sent; duplicate suppressed\): 1' <<<"$body"
+rg -q 'Delivery-unconfirmed sessions \(transport accepted but no native user turn; duplicate suppressed\): 1' <<<"$body"
 rg -q 'Repair attempts \(dispatch or session reuse\): 2' <<<"$body"
 rg -q 'Busy sessions deferred \(no prompt queued\): 1' <<<"$body"
 rg -q 'Unchanged blockers deferred by cooldown \(no inference\): 3' <<<"$body"

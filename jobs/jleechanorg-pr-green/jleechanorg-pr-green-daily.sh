@@ -178,6 +178,7 @@ restored=0
 busy_deferred=0
 cooldown_deferred=0
 recovery_blocked=0
+delivery_unconfirmed=0
 fixed_confirmed=0
 
 # outcomes.jsonl is the stable reporting contract. `verified` is true only
@@ -363,6 +364,12 @@ EOF
     continue
   else
     session_reuse_rc=$?
+    if [[ "$session_reuse_rc" -eq 4 ]]; then
+      delivery_unconfirmed=$((delivery_unconfirmed + 1))
+      record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed delivery_unconfirmed || true
+      echo "$LOG_PREFIX delivery unconfirmed for $repo#$number; duplicate spawn suppressed" >&2
+      continue
+    fi
     if [[ "$session_reuse_rc" -eq 3 ]]; then
       recovery_blocked=$((recovery_blocked + 1))
       record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed recovery_blocked || true
@@ -458,7 +465,8 @@ jq -n --argjson ts "$run_started" --argjson analyzed "$analyzed" \
   --argjson restored "$restored" --argjson busy_deferred "$busy_deferred" \
   --argjson cooldown_deferred "$cooldown_deferred" \
   --argjson recovery_blocked "$recovery_blocked" \
+  --argjson delivery_unconfirmed "$delivery_unconfirmed" \
   --argjson fixed_confirmed "$fixed_confirmed" \
-  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, busy_deferred:$busy_deferred, cooldown_deferred:$cooldown_deferred, recovery_blocked:$recovery_blocked, fixed_confirmed:$fixed_confirmed}' \
+  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, busy_deferred:$busy_deferred, cooldown_deferred:$cooldown_deferred, recovery_blocked:$recovery_blocked, delivery_unconfirmed:$delivery_unconfirmed, fixed_confirmed:$fixed_confirmed}' \
   >> "$METRICS_DIR/runs.jsonl"
-echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored busy_deferred=$busy_deferred cooldown_deferred=$cooldown_deferred recovery_blocked=$recovery_blocked fixed_confirmed=$fixed_confirmed"
+echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored busy_deferred=$busy_deferred cooldown_deferred=$cooldown_deferred recovery_blocked=$recovery_blocked delivery_unconfirmed=$delivery_unconfirmed fixed_confirmed=$fixed_confirmed"
