@@ -6,6 +6,7 @@ non-draft PR updated in the last 24 hours, select only red CI or merge conflicts
 and dispatch through AO with stale-session recovery. It must never merge or
 force-push.
 
-The launcher currently delegates to the host scheduler implementation while
-the job is being migrated into this repository. The systemd unit must point at
-this directory and record its exact commit before activation.
+`run.sh` executes the adjacent `jleechanorg-pr-green-daily.sh`, which is the
+tracked implementation. The systemd unit points at `run.sh`; deployments must
+activate a reviewed commit from this directory rather than an untracked copy
+under `$HOME/bin`.
