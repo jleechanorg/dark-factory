@@ -29,10 +29,59 @@ fi
 [[ -f "$RUNS_FILE" ]] || : >"$RUNS_FILE"
 [[ -f "$OUTCOMES_FILE" ]] || : >"$OUTCOMES_FILE"
 
-summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" --argjson since "$SINCE" '
+# Index discovery snapshots without treating report generation as a scheduler
+# run. A snapshot is trusted only when its row count agrees with both run totals.
+discovery_records_file="$(mktemp "${TMPDIR:-/tmp}/pr-green-report-discovery.XXXXXX")"
+trap 'rm -f -- "$discovery_records_file"' EXIT
+shopt -s nullglob
+for discovery_file in "$METRICS_DIR"/discovery-*.tsv; do
+  run_ts="${discovery_file##*/discovery-}"
+  run_ts="${run_ts%.tsv}"
+  [[ "$run_ts" =~ ^[0-9]+$ ]] || continue
+  jq -Rn --argjson run_ts "$run_ts" '
+    [inputs | select(length > 0) | split("\t") | select(length >= 2)
+      | {repo: .[0], number: .[1]}]
+    | {run_ts: $run_ts, rows: ., row_count: length}
+  ' <"$discovery_file" >>"$discovery_records_file"
+done
+shopt -u nullglob
+
+summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" \
+  --slurpfile discoveries "$discovery_records_file" --argjson since "$SINCE" '
   def recent: map(select((.ts // 0) >= $since));
+  def valid_push_receipt:
+    (.push_receipt? // null) as $receipt
+    | ($receipt | type) == "object"
+      and ($receipt.verified == true)
+      and ($receipt.push_exit_code == 0)
+      and (($receipt.before_sha // "") | tostring | length) > 0
+      and (($receipt.after_sha // "") | tostring | length) > 0
+      and ($receipt.before_sha != $receipt.after_sha)
+      and (($receipt.commit_url // "") | tostring | length) > 0
+      and (($receipt.repo // "") | tostring | length) > 0
+      and (($receipt.session_id // $receipt.session // "") | tostring | length) > 0;
   (recent) as $runs |
   ($outcomes | recent) as $outcomes |
+  ($discoveries
+    | map(. as $discovery
+      | ($runs | map(select((.ts // 0) == $discovery.run_ts)) | .[0]) as $run
+      | select($run != null)
+      | {
+          run_ts: $discovery.run_ts,
+          rows: $discovery.rows,
+          row_count: $discovery.row_count,
+          complete: ($run != null
+            and ($run.discovered // -1) == $discovery.row_count
+            and ($run.analyzed // -1) == $discovery.row_count)
+        })) as $discovery_runs |
+  ([ $discovery_runs[] | select(.complete) | .rows[] ]
+    | unique_by([.repo, .number])) as $unique_discovered |
+  ((($runs | length) > 0)
+    and (($discovery_runs | length) == ($runs | length))
+    and all($discovery_runs[]; .complete)) as $discovery_complete |
+  ($outcomes
+    | map(select(valid_push_receipt))
+    | unique_by([.repo, .number])) as $pushes |
   {
     runs: ($runs | length),
     discovered: ($runs | map(.discovered // 0) | add // 0),
@@ -42,16 +91,14 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" --argjson since "$SINCE" 
     attempts: ($runs | map(.attempted // 0) | add // 0),
     busy_deferred: ($runs | map(.busy_deferred // 0) | add // 0),
     cooldown_deferred: ($runs | map(.cooldown_deferred // 0) | add // 0),
-    outcome_records: ($outcomes | length),
+    analyzed_unique: ($unique_discovered | length),
+    analyzed_coverage_complete: $discovery_complete,
+    covered_runs: ($discovery_runs | map(select(.complete)) | length),
+    pushes: $pushes,
+    push_receipts_available: (any($outcomes[]; valid_push_receipt)),
     green_new_head_outcomes: ($outcomes
       | map(select(.result == "fixed" and (.verified == true)
         and ((.head_before // "") != (.head_after // ""))))
-      | unique_by([.repo, .number, .head_after])
-      | length),
-    explicit_push_receipt_green_outcomes: ($outcomes
-      | map(select(.result == "fixed" and (.verified == true)
-        and ((.head_before // "") != (.head_after // ""))
-        and ((.push_receipt // null) != null)))
       | unique_by([.repo, .number, .head_after])
       | length),
     recovery_blocked: ($outcomes
@@ -78,28 +125,37 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" --argjson since "$SINCE" 
   }
 ' "$RUNS_FILE")"
 
+analyzed_label="$(jq -r 'if .analyzed_coverage_complete then (.analyzed_unique | tostring) elif .covered_runs > 0 then ("at least " + (.analyzed_unique | tostring) + " unique (" + (.covered_runs | tostring) + "/" + (.runs | tostring) + " runs covered)") else "unknown (coverage incomplete)" end' <<<"$summary")"
+pushed_label="$(jq -r 'if .push_receipts_available then (.pushes | length | tostring) else "unknown (push receipts unavailable)" end' <<<"$summary")"
+push_lines="$(jq -r '
+  .pushes[]?
+  | "- " + (.repo // "unknown-repo") + "#" + ((.number // "?") | tostring)
+    + ": " + (.url // "PR URL unavailable")
+    + " — evidence "
+    + (if (.push_receipt.commit_url? // "") != "" then .push_receipt.commit_url
+       elif (.push_receipt.url? // "") != "" then .push_receipt.url
+       elif (.push_receipt.commit? // "") != "" then .push_receipt.commit
+       else "receipt recorded; evidence URL unavailable" end)
+' <<<"$summary")"
+[[ -n "$push_lines" ]] || push_lines='(none; no push receipt is available)'
+
 body="PR green repair report (last ${WINDOW_HOURS}h)
 
-Runs: $(jq -r '.runs' <<<"$summary")
-Eligible PR scan observations discovered: $(jq -r '.discovered' <<<"$summary")
-PR scan observations analyzed for red CI/conflict: $(jq -r '.analyzed' <<<"$summary")
-Actionable red/conflicting: $(jq -r '.actionable' <<<"$summary")
-Selected for repair: $(jq -r '.selected' <<<"$summary")
-Repair attempts (dispatch or session reuse): $(jq -r '.attempts' <<<"$summary")
-Busy sessions deferred (no prompt queued): $(jq -r '.busy_deferred' <<<"$summary")
-Unchanged blockers deferred by cooldown (no inference): $(jq -r '.cooldown_deferred' <<<"$summary")
+PRs analyzed: ${analyzed_label}
+PRs with successful remote commits: ${pushed_label}
+Verified green PR/heads (push attribution not established): $(jq -r '.green_new_head_outcomes' <<<"$summary")
 
-Durable PR outcomes: $(jq -r '.outcome_records' <<<"$summary")
-Green new-head outcomes (verified state; push attribution unverified, unique PR/head): $(jq -r '.green_new_head_outcomes' <<<"$summary")
-Explicit push-receipt green outcomes (unique PR/head): $(jq -r '.explicit_push_receipt_green_outcomes' <<<"$summary")
-Recovery-blocked sessions (no prompt sent; duplicate suppressed): $(jq -r '.recovery_blocked' <<<"$summary")
-Delivery-unconfirmed/blocked sessions (native acknowledgement not observed; duplicate suppressed): $(jq -r '.delivery_unconfirmed' <<<"$summary")
-Native-ack tracking (new records only): observed $(jq -r '.native_ack_observed' <<<"$summary"), missing $(jq -r '.native_ack_missing' <<<"$summary"), untracked/legacy $(jq -r '.native_ack_untracked' <<<"$summary")
-Note: untracked/legacy outcomes have no native-ack field; zero observed does not mean all historical deliveries were confirmed.
-Blocked: $(jq -r '.blockers' <<<"$summary")
-No change: $(jq -r '.unchanged' <<<"$summary")
-In progress: $(jq -r '.in_progress' <<<"$summary")
-Dispatch failures: $(jq -r '.dispatch_failures' <<<"$summary")
+Verified pushed PRs (receipt evidence):
+${push_lines}
+
+Funnel (per-run totals; repeated scans are not unique PRs):
+Actionable red/conflicting: $(jq -r '.actionable' <<<"$summary"); selected: $(jq -r '.selected' <<<"$summary")
+Repair attempts (dispatch or session reuse): $(jq -r '.attempts' <<<"$summary")
+Deferred: busy $(jq -r '.busy_deferred' <<<"$summary"); cooldown $(jq -r '.cooldown_deferred' <<<"$summary")
+
+Exceptions: recovery-blocked $(jq -r '.recovery_blocked' <<<"$summary"); delivery-unconfirmed $(jq -r '.delivery_unconfirmed' <<<"$summary")
+Other outcomes: blocked $(jq -r '.blockers' <<<"$summary"), no change $(jq -r '.unchanged' <<<"$summary"), in progress $(jq -r '.in_progress' <<<"$summary"), dispatch failures $(jq -r '.dispatch_failures' <<<"$summary")
+Coverage: runs $(jq -r '.runs' <<<"$summary"), discovery observations $(jq -r '.discovered' <<<"$summary"), complete snapshots $(jq -r '.covered_runs' <<<"$summary")/$(jq -r '.runs' <<<"$summary"); native ack observed $(jq -r '.native_ack_observed' <<<"$summary"), missing $(jq -r '.native_ack_missing' <<<"$summary"), untracked/legacy $(jq -r '.native_ack_untracked' <<<"$summary"). Unknown is not zero.
 
 Policy: only explicit red CI or merge conflicts; no merges or force-pushes.
 Note: dispatches and session reuse are attempts, never fixes."
