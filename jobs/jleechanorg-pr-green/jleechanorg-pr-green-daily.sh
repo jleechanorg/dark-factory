@@ -83,11 +83,18 @@ record_outcome() {
 }
 
 reconcile_pr() {
-  local repo="$1" number="$2" url="$3" before="$4" action="$5" after classification
+  local repo="$1" number="$2" url="$3" before="$4" action="$5" after classification snapshot_path
   after="$(pr_green_fetch_live_state "$url" 2>/dev/null || true)"
   [[ -n "$after" ]] || { echo "$LOG_PREFIX unable to re-read $repo#$number after $action" >&2; return 1; }
   classification="$(pr_green_classify_outcome "$before" "$after")"
   record_outcome "$repo" "$number" "$url" "$before" "$after" "$classification" "$action"
+  snapshot_path="$(pr_green_snapshot_path "$STATE_DIR" "$repo" "$number")"
+  if [[ "$classification" == "fixed_confirmed" ]]; then
+    # Keep the original pre-dispatch blocker for every intermediate result.
+    # Replacing it with a pending/blocked replacement head would make the later
+    # green read look like `no_change`, losing the fix.
+    rm -f -- "$snapshot_path"
+  fi
   echo "$LOG_PREFIX outcome $repo#$number $classification ($action)"
 }
 while IFS=$'\t' read -r repo number title url updated; do
@@ -148,8 +155,13 @@ EOF
     continue
   fi
 
-  # Save the exact blocker/head snapshot immediately before contacting AO.
-  pr_green_write_snapshot "$STATE_DIR" "$repo" "$number" "$live_state"
+  # Save the first blocker/head snapshot immediately before contacting AO. A
+  # replacement head may still be blocked on a later scan; keep the original
+  # baseline until a green read confirms the repair instead of resetting it to
+  # the replacement and losing the eventual fix accounting.
+  if [[ -z "$(pr_green_read_snapshot "$STATE_DIR" "$repo" "$number" || true)" ]]; then
+    pr_green_write_snapshot "$STATE_DIR" "$repo" "$number" "$live_state"
+  fi
 
   # Reuse an already configured AO project. For a new repo, clone it into a
   # dedicated non-repository directory before registering it; never clone into
@@ -158,6 +170,17 @@ EOF
   [[ "$repo" == "worldarchitect.ai" ]] && project_id="worldarchitect.ai"
   session_name="pr-${number}"
   session_action=""
+  if ! pr_green_ensure_codex_scope "$project_id"; then
+    # A project may not have been registered yet. Register it into AO's
+    # project registry, then apply and verify the complete preserved config
+    # before any session is reused, restored, or spawned.
+    mkdir -p "$AO_PROJECT_ROOT"
+    if ! (cd "$AO_PROJECT_ROOT" && ao start "https://github.com/jleechanorg/${repo}" --no-dashboard --no-orchestrator --no-open >/dev/null 2>&1) \
+      || ! pr_green_ensure_codex_scope "$project_id"; then
+      echo "$LOG_PREFIX failed to establish project-scoped Codex account for $repo#$number" >&2
+      continue
+    fi
+  fi
   if session_action="$(pr_green_reuse_session "$project_id" "$number" "$prompt")"; then
     case "$session_action" in
       restored)

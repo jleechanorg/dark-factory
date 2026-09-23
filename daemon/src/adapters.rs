@@ -3356,6 +3356,7 @@ fn open_go_ao_db() -> Result<rusqlite::Connection, DaemonError> {
 }
 
 fn go_ao_session_workspace_and_branch(
+    project: &str,
     session_id: &str,
 ) -> (Option<std::path::PathBuf>, Option<String>) {
     let home = match operator_home().or_else(|_| std::env::var("HOME").map_err(|e| e.to_string())) {
@@ -3370,11 +3371,13 @@ fn go_ao_session_workspace_and_branch(
         Ok(c) => c,
         Err(_) => return (None, None),
     };
-    let mut stmt = match conn.prepare("SELECT workspace_path, branch FROM sessions WHERE id = ?1") {
+    let mut stmt = match conn.prepare(
+        "SELECT workspace_path, branch FROM sessions WHERE id = ?1 AND project_id = ?2",
+    ) {
         Ok(s) => s,
         Err(_) => return (None, None),
     };
-    let mut rows = match stmt.query([session_id]) {
+    let mut rows = match stmt.query([session_id, project]) {
         Ok(r) => r,
         Err(_) => return (None, None),
     };
@@ -4174,6 +4177,20 @@ fn validate_target_identity_if_expected(
         .map(|_| ())
 }
 
+fn validate_spawned_workspace(
+    spec: &SpawnSpec,
+    path: &std::path::Path,
+    native_go_workspace: bool,
+) -> Result<(), DaemonError> {
+    // The legacy bridge is expected to report the exact configured checkout.
+    // Native Go AO creates its own per-session worktree, so comparing it with
+    // dispatch's base checkout would reject a valid isolated workspace.
+    if !native_go_workspace {
+        crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), path)?;
+    }
+    validate_target_identity_if_expected(&spec.repo, path, spec.expected_revision.as_deref())
+}
+
 /// Maps legacy vendor aliases onto their canonical AO plugin names. The
 /// runtime and startup paths consult this single source so a renamed plugin
 /// never silently disappears from `--agent` argv or preflight checks.
@@ -4274,6 +4291,8 @@ pub fn verify_ao_bridge_compatibility(
         let mut command = Command::new("ao-go");
         command
             .arg("status")
+            .arg("-p")
+            .arg(ao_project)
             .arg("--json")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -4745,7 +4764,8 @@ impl CliSessions {
                     }
                 })?;
             let session = SessionId(session_id);
-            let (mut ws, mut branch) = go_ao_session_workspace_and_branch(&session.0);
+            let (ws, branch) = go_ao_session_workspace_and_branch(&spec.ao_project, &session.0);
+            let mut ws = ws;
             if ws.is_none() {
                 if let Ok(home) = operator_home().or_else(|_| std::env::var("HOME").map_err(|e| e.to_string())) {
                     let fallback = std::path::Path::new(&home)
@@ -4756,9 +4776,6 @@ impl CliSessions {
                         ws = Some(fallback);
                     }
                 }
-            }
-            if branch.is_none() {
-                branch = Some(spec.branch.clone());
             }
             (session, ws, branch)
         } else {
@@ -4784,30 +4801,29 @@ impl CliSessions {
                         "ao spawn --agent {agent} returned session {} with branch {:?}, expected {:?}; refusing to dispatch a branch-mismatched worker",
                         session.0, observed_branch, spec.branch
                     )))
-                } else if !is_go_ao() && crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), workspace_path).is_err() {
-                    Some(crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), workspace_path).unwrap_err())
-                } else if is_go_ao() {
-                    if !workspace_path.is_absolute() || !workspace_path.is_dir() {
-                        Some(DaemonError::Config(format!(
-                            "Go AO worker workspace path is not a directory: {}",
-                            workspace_path.display()
-                        )))
-                    } else {
-                        None
-                    }
+                } else if is_go_ao() && (!workspace_path.is_absolute() || !workspace_path.is_dir()) {
+                    Some(DaemonError::Config(format!(
+                        "Go AO worker workspace path is not a directory: {}",
+                        workspace_path.display()
+                    )))
                 } else {
-                    match validate_target_identity_if_expected(
-                        &spec.repo,
-                        workspace_path,
-                        spec.expected_revision.as_deref(),
-                    ) {
+                    match validate_spawned_workspace(spec, workspace_path, is_go_ao()) {
                         Ok(()) => None,
-                        Err(error) => Some(DaemonError::Config(format!(
-                            "AO worker workspace for session {} is not bound to repo {} at expected revision {}: {error}",
-                            session.0,
-                            spec.repo,
-                            spec.expected_revision.as_deref().unwrap_or("?")
-                        ))),
+                        Err(error) => Some(if is_go_ao() {
+                            DaemonError::Config(format!(
+                                "Go AO worker workspace for session {} is not bound to repo {} at expected revision {}: {error}",
+                                session.0,
+                                spec.repo,
+                                spec.expected_revision.as_deref().unwrap_or("?"),
+                            ))
+                        } else {
+                            DaemonError::Config(format!(
+                                "AO worker workspace for session {} is not bound to repo {} at expected revision {}: {error}",
+                                session.0,
+                                spec.repo,
+                                spec.expected_revision.as_deref().unwrap_or("?"),
+                            ))
+                        }),
                     }
                 }
             }
@@ -9308,20 +9324,30 @@ export const isTerminalSession = () => false;
 impl Sessions for CliSessions {
     fn active_count(&self) -> Result<usize, DaemonError> {
         if is_go_ao() {
-            let conn = match open_go_ao_db() {
-                Ok(c) => c,
-                Err(_) => return Ok(0),
-            };
-            let mut stmt = match conn.prepare(
+            let conn = open_go_ao_db()?;
+            let mut stmt = conn.prepare(
                 "SELECT count(*) FROM sessions WHERE project_id = ?1 AND is_terminated = 0",
-            ) {
-                Ok(s) => s,
-                Err(_) => return Ok(0),
-            };
+            )
+            .map_err(|error| {
+                DaemonError::Config(format!(
+                    "failed to prepare Go AO active-session query for project {}: {error}",
+                    self.project
+                ))
+            })?;
             let count: i64 = stmt
                 .query_row([&self.project], |row| row.get(0))
-                .unwrap_or(0);
-            return Ok(count as usize);
+                .map_err(|error| {
+                    DaemonError::Config(format!(
+                        "failed to query Go AO active sessions for project {}: {error}",
+                        self.project
+                    ))
+                })?;
+            return usize::try_from(count).map_err(|error| {
+                DaemonError::Config(format!(
+                    "Go AO active-session count for project {} is invalid: {error}",
+                    self.project
+                ))
+            });
         }
         let out = run_ao_tool(&self.project, &["status", "-p", &self.project, "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
@@ -9671,7 +9697,7 @@ impl Sessions for CliSessions {
         project: &str,
     ) -> Result<Option<String>, DaemonError> {
         if is_go_ao() {
-            let (_, branch) = go_ao_session_workspace_and_branch(&id.0);
+            let (_, branch) = go_ao_session_workspace_and_branch(project, &id.0);
             return Ok(branch);
         }
         let out = match run_tool("ao", &["status", "-p", project, "--json"], 30) {
@@ -13685,12 +13711,15 @@ mod go_ao_lifecycle_tests {
 
         let fake_ao_go = temp_dir.join("ao-go");
         let state_file = temp_dir.join("ao_status_payload.json");
+        let calls_file = temp_dir.join("ao_status_calls.log");
         std::fs::write(&state_file, r#"{"health":"ok"}"#).unwrap();
 
         let script = format!(
             r#"#!/bin/sh
+printf '%s\n' "$*" > "{}"
 cat "{}"
 "#,
+            calls_file.display(),
             state_file.display()
         );
         std::fs::write(&fake_ao_go, script).unwrap();
@@ -13703,6 +13732,8 @@ cat "{}"
 
         // 1. health == ok
         assert!(verify_ao_bridge_compatibility("proj", "antigravity", &[]).is_ok());
+        let calls = std::fs::read_to_string(&calls_file).unwrap();
+        assert_eq!(calls.trim(), "status -p proj --json");
 
         // 2. state == ready
         std::fs::write(&state_file, r#"{"state":"ready"}"#).unwrap();
@@ -13740,6 +13771,83 @@ exit 1
             None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn go_ao_active_count_fails_closed_when_database_is_unavailable() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_op_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+        let temp_home = std::env::temp_dir().join(format!("df_test_go_ao_no_db_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_home);
+        std::fs::create_dir_all(&temp_home).unwrap();
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &temp_home);
+
+        let sessions = CliSessions::new("proj-a", "antigravity");
+        assert!(sessions.active_count().is_err(), "missing AO DB must not look like zero active sessions");
+
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_op_home {
+            Some(v) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn go_ao_workspace_validation_rejects_wrong_expected_revision() {
+        let spec = SpawnSpec {
+            bead_id: "go-workspace-validation".to_string(),
+            branch: "factory/go-workspace-validation".to_string(),
+            prompt: "test".to_string(),
+            repo: "jleechanorg/dark-factory".to_string(),
+            ao_project: "dark-factory".to_string(),
+            remote: "origin".to_string(),
+            local_checkout: None,
+            expected_revision: Some("f".repeat(40)),
+            managed_checkout: false,
+            expected_cwd: None,
+        };
+        let error = validate_spawned_workspace(
+            &spec,
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            true,
+        )
+            .expect_err("Go AO must validate the reported workspace identity");
+        assert!(error.to_string().contains("expected snapshot"), "{error}");
+    }
+
+    #[test]
+    fn go_ao_workspace_accepts_isolated_worktree_when_base_cwd_differs() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let head = std::process::Command::new("git")
+            .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        let spec = SpawnSpec {
+            bead_id: "go-isolated-workspace".to_string(),
+            branch: "factory/go-isolated-workspace".to_string(),
+            prompt: "test".to_string(),
+            repo: "jleechanorg/dark-factory".to_string(),
+            ao_project: "dark-factory".to_string(),
+            remote: "origin".to_string(),
+            local_checkout: None,
+            expected_revision: Some(head),
+            managed_checkout: false,
+            expected_cwd: Some(std::env::temp_dir().join("dispatch-base-checkout")),
+        };
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(validate_spawned_workspace(&spec, workspace, true).is_ok());
+        assert!(validate_spawned_workspace(&spec, workspace, false).is_err());
     }
 
     #[test]
@@ -13815,11 +13923,16 @@ exit 1
         drop(conn);
 
         // 1. go_ao_session_workspace_and_branch
-        let (ws, br) = go_ao_session_workspace_and_branch("sess-active-1");
+        let (ws, br) = go_ao_session_workspace_and_branch("proj-a", "sess-active-1");
         assert_eq!(ws, Some(std::path::PathBuf::from("/ws/1")));
         assert_eq!(br, Some("branch-1".to_string()));
 
-        let (ws_none, br_none) = go_ao_session_workspace_and_branch("sess-nonexistent");
+        let (wrong_project_ws, wrong_project_br) =
+            go_ao_session_workspace_and_branch("proj-b", "sess-active-1");
+        assert_eq!(wrong_project_ws, None);
+        assert_eq!(wrong_project_br, None);
+
+        let (ws_none, br_none) = go_ao_session_workspace_and_branch("proj-a", "sess-nonexistent");
         assert_eq!(ws_none, None);
         assert_eq!(br_none, None);
 
@@ -13956,7 +14069,7 @@ echo "$@" >> "{}"
         std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &temp_home);
 
         // No database exists, so go_ao_session_workspace_and_branch returns (None, None)
-        let (ws, br) = go_ao_session_workspace_and_branch("sess-fallback-123");
+        let (ws, br) = go_ao_session_workspace_and_branch("proj-x", "sess-fallback-123");
         assert_eq!(ws, None);
         assert_eq!(br, None);
 
@@ -13975,7 +14088,8 @@ echo "$@" >> "{}"
             expected_cwd: None,
         };
 
-        let (mut resolved_ws, mut resolved_br) = go_ao_session_workspace_and_branch(&session.0);
+        let (mut resolved_ws, resolved_br) =
+            go_ao_session_workspace_and_branch(&spec.ao_project, &session.0);
         if resolved_ws.is_none() {
             if let Ok(home) = operator_home().or_else(|_| std::env::var("HOME").map_err(|e| e.to_string())) {
                 let fallback = std::path::Path::new(&home)
@@ -13987,12 +14101,8 @@ echo "$@" >> "{}"
                 }
             }
         }
-        if resolved_br.is_none() {
-            resolved_br = Some(spec.branch.clone());
-        }
-
         assert_eq!(resolved_ws, Some(worktrees_dir));
-        assert_eq!(resolved_br, Some("factory/test-branch".to_string()));
+        assert_eq!(resolved_br, None);
 
         match prior_engine {
             Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
@@ -14089,4 +14199,3 @@ echo "$@" >> "{}"
 }
 
 // PR #666 — bead jleechan-nfdl (pr-655-finding-3) anchor for Evidence Gate re-trigger
-

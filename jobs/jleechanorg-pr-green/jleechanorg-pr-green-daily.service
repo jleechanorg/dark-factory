@@ -5,8 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+ExecStartPre=/usr/bin/test -d %h/.codex-dark-factory
+ExecStartPre=/usr/bin/test -s %h/.codex-dark-factory/auth.json
 ExecStart=/usr/bin/flock -n /run/user/%U/jleechanorg-pr-green-daily.lock /bin/bash /home/jleechan/.hermes/scripts/systemd-wrapper.sh %h/projects/dark-factory/jobs/jleechanorg-pr-green/run.sh
 UnsetEnvironment=GITHUB_TOKEN GH_TOKEN
-Environment=CODEX_HOME=%h/.codex
+Environment=CODEX_HOME=%h/.codex-dark-factory
 Environment=AO_CONFIG_PATH=%h/agent-orchestrator.yaml
 TimeoutStartSec=1800

@@ -38,7 +38,10 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" --argjson since "$SINCE" 
     busy_deferred: ($runs | map(.busy_deferred // 0) | add // 0),
     cooldown_deferred: ($runs | map(.cooldown_deferred // 0) | add // 0),
     outcome_records: ($outcomes | length),
-    confirmed_fixes: ($outcomes | map(select(.result == "fixed" and (.verified == true))) | length),
+    confirmed_fixes: ($outcomes
+      | map(select(.result == "fixed" and (.verified == true)))
+      | unique_by([.repo, .number, .head_after])
+      | length),
     blockers: ($outcomes | map(select(.result == "blocked")) | length),
     unchanged: ($outcomes | map(select(.result == "no_change")) | length),
     in_progress: ($outcomes | map(select(.result == "in_progress")) | length),
@@ -49,8 +52,8 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" --argjson since "$SINCE" 
 body="PR green repair report (last ${WINDOW_HOURS}h)
 
 Runs: $(jq -r '.runs' <<<"$summary")
-Eligible recently updated PRs discovered: $(jq -r '.discovered' <<<"$summary")
-PRs analyzed for red CI/conflict: $(jq -r '.analyzed' <<<"$summary")
+Eligible PR scan observations discovered: $(jq -r '.discovered' <<<"$summary")
+PR scan observations analyzed for red CI/conflict: $(jq -r '.analyzed' <<<"$summary")
 Actionable red/conflicting: $(jq -r '.actionable' <<<"$summary")
 Selected for repair: $(jq -r '.selected' <<<"$summary")
 Repair attempts (dispatch or session reuse): $(jq -r '.attempts' <<<"$summary")
@@ -58,7 +61,7 @@ Busy sessions deferred (no prompt queued): $(jq -r '.busy_deferred' <<<"$summary
 Unchanged blockers deferred by cooldown (no inference): $(jq -r '.cooldown_deferred' <<<"$summary")
 
 Durable PR outcomes: $(jq -r '.outcome_records' <<<"$summary")
-Confirmed fixes (verified): $(jq -r '.confirmed_fixes' <<<"$summary")
+Confirmed fixes (unique PR/head, verified): $(jq -r '.confirmed_fixes' <<<"$summary")
 Blocked: $(jq -r '.blockers' <<<"$summary")
 No change: $(jq -r '.unchanged' <<<"$summary")
 In progress: $(jq -r '.in_progress' <<<"$summary")

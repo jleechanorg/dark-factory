@@ -9,6 +9,7 @@ fixture='{"data":[{"id":"wa-live","displayName":"pr-123","isTerminated":false,"s
 session_get_fixture=''
 busy_runtime_handle=''
 busy_pane_output=''
+send_fail=0
 ao_calls_file="$(mktemp)"
 trap 'rm -f "$ao_calls_file"' EXIT
 ao() {
@@ -20,7 +21,7 @@ ao() {
   case "$1 $2" in
     "session ls") printf '%s\n' "$fixture" ;;
     "session restore") return 0 ;;
-    "send --session") return 0 ;;
+    "send --session") [[ "$send_fail" -eq 0 ]] ;;
     *) printf 'unexpected ao call: %s\n' "$*" >&2; return 1 ;;
   esac
 }
@@ -123,6 +124,25 @@ mapfile -t ao_calls <"$ao_calls_file"
 assert_eq "${#ao_calls[@]}" 3
 assert_eq "${ao_calls[1]}" 'session restore wa-dead -p worldarchitect.ai'
 assert_eq "${ao_calls[2]}" 'send --session wa-dead --message restore prompt'
+
+# A successful restore followed by a rejected prompt still identifies the
+# exact existing session. The caller must suppress duplicate spawn rather than
+# treating it as a missing session.
+send_fail=1
+: >"$ao_calls_file"
+set +e
+pr_green_reuse_session worldarchitect.ai 456 'restore retry prompt' >/dev/null
+rc=$?
+set -e
+send_fail=0
+if [[ "$rc" -ne 2 ]]; then
+  printf 'restore/send failure must return duplicate-suppression code 2 (got %s)\n' "$rc" >&2
+  exit 1
+fi
+mapfile -t ao_calls <"$ao_calls_file"
+assert_eq "${ao_calls[0]}" 'session ls -p worldarchitect.ai --include-terminated --json'
+assert_eq "${ao_calls[1]}" 'session restore wa-dead -p worldarchitect.ai'
+assert_eq "${ao_calls[2]}" 'send --session wa-dead --message restore retry prompt'
 
 fixture='{"data":[]}'
 : >"$ao_calls_file"

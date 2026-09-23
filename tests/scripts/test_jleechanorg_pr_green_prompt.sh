@@ -6,7 +6,9 @@ JOB="$ROOT/jobs/jleechanorg-pr-green/jleechanorg-pr-green-daily.sh"
 fixture_dir="$(mktemp -d)"
 trap 'rm -rf "$fixture_dir"' EXIT
 mock_bin="$fixture_dir/bin"
-mkdir -p "$mock_bin"
+codex_home="$fixture_dir/codex"
+mkdir -p "$mock_bin" "$codex_home"
+printf '%s\n' '{"tokens":{}}' >"$codex_home/auth.json"
 
 cat >"$mock_bin/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -26,6 +28,13 @@ cat >"$mock_bin/ao" <<'EOF'
 set -euo pipefail
 if [[ "$1" == "session" && "$2" == "ls" ]]; then
   printf '%s\n' '{"data":[]}'
+  exit 0
+fi
+if [[ "$1" == "project" && "$2" == "get" ]]; then
+  printf '{"status":"ok","project":{"id":"worldarchitect.ai","config":{"defaultBranch":"main","env":{"CODEX_HOME":"%s","OTHER":"preserve"}}}}\n' "$CODEX_HOME"
+  exit 0
+fi
+if [[ "$1" == "project" && "$2" == "set-config" ]]; then
   exit 0
 fi
 if [[ "$1" == "spawn" ]]; then
@@ -49,6 +58,7 @@ chmod +x "$mock_bin/gh" "$mock_bin/ao"
 capture="$fixture_dir/prompt.txt"
 PATH="$mock_bin:$PATH" \
   HOME="$fixture_dir/home" \
+  CODEX_HOME="$codex_home" \
   PR_GREEN_METRICS_DIR="$fixture_dir/metrics" \
   PR_GREEN_AO_CONFIG_PATH="$fixture_dir/ao-config" \
   PR_GREEN_SPAWN_PROBE_SECONDS=0.1 \

@@ -1589,7 +1589,7 @@ fn run_cargo_tests(
             .and_then(|s| s.to_str())
             .ok_or_else(|| RedGreenError::Git(format!("bad test file path: {}", target.path.display())))?;
 
-        if basename == "mod" {
+        if should_skip_cargo_target(&target.path) {
             continue;
         }
 
@@ -1641,6 +1641,11 @@ fn run_cargo_tests(
         failing,
         compile_errored,
     })
+}
+
+fn should_skip_cargo_target(path: &Path) -> bool {
+    let is_mod = path.file_name().and_then(|name| name.to_str()) == Some("mod.rs");
+    is_mod && path.parent().and_then(|parent| parent.file_name()).and_then(|name| name.to_str()) != Some("tests")
 }
 
 /// Run phase (c) — baseline-main sanity check — by materializing
@@ -2716,6 +2721,12 @@ fn b() {
         .expect("skipping mod.rs should succeed without running cargo");
         assert!(mod_outcome.all_passed());
         assert!(mod_outcome.failing.is_empty());
+
+        let top_level_mod = PathBuf::from("tests/mod.rs");
+        assert!(
+            !should_skip_cargo_target(&top_level_mod),
+            "tests/mod.rs is a top-level Cargo integration target and must run"
+        );
     }
 
     /// Create a unique temp directory under `std::env::temp_dir()`. The

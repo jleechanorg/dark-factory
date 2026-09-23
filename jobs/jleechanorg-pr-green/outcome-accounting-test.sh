@@ -95,4 +95,13 @@ if pr_green_same_head_cooldown_applies "$outcomes_file" worldarchitect.ai 9941 "
   exit 1
 fi
 
+# A replacement head that is still waiting on CI must keep the original
+# pre-dispatch blocker as its snapshot baseline. Otherwise the later green
+# read of that same replacement head is misclassified as no_change.
+pending_before='{"head_sha":"old-head","conflicting":false,"failed_checks":["unit"],"pending_checks":false}'
+pending_after='{"head_sha":"new-head","conflicting":false,"failed_checks":[],"pending_checks":true}'
+assert_eq "$(pr_green_classify_outcome "$pending_before" "$pending_after")" pushed_ci_pending
+pending_green='{"head_sha":"new-head","conflicting":false,"failed_checks":[],"pending_checks":false,"check_count":1,"successful_completed_checks":1}'
+assert_eq "$(pr_green_classify_outcome "$pending_before" "$pending_green")" fixed_confirmed
+
 printf 'outcome accounting tests passed\n'

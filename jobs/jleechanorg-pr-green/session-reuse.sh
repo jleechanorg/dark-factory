@@ -3,6 +3,47 @@
 # AO session reuse helpers for the PR-green sweep. These functions deliberately
 # use AO's project-scoped JSON API rather than scraping daemon internals.
 
+# AO resolves a project's environment when a session is spawned or restored.
+# Keep the repair job's Codex account binding in that project config as well as
+# in the scheduler environment; otherwise AO can launch a worker with its
+# registered project environment and silently fall back to the operator's
+# default account. `set-config` replaces the complete config, so preserve all
+# existing fields and verify the resulting project before proceeding.
+pr_green_ensure_codex_scope() {
+  local project_id="$1" codex_home="${CODEX_HOME:-}"
+  local project_json config_json existing_home updated_config verified_home
+  [[ -n "$codex_home" && -d "$codex_home" && -s "$codex_home/auth.json" ]] || {
+    echo "PR_GREEN CODEX_HOME is not an existing authenticated scope: $codex_home" >&2
+    return 1
+  }
+  project_json="$(ao project get "$project_id" --json 2>/dev/null || true)"
+  [[ -n "$project_json" ]] || return 1
+  config_json="$(jq -c '.project.config // {}' <<<"$project_json" 2>/dev/null || true)"
+  [[ -n "$config_json" && "$config_json" != "null" ]] || return 1
+  existing_home="$(jq -r '
+    if ((.env // {}) | type) == "object" then (.env.CODEX_HOME // "")
+    elif ((.env // []) | type) == "array" then
+      ((.env // [])[] | select(startswith("CODEX_HOME=")) | sub("^CODEX_HOME="; "")) // ""
+    else "" end
+  ' <<<"$config_json" 2>/dev/null || true)"
+  if [[ "$existing_home" == "$codex_home" ]]; then
+    return 0
+  fi
+  updated_config="$(jq -c --arg codex_home "$codex_home" '
+    if ((.env // {}) | type) == "object" then
+      .env = ((.env // {}) + {CODEX_HOME: $codex_home})
+    elif ((.env // []) | type) == "array" then
+      .env = ((.env // []) | map(select(startswith("CODEX_HOME=") | not)) + ["CODEX_HOME=" + $codex_home])
+    else
+      .env = {CODEX_HOME: $codex_home}
+    end
+  ' <<<"$config_json" 2>/dev/null || true)"
+  [[ -n "$updated_config" ]] || return 1
+  ao project set-config "$project_id" --config-json "$updated_config" --json >/dev/null 2>&1 || return 1
+  verified_home="$(ao project get "$project_id" --json 2>/dev/null | jq -r '.project.config.env.CODEX_HOME // ""' 2>/dev/null || true)"
+  [[ "$verified_home" == "$codex_home" ]]
+}
+
 # Recognize both legacy and current Go AO spawn acknowledgements. The Go CLI
 # exits after claiming a PR and reports either a generic "claimed URL" or the
 # actual claimed pull-request URL, rather than the older SESSION= or Worktree
@@ -129,11 +170,7 @@ pr_green_reuse_session() {
   fi
 
   if ! ao send --session "$session_id" --message "$prompt" >/dev/null 2>&1; then
-    if [[ "$terminated" == "true" ]]; then
-      printf '%s\n' "AO restored session $session_id did not accept the prompt" >&2
-      return 1
-    fi
-    printf '%s\n' "AO live session $session_id did not accept the prompt; suppressing duplicate spawn" >&2
+    printf '%s\n' "AO session $session_id did not accept the prompt after reuse/restore; suppressing duplicate spawn" >&2
     return 2
   fi
 }
