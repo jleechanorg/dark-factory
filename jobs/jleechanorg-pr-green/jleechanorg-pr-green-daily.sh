@@ -131,7 +131,11 @@ MANDATORY INTEGRATION RULES
 - Stop only when repository evidence leaves two or more genuinely plausible user-visible behaviors. Stop only if choosing between them would materially change product behavior, and report that exact blocker.
 
 SAFETY AND DELIVERY
-- Do not merge the PR, rebase published history, rewrite history, force-push, change credentials, or weaken tests merely to make them pass.
+- Never merge the PR.
+- Never rebase published history or rewrite history.
+- Never force-push.
+- Never change credentials.
+- Never weaken tests merely to make them pass.
 - Run the narrowest relevant tests covering both the PR behavior and current-base contract, then the repository's required checks.
 - Commit with an explicit message. Push normally only after the integrated tests and required checks are green.
 
