@@ -11766,6 +11766,7 @@ mod chain_llm_fallback_argv_tests {
         let dir = std::env::temp_dir().join(format!("afd_chain_llm_{}_{}", prefix, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("codex-home")).unwrap();
         write_argv_dump_shim(&dir.join("bin").join(bin_name));
         dir
     }
@@ -11799,18 +11800,21 @@ mod chain_llm_fallback_argv_tests {
         // stops at the shim — this pins the argv of the FIRST link rather
         // than accidentally exercising the fallback.
         let prior_path = std::env::var_os("PATH");
+        // Keep only the shim plus the system shell locations needed by the
+        // shim's /usr/bin/env bash shebang. Retaining the ambient PATH made a
+        // failed account-scope setup fall through to the operator's real
+        // Codex CLI instead of failing the test hermetically.
         let mut new_path = std::ffi::OsString::from(bin.to_str().unwrap());
-        if let Some(prior) = prior_path.as_ref() {
-            new_path.push(":");
-            new_path.push(prior);
-        }
+        new_path.push(":/usr/bin:/bin");
         // SAFETY: tests mutate env vars sequentially here. ENV_LOCK above
         // ensures no parallel test from this module can interleave; the
         // per-test temp dir + `nanos` suffix is defense-in-depth in case
         // a future contributor adds a test that does NOT take the lock.
         unsafe { std::env::set_var("PATH", &new_path) };
         let prior_home = std::env::var_os("HOME");
+        let prior_codex_home = std::env::var_os("CODEX_HOME");
         unsafe { std::env::set_var("HOME", dir.to_str().unwrap()) };
+        unsafe { std::env::set_var("CODEX_HOME", dir.join("codex-home")) };
 
         let result = ChainLlm.judge("hello-router-prompt");
 
@@ -11824,6 +11828,11 @@ mod chain_llm_fallback_argv_tests {
                 std::env::set_var("HOME", prior);
             } else {
                 std::env::remove_var("HOME");
+            }
+            if let Some(prior) = prior_codex_home {
+                std::env::set_var("CODEX_HOME", prior);
+            } else {
+                std::env::remove_var("CODEX_HOME");
             }
             if let Some(prior) = prior_path {
                 std::env::set_var("PATH", prior);
@@ -11882,13 +11891,12 @@ mod chain_llm_fallback_argv_tests {
 
         let prior_path = std::env::var_os("PATH");
         let mut new_path = std::ffi::OsString::from(bin.to_str().unwrap());
-        if let Some(prior) = prior_path.as_ref() {
-            new_path.push(":");
-            new_path.push(prior);
-        }
+        new_path.push(":/usr/bin:/bin");
         unsafe { std::env::set_var("PATH", &new_path) };
         let prior_home = std::env::var_os("HOME");
+        let prior_codex_home = std::env::var_os("CODEX_HOME");
         unsafe { std::env::set_var("HOME", dir.to_str().unwrap()) };
+        unsafe { std::env::set_var("CODEX_HOME", dir.join("codex-home")) };
 
         let result = ChainLlm.judge("boundary-check");
 
@@ -11897,6 +11905,11 @@ mod chain_llm_fallback_argv_tests {
                 std::env::set_var("HOME", prior);
             } else {
                 std::env::remove_var("HOME");
+            }
+            if let Some(prior) = prior_codex_home {
+                std::env::set_var("CODEX_HOME", prior);
+            } else {
+                std::env::remove_var("CODEX_HOME");
             }
             if let Some(prior) = prior_path {
                 std::env::set_var("PATH", prior);
