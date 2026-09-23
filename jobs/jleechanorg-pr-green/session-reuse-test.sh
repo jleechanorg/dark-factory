@@ -389,6 +389,62 @@ assert_eq "$(printf '%s\n' "$indexed_result" | sed -n '1p')" "$indexed_id"
   exit 1
 }
 
+# Multiple valid indexed rows must return success even when a nonselected row
+# is the final match inspected by the output loop.
+indexed_multi_best='native-session-indexed-best'
+indexed_multi_old='native-session-indexed-old-valid'
+for indexed_multi_spec in \
+  "$indexed_multi_best|2026-09-23T16:05:00Z|registry-rollout-$indexed_multi_best.jsonl" \
+  "$indexed_multi_old|2026-09-23T16:04:00Z|registry-rollout-$indexed_multi_old.jsonl"; do
+  IFS='|' read -r indexed_multi_id indexed_multi_timestamp indexed_multi_relative <<<"$indexed_multi_spec"
+  printf '%s\n' '{"type":"session_meta","payload":{"session_id":"'"$indexed_multi_id"'","cwd":"'"$recovery_workspace"'"},"timestamp":"'"$indexed_multi_timestamp"'"}' \
+    >"$indexed_home/$indexed_multi_relative"
+done
+export PR_GREEN_INDEXED_ROWS="$indexed_multi_best"$'\t'"$indexed_home/registry-rollout-$indexed_multi_best.jsonl"$'\t'1727107500$'\t'1727107500
+export PR_GREEN_INDEXED_ROWS+=$'\n'"$indexed_multi_old"$'\t'"$indexed_home/registry-rollout-$indexed_multi_old.jsonl"$'\t'1727107440$'\t'1727107440
+set +e
+indexed_multi_result="$(pr_green_find_native_rollouts "$recovery_workspace" '2026-09-23T16:00:00Z')"
+indexed_multi_rc=$?
+set -e
+assert_eq "$indexed_multi_rc" 0
+assert_eq "$(printf '%s\n' "$indexed_multi_result" | sed -n '1p')" "$indexed_multi_best"
+
+# The legacy scan has the same output-loop contract: a valid selection must
+# return zero even when another valid rollout follows it in traversal order.
+legacy_multi_home="$recovery_dir/legacy-multi-codex"
+mkdir -p "$legacy_multi_home/sessions/2026/09/23"
+legacy_multi_best='native-session-legacy-best'
+legacy_multi_old='native-session-legacy-old-valid'
+printf '%s\n' '{"type":"session_meta","payload":{"session_id":"'"$legacy_multi_best"'","cwd":"'"$recovery_workspace"'"},"timestamp":"2026-09-23T16:07:00Z"}' \
+  >"$legacy_multi_home/sessions/2026/09/23/rollout-a-$legacy_multi_best.jsonl"
+printf '%s\n' '{"type":"session_meta","payload":{"session_id":"'"$legacy_multi_old"'","cwd":"'"$recovery_workspace"'"},"timestamp":"2026-09-23T16:06:00Z"}' \
+  >"$legacy_multi_home/sessions/2026/09/23/rollout-z-$legacy_multi_old.jsonl"
+unset PR_GREEN_TEST_INDEXED_ROWS PR_GREEN_INDEXED_ROWS
+export PR_GREEN_CODEX_HOME_CANDIDATES="$legacy_multi_home"
+set +e
+legacy_multi_result="$(pr_green_find_native_rollouts "$recovery_workspace" '2026-09-23T16:00:00Z')"
+legacy_multi_rc=$?
+set -e
+assert_eq "$legacy_multi_rc" 0
+assert_eq "$(printf '%s\n' "$legacy_multi_result" | sed -n '1p')" "$legacy_multi_best"
+
+# One readable but empty registry must not suppress the legacy scan in a
+# distinct candidate home that has no queryable registry.
+mixed_indexed_home="$recovery_dir/indexed-empty-codex"
+mkdir -p "$mixed_indexed_home/sessions/2026/09/23"
+: >"$mixed_indexed_home/state_5.sqlite"
+export PR_GREEN_CODEX_HOME_CANDIDATES="$mixed_indexed_home:$recovery_source"
+export PR_GREEN_TEST_INDEXED_ROWS=1
+unset PR_GREEN_INDEXED_ROWS
+set +e
+mixed_result="$(pr_green_find_native_rollouts "$recovery_workspace" '2026-09-23T16:00:00Z')"
+mixed_rc=$?
+set -e
+assert_eq "$mixed_rc" 0
+assert_eq "$(printf '%s\n' "$mixed_result" | sed -n '1p')" native-session-dead
+
+export PR_GREEN_CODEX_HOME_CANDIDATES="$indexed_home"
+
 ambiguous_a='native-session-ambiguous-a'
 ambiguous_b='native-session-ambiguous-b'
 for ambiguous_id in "$ambiguous_a" "$ambiguous_b"; do

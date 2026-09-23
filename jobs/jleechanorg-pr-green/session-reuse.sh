@@ -68,17 +68,18 @@ pr_green_session_recovery_row() {
 
 # Query Codex's indexed thread registry before touching the session tree. A
 # successful query is authoritative: an invalid or ambiguous row must not
-# fall through to a filesystem "newest" guess. Return 2 only when no registry
-# could be queried, allowing the legacy scan to handle older Codex homes.
+# fall through to a filesystem "newest" guess. Return 2 when any candidate
+# home lacks a queryable registry, allowing the legacy scan to handle mixed
+# Codex homes and older profiles safely.
 pr_green_find_native_rollouts_indexed() {
   local workspace="$1"
   local created_at="${2:-}" wanted_id="${3:-}"
   local cutoff_epoch='' created_at_clean='' home db escaped_workspace rows
   local candidate_id rollout_path first metadata_id metadata_cwd metadata_timestamp metadata_epoch
   local source_home relative match best_id='' best_timestamp='' candidate_timestamp
-  local registry_available=0 best_ties=0
+  local best_ties=0
   local -a homes=() matches=()
-  local -A seen_ids=() id_timestamps=()
+  local -A seen_homes=() registry_queryable=() seen_ids=() id_timestamps=()
   local candidates="${PR_GREEN_CODEX_HOME_CANDIDATES:-${HOME}/.codex:${CODEX_HOME:-${HOME}/.codex-dark-factory}}"
 
   if [[ -n "$created_at" ]]; then
@@ -96,12 +97,15 @@ pr_green_find_native_rollouts_indexed() {
   for home in "${homes[@]}"; do
     [[ -n "$home" ]] || continue
     home="${home%/}"
+    [[ -n "${seen_homes[$home]+yes}" ]] && continue
+    seen_homes["$home"]=1
+    registry_queryable["$home"]=0
     for db in "$home/state_5.sqlite" "$home/state.sqlite"; do
       [[ -r "$db" ]] || continue
       if ! rows="$(sqlite3 -readonly -noheader -separator $'\t' "$db" "SELECT id,rollout_path,updated_at,created_at FROM threads WHERE cwd = '$escaped_workspace' ORDER BY updated_at DESC;" 2>/dev/null)"; then
         continue
       fi
-      registry_available=1
+      registry_queryable["$home"]=1
       while IFS=$'\t' read -r candidate_id rollout_path _ _; do
         [[ -n "$candidate_id" && -n "$rollout_path" ]] || continue
         [[ -n "$wanted_id" && "$candidate_id" != "$wanted_id" ]] && continue
@@ -134,7 +138,10 @@ pr_green_find_native_rollouts_indexed() {
       done <<<"$rows"
     done
   done
-  ((registry_available == 1)) || return 2
+  ((${#seen_homes[@]} > 0)) || return 2
+  for home in "${!seen_homes[@]}"; do
+    ((registry_queryable[$home] == 1)) || return 2
+  done
   if [[ -n "$wanted_id" ]]; then
     [[ -n "${seen_ids[$wanted_id]+yes}" ]] || return 1
     best_id="$wanted_id"
@@ -157,6 +164,7 @@ pr_green_find_native_rollouts_indexed() {
   for match in "${matches[@]}"; do
     [[ "${match%%$'\t'*}" == "$best_id" ]] && printf '%s\n' "$match"
   done
+  return 0
 }
 
 # Discover the exact Codex conversation for one AO workspace. A session_meta
@@ -252,6 +260,7 @@ pr_green_find_native_rollouts() {
   for match in "${matches[@]}"; do
     [[ "${match%%$'\t'*}" == "$best_id" ]] && printf '%s\n' "$match"
   done
+  return 0
 }
 
 # Copy all exact rollout segments for a unique native conversation into the
