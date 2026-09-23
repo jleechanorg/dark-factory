@@ -368,6 +368,7 @@ SAFETY AND DELIVERY
 - Never force-push.
 - Never change credentials.
 - Never weaken tests merely to make them pass.
+- Never manufacture an empty or no-op commit, bypass hooks, or wrap/replace push tools to obtain a receipt or satisfy delivery metrics.
 - Run the narrowest relevant tests covering both the PR behavior and current-base contract, then the repository's required checks.
 - Commit with an explicit message. Push normally only after the integrated tests and required checks are green.
 - Before any push, invoke the job-owned receipt helper exactly as follows; do not use a bare git push:
@@ -380,6 +381,7 @@ SAFETY AND DELIVERY
     --commit-url "https://github.com/jleechanorg/${repo}/commit/\$after_sha" \
     --worktree "\$PWD" --ledger "${METRICS_DIR}/push-receipts.jsonl"
 - The helper performs the normal push and records the verified receipt. Never invent or copy an AO/native session id.
+- If the push succeeds but receipt/verification remains pending or unavailable, preserve the exact before/after SHAs and logs, do not create another commit or push solely to obtain a metric/receipt, and report verification pending.
 
 Current signals: mergeable=${mergeable:-unknown}; failing_checks=${failures:-none}.
 EOF
