@@ -8473,8 +8473,11 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
     // Fix the coder vendor so the reviewer priority list (and therefore
     // which two fake binaries get dispatched) is deterministic regardless
     // of the ambient environment.
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
+        ("MINIMAX_API_KEY", "test-fake-minimax-key"),
+    ]);
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -8669,8 +8672,11 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
     // Fix the coder vendor so the reviewer priority list (and therefore
     // which two fake binaries get dispatched) is deterministic regardless
     // of the ambient environment.
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
+        ("MINIMAX_API_KEY", "test-fake-minimax-key"),
+    ]);
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -9071,8 +9077,11 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
 
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
+        ("MINIMAX_API_KEY", "test-fake-minimax-key"),
+    ]);
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -9991,8 +10000,11 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
 
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
+    let _env_guard = EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
+        ("MINIMAX_API_KEY", "test-fake-minimax-key"),
+    ]);
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
