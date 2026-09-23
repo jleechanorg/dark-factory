@@ -71,6 +71,10 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" \
       and (($receipt.repo // "") | tostring | length) > 0
       and (($receipt.session_id // $receipt.session // "") | tostring | length) > 0
       and (($receipt.pushed_at // "") | tostring | length) > 0
+      and (($receipt.repo | type) == "string")
+      and (($receipt.repo | test("^[A-Za-z0-9._-]+$")))
+      and (($receipt.number | type) == "number")
+      and ($receipt.number > 0)
       and ($receipt.repo == (.repo // ""))
       and ($receipt.after_sha == (.head_after // ""))
       and (($receipt.commit_url | tostring) | contains("/commit/" + ($receipt.after_sha | tostring)));
@@ -87,11 +91,17 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" \
       | {
           repo: ($receipt.repo // ""),
           number: ($receipt.number // 0),
-          url: ($receipt.pr_url // $receipt.url // "PR URL unavailable"),
+          url: ($receipt.pr_url // $receipt.url // ("https://github.com/jleechanorg/" + ($receipt.repo // "") + "/pull/" + (($receipt.number // 0) | tostring))),
           head_after: ($receipt.after_sha // ""),
           push_receipt: $receipt
         })) as $ledger_records |
-  ($all_outcomes | map(select((.push_receipt? // null) != null))) as $legacy_records |
+  ($all_outcomes
+    | map(select((.push_receipt? // null) != null)
+      | . as $outcome
+      | ($outcome + {push_receipt: ($outcome.push_receipt + {
+          repo: ($outcome.push_receipt.repo // $outcome.repo),
+          number: ($outcome.push_receipt.number // $outcome.number)
+        })}))) as $legacy_records |
   ($ledger_records + $legacy_records) as $push_records |
   ($runs | sort_by(.ts // 0) | last // {}) as $latest_run |
   ($discoveries
@@ -193,7 +203,7 @@ Selected $(jq -r '.latest_run.selected // 0' <<<"$summary"); dispatched $(jq -r 
 Deferred: busy $(jq -r '.latest_run.busy_deferred // 0' <<<"$summary"); cooldown $(jq -r '.latest_run.cooldown_deferred // 0' <<<"$summary"); admission-cap $(jq -r '.latest_run.admission_deferred // 0' <<<"$summary"); delivery-unconfirmed $(jq -r '.latest_run.delivery_unconfirmed // 0' <<<"$summary")
 
 Exceptions: recovery-blocked $(jq -r '.recovery_blocked' <<<"$summary"); delivery-unconfirmed $(jq -r '.delivery_unconfirmed' <<<"$summary")
-Other outcomes: blocked $(jq -r '.blockers' <<<"$summary"), no change $(jq -r '.unchanged' <<<"$summary"), in progress $(jq -r '.in_progress' <<<"$summary"), dispatch failures $(jq -r '.dispatch_failures' <<<"$summary")
+Other outcomes (records; repeated PRs): blocked $(jq -r '.blockers' <<<"$summary"), no change $(jq -r '.unchanged' <<<"$summary"), in progress $(jq -r '.in_progress' <<<"$summary"), dispatch failures $(jq -r '.dispatch_failures' <<<"$summary")
 Coverage: runs $(jq -r '.runs' <<<"$summary"); complete discovery snapshots $(jq -r '.covered_runs' <<<"$summary")/$(jq -r '.runs' <<<"$summary"); observations $(jq -r '.discovered' <<<"$summary").
 Caveat: uncovered snapshots, legacy outcomes, and native-ack/push attribution not independently proven remain unknown—not zero.
 
