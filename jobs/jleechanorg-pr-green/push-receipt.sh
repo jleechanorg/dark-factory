@@ -84,6 +84,8 @@ main() {
   printf 'branch=%s\nupstream=%s\ntarget=%s:refs/heads/%s\n' "$branch" "$upstream" "$remote" "$target_branch" >&2
 
   local remote_before remote_after ls_line push_output push_url
+  local post_poll_attempts="${PR_GREEN_PUSH_POST_POLL_ATTEMPTS:-5}"
+  local post_poll_seconds="${PR_GREEN_PUSH_POST_POLL_SECONDS:-1}" post_attempt
   local -a push_urls=()
   mapfile -t push_urls < <(git -C "$worktree" config --get-all "remote.$remote.pushurl" 2>/dev/null || true)
   ((${#push_urls[@]} <= 1)) || { fail 'multiple push URLs are ambiguous'; return 1; }
@@ -97,6 +99,8 @@ main() {
   [[ "$remote_before" == "$before_sha" ]] || { fail 'remote PR head does not equal before SHA'; return 1; }
   git -C "$worktree" merge-base --is-ancestor "$before_sha" "$after_sha" \
     || { fail 'after SHA is not a descendant of before SHA; refusing rewrite'; return 1; }
+  [[ "$post_poll_attempts" =~ ^[1-9][0-9]*$ ]] || { fail 'invalid post-push poll attempts'; return 1; }
+  [[ "$post_poll_seconds" =~ ^[0-9]+$ ]] || { fail 'invalid post-push poll seconds'; return 1; }
 
   if [[ -s "$ledger" ]] && jq -e --arg repo "$repo" --argjson number "$number" --arg after "$after_sha" \
     'select(.repo == $repo and .number == $number and .after_sha == $after and .verified == true)' \
@@ -120,11 +124,7 @@ main() {
   remote_after="${ls_line%%$'\t'*}"
   [[ "$remote_after" == "$after_sha" ]] || { fail 'remote ref does not equal after SHA after push'; return 1; }
 
-  local post_json='' post_branch='' post_oid='' post_repo='' post_poll_attempts post_poll_seconds post_attempt
-  post_poll_attempts="${PR_GREEN_PUSH_POST_POLL_ATTEMPTS:-3}"
-  post_poll_seconds="${PR_GREEN_PUSH_POST_POLL_SECONDS:-1}"
-  [[ "$post_poll_attempts" =~ ^[1-9][0-9]*$ ]] || { fail 'invalid post-push poll attempts'; return 1; }
-  [[ "$post_poll_seconds" =~ ^[0-9]+$ ]] || { fail 'invalid post-push poll seconds'; return 1; }
+  local post_json='' post_branch='' post_oid='' post_repo=''
   for ((post_attempt = 1; post_attempt <= post_poll_attempts; post_attempt++)); do
     post_json="$(gh pr view "$pr_url" --json headRefName,headRefOid,headRepository,baseRefName 2>/dev/null || true)"
     post_branch="$(jq -r '.headRefName // empty' <<<"$post_json" 2>/dev/null || true)"
