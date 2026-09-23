@@ -66,6 +66,99 @@ pr_green_session_recovery_row() {
     2>/dev/null | head -n 1
 }
 
+# Query Codex's indexed thread registry before touching the session tree. A
+# successful query is authoritative: an invalid or ambiguous row must not
+# fall through to a filesystem "newest" guess. Return 2 only when no registry
+# could be queried, allowing the legacy scan to handle older Codex homes.
+pr_green_find_native_rollouts_indexed() {
+  local workspace="$1"
+  local created_at="${2:-}" wanted_id="${3:-}"
+  local cutoff_epoch='' created_at_clean='' home db escaped_workspace rows
+  local candidate_id rollout_path first metadata_id metadata_cwd metadata_timestamp metadata_epoch
+  local source_home relative match best_id='' best_timestamp='' candidate_timestamp
+  local registry_available=0 best_ties=0
+  local -a homes=() matches=()
+  local -A seen_ids=() id_timestamps=()
+  local candidates="${PR_GREEN_CODEX_HOME_CANDIDATES:-${HOME}/.codex:${CODEX_HOME:-${HOME}/.codex-dark-factory}}"
+
+  if [[ -n "$created_at" ]]; then
+    if [[ "$created_at" == *Z ]]; then
+      cutoff_epoch="$(date -u -d "$created_at" +%s 2>/dev/null || true)"
+    else
+      created_at_clean="${created_at%%.*}"
+      created_at_clean="${created_at_clean%% +*}"
+      cutoff_epoch="$(date -u -d "$created_at_clean UTC" +%s 2>/dev/null || true)"
+    fi
+  fi
+  [[ "$workspace" != *$'\n'* && "$workspace" != *$'\r'* ]] || return 2
+  escaped_workspace="$(printf '%s' "$workspace" | sed "s/'/''/g")"
+  IFS=: read -r -a homes <<<"$candidates"
+  for home in "${homes[@]}"; do
+    [[ -n "$home" ]] || continue
+    home="${home%/}"
+    for db in "$home/state_5.sqlite" "$home/state.sqlite"; do
+      [[ -r "$db" ]] || continue
+      if ! rows="$(sqlite3 -readonly -noheader -separator $'\t' "$db" "SELECT id,rollout_path,updated_at,created_at FROM threads WHERE cwd = '$escaped_workspace' ORDER BY updated_at DESC;" 2>/dev/null)"; then
+        continue
+      fi
+      registry_available=1
+      while IFS=$'\t' read -r candidate_id rollout_path _ _; do
+        [[ -n "$candidate_id" && -n "$rollout_path" ]] || continue
+        [[ -n "$wanted_id" && "$candidate_id" != "$wanted_id" ]] && continue
+        [[ -n "$wanted_id" || "$candidate_id" =~ ^[[:alnum:]-]{16,}$ ]] || continue
+        case "$rollout_path" in
+          /*) ;;
+          *) rollout_path="$home/$rollout_path" ;;
+        esac
+        [[ -f "$rollout_path" && ! -L "$rollout_path" ]] || continue
+        first="$(head -n 1 "$rollout_path" 2>/dev/null || true)"
+        metadata_id="$(jq -r 'select(.type == "session_meta") | (.payload.session_id // .payload.id // empty)' <<<"$first" 2>/dev/null || true)"
+        metadata_cwd="$(jq -r 'select(.type == "session_meta") | .payload.cwd // empty' <<<"$first" 2>/dev/null || true)"
+        metadata_timestamp="$(jq -r 'select(.type == "session_meta") | .timestamp // .payload.timestamp // empty' <<<"$first" 2>/dev/null || true)"
+        [[ "$metadata_id" == "$candidate_id" && "$metadata_cwd" == "$workspace" ]] || continue
+        if [[ -n "$cutoff_epoch" ]]; then
+          [[ -n "$metadata_timestamp" ]] || continue
+          metadata_epoch="$(date -u -d "$metadata_timestamp" +%s 2>/dev/null || true)"
+          [[ -n "$metadata_epoch" && "$metadata_epoch" -ge "$cutoff_epoch" ]] || continue
+        fi
+        seen_ids["$candidate_id"]=1
+        if [[ -z "${id_timestamps[$candidate_id]+yes}" || "$metadata_timestamp" > "${id_timestamps[$candidate_id]}" ]]; then
+          id_timestamps["$candidate_id"]="$metadata_timestamp"
+        fi
+        case "$rollout_path" in
+          "$home"/*) source_home="$home"; relative="${rollout_path#$home/}" ;;
+          /*) source_home=/; relative="${rollout_path#/}" ;;
+          *) continue ;;
+        esac
+        matches+=("$candidate_id"$'\t'"$source_home"$'\t'"$relative")
+      done <<<"$rows"
+    done
+  done
+  ((registry_available == 1)) || return 2
+  if [[ -n "$wanted_id" ]]; then
+    [[ -n "${seen_ids[$wanted_id]+yes}" ]] || return 1
+    best_id="$wanted_id"
+  else
+    for candidate_id in "${!seen_ids[@]}"; do
+      candidate_timestamp="${id_timestamps[$candidate_id]}"
+      [[ -n "$candidate_timestamp" ]] || continue
+      if [[ -z "$best_id" || "$candidate_timestamp" > "$best_timestamp" ]]; then
+        best_id="$candidate_id"
+        best_timestamp="$candidate_timestamp"
+        best_ties=0
+      elif [[ "$candidate_timestamp" == "$best_timestamp" ]]; then
+        best_ties=$((best_ties + 1))
+      fi
+    done
+    ((best_ties == 0)) || return 1
+  fi
+  [[ -n "$best_id" ]] || return 1
+  printf '%s\n' "$best_id"
+  for match in "${matches[@]}"; do
+    [[ "${match%%$'\t'*}" == "$best_id" ]] && printf '%s\n' "$match"
+  done
+}
+
 # Discover the exact Codex conversation for one AO workspace. A session_meta
 # record is authoritative only when its first record names the exact workspace;
 # the newest timestamp-qualified native id wins, while an exact timestamp tie
@@ -75,10 +168,17 @@ pr_green_find_native_rollouts() {
   local workspace="$1"
   local created_at="${2:-}" wanted_id="${3:-}" cutoff_epoch='' created_at_clean='' home file first metadata_id metadata_cwd metadata_timestamp metadata_epoch relative
   local best_id='' best_timestamp='' candidate_id candidate_timestamp best_ties=0
+  local indexed_result indexed_rc=0
   local -a homes=()
   local -A seen_homes=() seen_ids=() id_timestamps=()
   local -a matches=()
   local candidates="${PR_GREEN_CODEX_HOME_CANDIDATES:-${HOME}/.codex:${CODEX_HOME:-${HOME}/.codex-dark-factory}}"
+
+  indexed_result="$(pr_green_find_native_rollouts_indexed "$workspace" "$created_at" "$wanted_id" 2>/dev/null)" || indexed_rc=$?
+  if ((indexed_rc == 0 || indexed_rc == 1)); then
+    [[ -n "$indexed_result" ]] && printf '%s\n' "$indexed_result"
+    return "$indexed_rc"
+  fi
 
   if [[ -n "$created_at" ]]; then
     if [[ "$created_at" == *Z ]]; then

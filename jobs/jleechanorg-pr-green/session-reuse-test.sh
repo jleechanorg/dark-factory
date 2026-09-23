@@ -41,7 +41,13 @@ export PR_GREEN_RECOVERY_STATE="$recovery_state"
 export PR_GREEN_DELIVERY_STATE_DIR="$recovery_dir/delivery"
 cat >"$recovery_bin/sqlite3" <<'EOF'
 #!/usr/bin/env bash
-if [[ "$*" == *"SELECT runtime_handle_id"* && "$*" == *"'wa-busy'"* ]]; then
+if [[ "$*" == *"FROM threads"* ]]; then
+  if [[ "${PR_GREEN_TEST_INDEXED_ROWS:-0}" == 1 ]]; then
+    printf '%s\n' "${PR_GREEN_INDEXED_ROWS:-}"
+    exit 0
+  fi
+  exit 1
+elif [[ "$*" == *"SELECT runtime_handle_id"* && "$*" == *"'wa-busy'"* ]]; then
   printf '%s\n' 'worldarchitect-ai-777-deadbeef'
 elif [[ "$*" == *"SELECT runtime_handle_id"* && "$*" == *"'wa-live'"* ]]; then
   printf '%s\n' 'worldarchitect-ai-123-native'
@@ -363,5 +369,65 @@ if [[ "$rc" -ne 1 ]]; then
   printf 'expected no-session lookup to return 1\n' >&2
   exit 1
 fi
+
+# The Codex thread registry is the bounded fast path when its schema/query is
+# available. Its rows still require exact rollout metadata identity, and an
+# equal timestamp must fail closed rather than guessing a conversation.
+indexed_home="$recovery_dir/indexed-codex"
+mkdir -p "$indexed_home/sessions/2026/09/23"
+: >"$indexed_home/state_5.sqlite"
+indexed_id='native-session-indexed'
+indexed_rollout="$indexed_home/registry-rollout-$indexed_id.jsonl"
+printf '%s\n' '{"type":"session_meta","payload":{"session_id":"'"$indexed_id"'","cwd":"'"$recovery_workspace"'"},"timestamp":"2026-09-23T16:02:00Z"}' >"$indexed_rollout"
+export PR_GREEN_CODEX_HOME_CANDIDATES="$indexed_home"
+export PR_GREEN_TEST_INDEXED_ROWS=1
+export PR_GREEN_INDEXED_ROWS="$indexed_id"$'\t'"$indexed_rollout"$'\t'1727107320$'\t'1727107320
+indexed_result="$(pr_green_find_native_rollouts "$recovery_workspace" '2026-09-23T16:00:00Z' "$indexed_id")"
+assert_eq "$(printf '%s\n' "$indexed_result" | sed -n '1p')" "$indexed_id"
+[[ "$indexed_result" == *$'\t'"$indexed_home"$'\t'"registry-rollout-$indexed_id.jsonl" ]] || {
+  printf 'indexed lookup did not return the exact rollout mapping\n' >&2
+  exit 1
+}
+
+ambiguous_a='native-session-ambiguous-a'
+ambiguous_b='native-session-ambiguous-b'
+for ambiguous_id in "$ambiguous_a" "$ambiguous_b"; do
+  ambiguous_rollout="$indexed_home/sessions/2026/09/23/rollout-$ambiguous_id.jsonl"
+  printf '%s\n' '{"type":"session_meta","payload":{"session_id":"'"$ambiguous_id"'","cwd":"'"$recovery_workspace"'"},"timestamp":"2026-09-23T16:03:00Z"}' >"$ambiguous_rollout"
+done
+export PR_GREEN_INDEXED_ROWS="$ambiguous_a"$'\t'"$indexed_home/sessions/2026/09/23/rollout-$ambiguous_a.jsonl"$'\t'1727107380$'\t'1727107380
+export PR_GREEN_INDEXED_ROWS+=$'\n'"$ambiguous_b"$'\t'"$indexed_home/sessions/2026/09/23/rollout-$ambiguous_b.jsonl"$'\t'1727107380$'\t'1727107380
+if pr_green_find_native_rollouts "$recovery_workspace" '' >/dev/null 2>&1; then
+  printf 'indexed lookup guessed across an equal timestamp\n' >&2
+  exit 1
+fi
+
+indexed_bad='native-session-indexed-bad'
+indexed_bad_rollout="$indexed_home/sessions/2026/09/23/rollout-$indexed_bad.jsonl"
+printf '%s\n' '{"type":"session_meta","payload":{"session_id":"native-session-other","cwd":"'"$recovery_workspace"'"},"timestamp":"2026-09-23T16:04:00Z"}' >"$indexed_bad_rollout"
+export PR_GREEN_INDEXED_ROWS="$indexed_bad"$'\t'"$indexed_bad_rollout"$'\t'1727107440$'\t'1727107440
+if pr_green_find_native_rollouts "$recovery_workspace" '' "$indexed_bad" >/dev/null 2>&1; then
+  printf 'indexed lookup accepted a mismatched session identity\n' >&2
+  exit 1
+fi
+
+indexed_old='native-session-indexed-old'
+indexed_old_rollout="$indexed_home/sessions/2026/09/23/rollout-$indexed_old.jsonl"
+printf '%s\n' '{"type":"session_meta","payload":{"session_id":"'"$indexed_old"'","cwd":"'"$recovery_workspace"'"},"timestamp":"2026-09-23T15:00:00Z"}' >"$indexed_old_rollout"
+export PR_GREEN_INDEXED_ROWS="$indexed_old"$'\t'"$indexed_old_rollout"$'\t'1727103600$'\t'1727103600
+if pr_green_find_native_rollouts "$recovery_workspace" '2026-09-23T16:00:00Z' "$indexed_old" >/dev/null 2>&1; then
+  printf 'indexed lookup accepted a rollout older than the creation cutoff\n' >&2
+  exit 1
+fi
+
+# A missing/unsupported registry schema keeps the legacy scan available for
+# older Codex homes; this is the only condition that permits that fallback.
+unset PR_GREEN_TEST_INDEXED_ROWS PR_GREEN_INDEXED_ROWS
+export PR_GREEN_CODEX_HOME_CANDIDATES="$recovery_source:$recovery_home"
+fallback_result="$(pr_green_find_native_rollouts "$recovery_workspace" '2026-09-23T16:00:00Z' 'native-session-dead')"
+[[ "$fallback_result" == *'native-session-dead'* ]] || {
+  printf 'registry-unavailable fallback did not recover the legacy rollout\n' >&2
+  exit 1
+}
 
 printf 'session reuse tests passed\n'
