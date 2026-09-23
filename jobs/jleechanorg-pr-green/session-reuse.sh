@@ -919,8 +919,11 @@ pr_green_delivery_submit_pending_recovery() {
     return 1
   fi
   if [[ "$current_ack" =~ ^[0-9]+$ && "$current_ack" -gt "$baseline" ]]; then
-    pr_green_delivery_clear_pending "$project_id" "$pr_number"
-    return $?
+    if pr_green_delivery_clear_pending "$project_id" "$pr_number"; then
+      rmdir -- "$claim_path" 2>/dev/null || true
+      return 0
+    fi
+    return 1
   fi
   envelope_digest="$(printf '%s' "$envelope" | sha256sum | awk '{print $1}')"
   if ! pr_green_delivery_mark_recovery_attempted "$path" "$evidence_path" "$runtime_handle" "$pane_id" "$envelope_digest"; then
@@ -929,8 +932,11 @@ pr_green_delivery_submit_pending_recovery() {
   fi
   tmux send-keys -t "$pane_id" Enter || return 1
   if pr_green_wait_for_delivery_ack "$refreshed_listing" "$envelope" "$legacy_envelope" "$baseline"; then
-    pr_green_delivery_clear_pending "$project_id" "$pr_number"
-    return $?
+    if pr_green_delivery_clear_pending "$project_id" "$pr_number"; then
+      rmdir -- "$claim_path" 2>/dev/null || true
+      return 0
+    fi
+    return 1
   fi
   return 2
 }
