@@ -3388,6 +3388,20 @@ fn go_ao_session_workspace_and_branch(
     }
 }
 
+fn go_ao_session_runtime_handle(project: &str, session_id: &str) -> Option<String> {
+    let conn = open_go_ao_db().ok()?;
+    let mut stmt = conn
+        .prepare("SELECT runtime_handle_id FROM sessions WHERE id = ?1 AND project_id = ?2")
+        .ok()?;
+    let mut rows = stmt.query([session_id, project]).ok()?;
+    rows.next()
+        .ok()??
+        .get::<_, Option<String>>(0)
+        .ok()
+        .flatten()
+        .filter(|handle| !handle.trim().is_empty())
+}
+
 #[cfg(target_os = "linux")]
 fn process_start_ticks(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -4736,32 +4750,18 @@ impl CliSessions {
         let out = String::from_utf8_lossy(&output.stdout).into_owned();
         let err_msg = String::from_utf8_lossy(&output.stderr).into_owned();
         let (session, workspace, observed_branch) = if is_go_ao() {
-            let session_id = out
-                .lines()
-                .find_map(|line| {
-                    let rest = line.strip_prefix("spawned session ")?;
-                    rest.split_whitespace().next().map(|s| s.to_string())
-                })
-                .ok_or_else(|| {
-                    if !output.status.success() {
-                        let harness = match agent {
-                            "antigravity" | "agy" => "agy",
-                            "claude" | "claude-code" => "claude-code",
-                            "codex" => "codex",
-                            other => other,
-                        };
-                        DaemonError::Tool {
-                            tool: format!("ao-go spawn --harness {harness}"),
-                            rc: output.status.code().unwrap_or(-1),
-                            stderr: err_msg.clone(),
-                        }
-                    } else {
-                        DaemonError::Parse(format!(
-                            "ao-go spawn produced no 'spawned session ' line: stdout={out}, stderr={err_msg}"
-                        ))
-                    }
-                })?;
-            let session = SessionId(session_id);
+            let session = match Self::classify_go_spawn_output(
+                agent,
+                output.status.success(),
+                output.status.code(),
+                &out,
+                &err_msg,
+            ) {
+                Ok(session) => session,
+                Err(spawn_error) => {
+                    self.recover_go_spawn_after_nonzero(spec, spawn_error, &out)?
+                }
+            };
             let (ws, branch) = go_ao_session_workspace_and_branch(&spec.ao_project, &session.0);
             let mut ws = ws;
             if ws.is_none() {
@@ -4876,6 +4876,104 @@ impl CliSessions {
         out.lines().find_map(|line| {
             let value = line.trim().strip_prefix("Branch:")?.trim();
             (!value.is_empty() && value != "-").then(|| value.to_string())
+        })
+    }
+
+    fn parse_go_spawn_session(out: &str) -> Option<String> {
+        out.lines().find_map(|line| {
+            let rest = line.strip_prefix("spawned session ")?;
+            rest.split_whitespace().next().map(str::to_string)
+        })
+    }
+
+    fn classify_go_spawn_output(
+        agent: &str,
+        success: bool,
+        code: Option<i32>,
+        out: &str,
+        err_msg: &str,
+    ) -> Result<SessionId, DaemonError> {
+        if !success {
+            let harness = match agent {
+                "antigravity" | "agy" => "agy",
+                "claude" | "claude-code" => "claude-code",
+                "codex" => "codex",
+                other => other,
+            };
+            return Err(DaemonError::Tool {
+                tool: format!("ao-go spawn --harness {harness}"),
+                rc: code.unwrap_or(-1),
+                stderr: err_msg.to_string(),
+            });
+        }
+
+        Self::parse_go_spawn_session(out)
+            .map(SessionId)
+            .ok_or_else(|| {
+                DaemonError::Parse(format!(
+                    "ao-go spawn produced no 'spawned session ' line: stdout={out}, stderr={err_msg}"
+                ))
+        })
+    }
+
+    fn go_ao_session_is_usable_for_spawn(
+        &self,
+        spec: &SpawnSpec,
+        session: &SessionId,
+    ) -> bool {
+        let (workspace, branch) = go_ao_session_workspace_and_branch(&spec.ao_project, &session.0);
+        let workspace = workspace.or_else(|| {
+            let home = operator_home()
+                .or_else(|_| std::env::var("HOME").map_err(|e| e.to_string()))
+                .ok()?;
+            let fallback = std::path::Path::new(&home)
+                .join(".ao/data/worktrees")
+                .join(&spec.ao_project)
+                .join(&session.0);
+            fallback.is_dir().then_some(fallback)
+        });
+        let workspace_ok = workspace
+            .as_ref()
+            .is_some_and(|path| path.is_absolute() && path.is_dir());
+        let branch_ok = branch.as_deref() == Some(spec.branch.as_str());
+        let runtime_ok = go_ao_session_runtime_handle(&spec.ao_project, &session.0)
+            .map(|handle| {
+                let target = format!("={handle}");
+                run_tool("tmux", &["has-session", "-t", &target], 5).is_ok()
+            })
+            .unwrap_or(false);
+        let activity_ok = matches!(
+            self.session_activity_within_in_project(session, &spec.ao_project, 30),
+            Ok(crate::tools::SessionActivity::Running | crate::tools::SessionActivity::Idle)
+        );
+        workspace_ok && branch_ok && runtime_ok && activity_ok
+    }
+
+    fn recover_go_spawn_after_nonzero(
+        &self,
+        spec: &SpawnSpec,
+        spawn_error: DaemonError,
+        out: &str,
+    ) -> Result<SessionId, DaemonError> {
+        let Some(session_id) = Self::parse_go_spawn_session(out) else {
+            return Err(spawn_error);
+        };
+        let session = SessionId(session_id);
+        if self.go_ao_session_is_usable_for_spawn(spec, &session) {
+            return Ok(session);
+        }
+
+        // The Go CLI emits the acknowledgement before its final attach-hint
+        // write. Keep an unverified acknowledged session for reconciliation;
+        // killing it here could destroy a valid worker whose output stream
+        // alone failed. SpawnCleanupFailed is the existing non-fallback error
+        // carrier that preserves the session identity for dispatch recovery.
+        Err(DaemonError::SpawnCleanupFailed {
+            session: session.0,
+            spawn_error: Box::new(spawn_error),
+            cleanup_error: Box::new(DaemonError::Config(
+                "ao-go acknowledged a session but its live workspace, branch, and activity could not be verified; preserving the session for reconciliation".to_string(),
+            )),
         })
     }
 
@@ -5287,6 +5385,29 @@ mod spawn_classification_tests {
             }
             other => panic!("expected DaemonError::Tool for an unrelated failure, got {other:?}"),
         }
+    }
+
+    /// Native Go AO can print its session acknowledgement before the command
+    /// exits nonzero. That partial acknowledgement is not a dispatch success:
+    /// the failed process must remain a tool failure even when stdout names a
+    /// session that would otherwise parse successfully.
+    #[test]
+    fn go_spawn_partial_ack_on_nonzero_exit_is_not_dispatch_success() {
+        let err = CliSessions::classify_go_spawn_output(
+            "codex",
+            false,
+            Some(1),
+            "spawned session sess-partial-ack (working)\n",
+            "spawn finalization failed",
+        )
+        .expect_err("nonzero Go AO spawn must not become a dispatched session");
+
+        assert!(matches!(
+            err,
+            DaemonError::Tool { ref tool, rc: 1, ref stderr }
+            if tool.contains("ao-go spawn --harness codex")
+                && stderr.contains("spawn finalization failed")
+        ));
     }
 
     /// Existing REQUEST= behavior (jleechan-5ia2) must be unaffected by this
@@ -13692,6 +13813,55 @@ mod go_ao_lifecycle_tests {
     use crate::tools::{SessionActivity, Sessions};
     use std::os::unix::fs::PermissionsExt;
 
+    fn fixture_repo(name: &str) -> (std::path::PathBuf, String) {
+        let root = std::env::temp_dir().join(format!(
+            "df_test_go_ao_repo_{name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/jleechanorg/dark-factory.git",
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        (root, head)
+    }
+
     #[test]
     fn go_ao_verify_bridge_compatibility_variants() {
         let _guard = crate::test_env_lock()
@@ -13799,6 +13969,7 @@ exit 1
 
     #[test]
     fn go_ao_workspace_validation_rejects_wrong_expected_revision() {
+        let (workspace, _) = fixture_repo("wrong_revision");
         let spec = SpawnSpec {
             bead_id: "go-workspace-validation".to_string(),
             branch: "factory/go-workspace-validation".to_string(),
@@ -13813,11 +13984,12 @@ exit 1
         };
         let error = validate_spawned_workspace(
             &spec,
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            &workspace,
             true,
         )
             .expect_err("Go AO must validate the reported workspace identity");
         assert!(error.to_string().contains("expected snapshot"), "{error}");
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -13825,11 +13997,7 @@ exit 1
         let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let head = std::process::Command::new("git")
-            .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
-            .output()
-            .unwrap();
-        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        let (workspace, head) = fixture_repo("isolated_workspace");
         let spec = SpawnSpec {
             bead_id: "go-isolated-workspace".to_string(),
             branch: "factory/go-isolated-workspace".to_string(),
@@ -13842,9 +14010,9 @@ exit 1
             managed_checkout: false,
             expected_cwd: Some(std::env::temp_dir().join("dispatch-base-checkout")),
         };
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert!(validate_spawned_workspace(&spec, workspace, true).is_ok());
-        assert!(validate_spawned_workspace(&spec, workspace, false).is_err());
+        assert!(validate_spawned_workspace(&spec, &workspace, true).is_ok());
+        assert!(validate_spawned_workspace(&spec, &workspace, false).is_err());
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -13997,6 +14165,161 @@ exit 1
         match prior_op_home {
             Some(v) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", v),
             None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn go_ao_partial_ack_adopts_only_verified_live_session() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_op_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+        let temp_home = std::env::temp_dir().join(format!(
+            "df_test_go_ao_partial_ack_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_home);
+        let workspace = temp_home.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ao_data = temp_home.join(".ao/data");
+        std::fs::create_dir_all(&ao_data).unwrap();
+        let tmux_tmpdir = temp_home.join("tmux-socket");
+        std::fs::create_dir_all(&tmux_tmpdir).unwrap();
+        let tmux_log = temp_home.join("tmux.log");
+        let fake_tmux = temp_home.join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$TMUX_TMPDIR\" \"$*\" >> '{}'\n[ \"$3\" = \"=runtime-live\" ]\n",
+                tmux_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &temp_home);
+        let prior_path = std::env::var_os("PATH");
+        let prior_tmux_tmpdir = std::env::var_os("TMUX_TMPDIR");
+        let path = format!(
+            "{}:{}",
+            temp_home.display(),
+            prior_path.as_deref().unwrap_or_default().to_string_lossy()
+        );
+        std::env::set_var("PATH", path);
+        std::env::set_var("TMUX_TMPDIR", &tmux_tmpdir);
+        let db_path = ao_data.join("ao.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                workspace_path TEXT,
+                branch TEXT,
+                project_id TEXT,
+                is_terminated INTEGER,
+                activity_state TEXT,
+                runtime_handle_id TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES (?1, ?2, ?3, ?4, 0, 'active', ?5)",
+            rusqlite::params![
+                "sess-live",
+                workspace.to_string_lossy().as_ref(),
+                "factory/partial-ack",
+                "proj-a",
+                "runtime-live"
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let sessions = CliSessions::new("org/proj-a", "codex");
+        let spec = SpawnSpec {
+            bead_id: "partial-ack".to_string(),
+            branch: "factory/partial-ack".to_string(),
+            prompt: "test".to_string(),
+            repo: "org/proj-a".to_string(),
+            ao_project: "proj-a".to_string(),
+            remote: "origin".to_string(),
+            local_checkout: None,
+            expected_revision: None,
+            managed_checkout: false,
+            expected_cwd: None,
+        };
+        let ack = "spawned session sess-live (working)\n";
+        let adopted = sessions
+            .recover_go_spawn_after_nonzero(
+                &spec,
+                DaemonError::Tool {
+                    tool: "ao-go spawn --harness codex".to_string(),
+                    rc: 1,
+                    stderr: "attach hint write failed".to_string(),
+                },
+                ack,
+            )
+            .expect("verified live worker must be adopted");
+        assert_eq!(adopted.0, "sess-live");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE sessions SET activity_state = 'idle', runtime_handle_id = 'runtime-missing' WHERE id = 'sess-live'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let terminated = sessions
+            .recover_go_spawn_after_nonzero(
+                &spec,
+                DaemonError::Tool {
+                    tool: "ao-go spawn --harness codex".to_string(),
+                    rc: 1,
+                    stderr: "attach hint write failed".to_string(),
+                },
+                ack,
+            )
+            .expect_err("terminated worker must not be adopted or retried");
+        assert!(matches!(
+            terminated,
+            DaemonError::SpawnCleanupFailed { ref session, .. } if session == "sess-live"
+        ));
+
+        let missing = sessions
+            .recover_go_spawn_after_nonzero(
+                &spec,
+                DaemonError::Tool {
+                    tool: "ao-go spawn --harness codex".to_string(),
+                    rc: 1,
+                    stderr: "attach hint write failed".to_string(),
+                },
+                "spawned session sess-missing (working)\n",
+            )
+            .expect_err("missing worker must not be adopted or retried");
+        assert!(matches!(
+            missing,
+            DaemonError::SpawnCleanupFailed { ref session, .. } if session == "sess-missing"
+        ));
+        let tmux_probe = std::fs::read_to_string(&tmux_log).unwrap();
+        assert!(tmux_probe.contains("|has-session -t =runtime-live"));
+
+        match prior_engine {
+            Some(value) => std::env::set_var("DARK_FACTORY_AO_ENGINE", value),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_op_home {
+            Some(value) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        match prior_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        match prior_tmux_tmpdir {
+            Some(value) => std::env::set_var("TMUX_TMPDIR", value),
+            None => std::env::remove_var("TMUX_TMPDIR"),
         }
         let _ = std::fs::remove_dir_all(&temp_home);
     }
