@@ -5,6 +5,10 @@ set -euo pipefail
 # jleechanorg, then hands only actionable PRs to AO. AO workers may push fixes;
 # they must never merge or force-push.
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=session-reuse.sh
+source "$SCRIPT_DIR/session-reuse.sh"
+
 WINDOW_HOURS="${PR_GREEN_WINDOW_HOURS:-24}"
 MAX_PRS="${PR_GREEN_MAX_PRS:-12}"
 DRY_RUN="${PR_GREEN_DRY_RUN:-0}"
@@ -45,6 +49,9 @@ if [[ -z "$prs" ]]; then
 fi
 
 dispatched=0
+selected=0
+reused=0
+restored=0
 while IFS=$'\t' read -r repo number title url updated; do
   [[ -n "$repo" && -n "$number" ]] || continue
   analyzed=$((analyzed + 1))
@@ -58,10 +65,11 @@ while IFS=$'\t' read -r repo number title url updated; do
     continue
   fi
   actionable=$((actionable + 1))
-  if (( dispatched >= MAX_PRS )); then
-    echo "$LOG_PREFIX cap reached ($MAX_PRS); leaving later actionable PRs for the next run"
-    break
+  if (( selected >= MAX_PRS )); then
+    echo "$LOG_PREFIX cap reached ($MAX_PRS); deferring $repo#$number to the next run"
+    continue
   fi
+  selected=$((selected + 1))
 
   prompt="Work on ${url} in ${repo}. This is an automated daily repair pass for a PR updated in the last ${WINDOW_HOURS} hours. Inspect the exact current PR head and base first. Fix only easy, clearly scoped test failures or mechanical merge conflicts that you can verify locally. Preserve product intent; do not broaden scope, rewrite history, force-push, merge the PR, or change credentials. Run the narrowest relevant tests, then the repository's required checks, commit with an explicit message, and push normally if and only if the fix is green. If the issue is ambiguous, risky, or not mechanically solvable, leave it untouched and report the blocker. Current signals: mergeable=${mergeable:-unknown}; failing_checks=${failures:-none}."
 
@@ -76,6 +84,28 @@ while IFS=$'\t' read -r repo number title url updated; do
   project_id="$repo"
   [[ "$repo" == "worldarchitect.ai" ]] && project_id="worldarchitect.ai"
   session_name="pr-${number}"
+  session_action=""
+  if session_action="$(pr_green_reuse_session "$project_id" "$number" "$prompt")"; then
+    attempted=$((attempted + 1))
+    case "$session_action" in
+      restored)
+        restored=$((restored + 1))
+        echo "$LOG_PREFIX restored and reused AO session for $repo#$number"
+        ;;
+      *)
+        reused=$((reused + 1))
+        echo "$LOG_PREFIX reused AO session for $repo#$number"
+        ;;
+    esac
+    continue
+  else
+    session_reuse_rc=$?
+    if [[ "$session_reuse_rc" -eq 2 ]]; then
+      attempted=$((attempted + 1))
+      echo "$LOG_PREFIX existing AO session for $repo#$number rejected update; skipping duplicate spawn" >&2
+      continue
+    fi
+  fi
   # AO serializes spawns per project; mirror that lock so candidates are
   # deferred instead of producing concurrent-spawn refusals.
   ao_spawn_lock="/run/user/${UID}/jleechanorg-pr-green-ao-${project_id}.lock"
@@ -99,7 +129,7 @@ while IFS=$'\t' read -r repo number title url updated; do
     # attached to the worker until the timeout. Treat durable creation proof as
     # success; do not kill the newly-created worker just because the CLI stayed
     # attached.
-    if grep -Eq 'SESSION=wa-[0-9]+|created and claimed PR|Worktree: ' "$spawn_err"; then
+    if pr_green_spawn_output_is_success "$spawn_err"; then
       echo "$LOG_PREFIX dispatched $repo#$number (AO session created; CLI wait bounded)"
       dispatched=$((dispatched + 1))
       rm -f "$spawn_err"
@@ -126,18 +156,18 @@ while IFS=$'\t' read -r repo number title url updated; do
     "${spawn_cmd[@]}" >/dev/null 2>&1 &
     echo "$LOG_PREFIX dispatched $repo#$number after AO registration"
     dispatched=$((dispatched + 1))
+    rm -f "$spawn_err"
+    continue
   fi
   rm -f "$spawn_err"
-  if [[ $? -eq 0 ]]; then
-    echo "$LOG_PREFIX dispatched $repo#$number"
-    dispatched=$((dispatched + 1))
-  fi
 done <<< "$prs"
 
 jq -n --argjson ts "$run_started" --argjson analyzed "$analyzed" \
   --argjson discovered "$discovered_count" \
-  --argjson actionable "$actionable" --argjson attempted "$attempted" \
-  --argjson dispatched "$dispatched" --argjson fixed_confirmed 0 \
-  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, actionable:$actionable, attempted:$attempted, dispatched:$dispatched, fixed_confirmed:$fixed_confirmed}' \
+  --argjson actionable "$actionable" --argjson selected "$selected" \
+  --argjson attempted "$attempted" \
+  --argjson dispatched "$dispatched" --argjson reused "$reused" \
+  --argjson restored "$restored" --argjson fixed_confirmed 0 \
+  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, fixed_confirmed:$fixed_confirmed}' \
   >> "$METRICS_DIR/runs.jsonl"
-echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable attempted=$attempted dispatched=$dispatched fixed_confirmed=0"
+echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored fixed_confirmed=0"
