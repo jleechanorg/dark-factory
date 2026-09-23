@@ -159,7 +159,7 @@ This repo is layer 1 only.
 - The AO repository is **read-only / reference only**. We almost never want to modify or open PRs against AO; all session liveness interpretation, reaping triggers, timeout logic, and promotion handling must live within `dark-factory` itself (e.g. in `daemon/src/adapters.rs` and `daemon/src/tick.rs`).
 - **Hard Safety Gate**: Agents must **NEVER** write or modify `agent-orchestrator` code unless the human operator explicitly provides the verbatim authorization: `AO CODE APPROVED`.
 - **AO CLI Wrapper Fidelity**: Host CLI wrappers for `ao` or any external tool must never modify, strip, or suppress machine-readable flags (such as `--json`, `--format`, `--porcelain`). Wrappers must pass through all arguments transparently to preserve downstream parsing contracts.
-- **Project Scoping**: All `ao status` and session management queries from `dark-factory` must be project-scoped using `-p <project>` to avoid scanning all registered host repositories and hitting rate limits or incurring unnecessary latency.
+- **Project Scoping**: Session inventory and management queries must be project-scoped using `-p <project>` to avoid scanning unrelated repositories. Go AO's `ao status --json` is a daemon-health probe, not a session inventory, and does not accept `-p`; use its exact health contract and retain project scoping on session queries.
 
 
 ### Durable artifacts vs. dorodango
