@@ -509,6 +509,35 @@ pr_green_native_prompt_count() {
   printf '%s\n' "$total"
 }
 
+# Count delivery envelopes in native USER response items. Unlike the ordinary
+# prompt counter above, this is deliberately scoped to persisted delivery
+# state: AO may prepend its raw CI request, but the complete known envelope
+# must still occur in the USER body. A nonce alone is never sufficient.
+pr_green_delivery_ack_count() {
+  local listing="$1" envelope="$2" legacy_envelope="${3:-}" line home relative file count total=0
+  local -a entries=()
+  [[ -n "$envelope" ]] || return 1
+  mapfile -t entries <<<"$listing"
+  ((${#entries[@]} >= 2)) || return 1
+  for line in "${entries[@]:1}"; do
+    [[ -n "$line" ]] || continue
+    home="${line#*$'\t'}"
+    relative="${home#*$'\t'}"
+    home="${home%%$'\t'*}"
+    file="$home/$relative"
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    count="$(jq -s --arg envelope "$envelope" --arg legacy_envelope "$legacy_envelope" '
+      [.[]
+       | select(.type == "response_item" and .payload.role == "user")
+       | ([.payload.content[]? | select(.type == "input_text") | .text] | join("")) as $body
+       | select(($body | contains($envelope)) or ($legacy_envelope != "" and ($body | contains($legacy_envelope))))]
+      | length
+    ' "$file" 2>/dev/null)" || return 1
+    total=$((total + count))
+  done
+  printf '%s\n' "$total"
+}
+
 pr_green_wait_for_native_prompt() {
   local listing="$1" prompt="$2" baseline="$3"
   local timeout_seconds="${4:-${PR_GREEN_NATIVE_ACK_TIMEOUT_SECONDS:-8}}"
@@ -517,6 +546,20 @@ pr_green_wait_for_native_prompt() {
   deadline=$((SECONDS + timeout_seconds))
   while :; do
     current="$(pr_green_native_prompt_count "$listing" "$prompt" 2>/dev/null || true)"
+    [[ "$current" =~ ^[0-9]+$ && "$current" -gt "$baseline" ]] && return 0
+    (( SECONDS >= deadline )) && return 1
+    sleep 0.25
+  done
+}
+
+pr_green_wait_for_delivery_ack() {
+  local listing="$1" envelope="$2" legacy_envelope="$3" baseline="$4"
+  local timeout_seconds="${5:-${PR_GREEN_NATIVE_ACK_TIMEOUT_SECONDS:-8}}"
+  local current deadline
+  [[ "$baseline" =~ ^[0-9]+$ && "$timeout_seconds" =~ ^[0-9]+$ ]] || return 1
+  deadline=$((SECONDS + timeout_seconds))
+  while :; do
+    current="$(pr_green_delivery_ack_count "$listing" "$envelope" "$legacy_envelope" 2>/dev/null || true)"
     [[ "$current" =~ ^[0-9]+$ && "$current" -gt "$baseline" ]] && return 0
     (( SECONDS >= deadline )) && return 1
     sleep 0.25
@@ -608,17 +651,18 @@ pr_green_delivery_clear_pending() {
 # or malformed record is deliberately pending: it must suppress a duplicate,
 # never become permission to send a new prompt.
 pr_green_delivery_pending_status() {
-  local project_id="$1" pr_number="$2" path pending listing count envelope native_id workspace
+  local project_id="$1" pr_number="$2" path pending listing count envelope legacy_envelope native_id workspace
   path="$(pr_green_delivery_pending_path "$project_id" "$pr_number")" || return 1
   [[ -s "$path" ]] || { printf '%s\n' none; return 0; }
   pending="$(cat -- "$path" 2>/dev/null || true)"
   native_id="$(jq -r '.native_id // empty' <<<"$pending" 2>/dev/null || true)"
   workspace="$(jq -r '.workspace // empty' <<<"$pending" 2>/dev/null || true)"
   envelope="$(jq -r '.envelope // empty' <<<"$pending" 2>/dev/null || true)"
+  legacy_envelope="$(jq -r '.legacy_envelope // empty' <<<"$pending" 2>/dev/null || true)"
   [[ -n "$native_id" && -n "$workspace" && -n "$envelope" ]] || { printf '%s\n' pending; return 0; }
   listing="$(pr_green_find_native_rollouts "$workspace" '' "$native_id" 2>/dev/null || true)"
   [[ -n "$listing" ]] || { printf '%s\n' pending; return 0; }
-  count="$(pr_green_native_prompt_count "$listing" "$envelope" 2>/dev/null || true)"
+  count="$(pr_green_delivery_ack_count "$listing" "$envelope" "$legacy_envelope" 2>/dev/null || true)"
   if [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]; then
     printf '%s\n' acked
   else
@@ -651,7 +695,7 @@ pr_green_delivery_upgrade_legacy() {
     printf '%s\n' pending
     return 0
   }
-  count="$(pr_green_native_prompt_count "$listing" "$old_envelope" 2>/dev/null || true)"
+  count="$(pr_green_delivery_ack_count "$listing" "$old_envelope" 2>/dev/null || true)"
   if [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]; then
     printf '%s\n' acked
     return 0
@@ -670,6 +714,164 @@ pr_green_delivery_upgrade_legacy() {
   fi
   mv -- "$tmp" "$path" || { rm -f -- "$tmp"; printf '%s\n' pending; return 0; }
   printf '%s\n' migrated
+}
+
+pr_green_delivery_recovery_composer_region() {
+  awk '
+    /^[[:space:]]*›[[:space:]]/ {
+      found=1
+      region=$0
+      sub(/^[[:space:]]*›[[:space:]]*/, "", region)
+      next
+    }
+    found && $0 ~ /^[[:space:]]*(\? for shortcuts|Esc to interrupt|Ctrl\+[A-Za-z])([[:space:]]|$)/ { exit }
+    found { region=region "\n" $0 }
+    END { if (found) print region }
+  '
+}
+
+pr_green_delivery_recovery_normalize() {
+  # TUI wrapping can split even an otherwise single token; remove only
+  # whitespace from both sides, preserving every non-whitespace byte.
+  tr -d '[:space:]'
+}
+
+pr_green_delivery_recovery_capture() {
+  local runtime_handle="$1" shape mode cursor_y pane_height
+  shape="$(tmux display-message -p -t "$runtime_handle" '#{pane_in_mode}:#{cursor_y}:#{pane_height}' 2>/dev/null || true)"
+  IFS=: read -r mode cursor_y pane_height <<<"$shape"
+  [[ "$mode" == 0 && "$cursor_y" =~ ^[0-9]+$ && "$pane_height" =~ ^[0-9]+$ && "$cursor_y" -lt "$pane_height" ]] || return 1
+  tmux capture-pane -p -t "$runtime_handle" -S 0 -E "$cursor_y" 2>/dev/null
+}
+
+pr_green_delivery_recovery_composer_matches() {
+  local region="$1" envelope="$2" legacy_envelope="${3:-}" normalized expected
+  normalized="$(pr_green_delivery_recovery_normalize <<<"$region")"
+  [[ -n "$normalized" ]] || return 1
+  for expected in "$envelope" "$legacy_envelope"; do
+    [[ -n "$expected" ]] || continue
+    expected="$(pr_green_delivery_recovery_normalize <<<"$expected")"
+    [[ -n "$expected" && "$normalized" == *"$expected" ]] && return 0
+  done
+  return 1
+}
+
+pr_green_delivery_recovery_identity() {
+  local project_id="$1" pr_number="$2" session_id="$3" native_id="$4" workspace="$5" expected_runtime="${6:-}"
+  local record fresh_session row row_workspace row_native row_terminated live_home intended_home runtime_handle
+  local -a row_fields=()
+  record="$(pr_green_session_record "$project_id" "$pr_number" 2>/dev/null || true)"
+  fresh_session="$(jq -r '.id // empty' <<<"$record" 2>/dev/null || true)"
+  [[ -n "$record" && "$fresh_session" == "$session_id" ]] || return 1
+  [[ "$(jq -r 'if (.isTerminated // false) then "true" else "false" end' <<<"$record" 2>/dev/null || true)" == false ]] || return 1
+  row="$(pr_green_session_recovery_row "$project_id" "$session_id" 2>/dev/null || true)"
+  IFS='|' read -r -a row_fields <<<"$row"
+  row_workspace="${row_fields[0]:-}"
+  row_native="${row_fields[1]:-}"
+  row_terminated="${row_fields[2]:-}"
+  [[ "$row_workspace" == "$workspace" && "$row_native" == "$native_id" && "$row_terminated" == 0 ]] || return 1
+  intended_home="${CODEX_HOME:-${PR_GREEN_CODEX_HOME:-$HOME/.codex-dark-factory}}"
+  [[ -d "$intended_home" && -s "$intended_home/auth.json" ]] || return 1
+  live_home="$(pr_green_live_codex_home "$project_id" "$session_id" "$workspace" 2>/dev/null || true)"
+  [[ "$live_home" == "$intended_home" ]] || return 1
+  pr_green_live_session_is_busy "$project_id" "$session_id" && return 2
+  runtime_handle="$(pr_green_runtime_handle "$project_id" "$session_id" 2>/dev/null || true)"
+  [[ -n "$runtime_handle" && ( -z "$expected_runtime" || "$runtime_handle" == "$expected_runtime" ) ]] || return 1
+  PR_GREEN_DELIVERY_RECOVERY_RUNTIME="$runtime_handle"
+}
+
+pr_green_delivery_mark_recovery_attempted() {
+  local path="$1" evidence_path="$2" tmp attempted_at
+  attempted_at="$(date +%s)"
+  [[ "$attempted_at" =~ ^[0-9]+$ ]] || return 1
+  tmp="$(mktemp "${path}.tmp.XXXXXX")" || return 1
+  if ! jq --argjson attempted_at "$attempted_at" --arg evidence_path "$evidence_path" \
+    '. + {submit_recovery_attempted_at:$attempted_at,submit_recovery_evidence_path:$evidence_path}' \
+    <"$path" >"$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  mv -- "$tmp" "$path" || { rm -f -- "$tmp"; return 1; }
+}
+
+# Submit only the already-visible pending composer draft. This never appends
+# text, interrupts, kills, restarts, or replays an AO message.
+pr_green_delivery_submit_pending_recovery() {
+  local project_id="$1" pr_number="$2" path pending session_id native_id workspace envelope legacy_envelope request_id
+  local listing baseline runtime_handle pane region normalized second_pane second_region second_normalized
+  local state_dir evidence_path tmp claim_path marker_count current_ack
+  path="$(pr_green_delivery_pending_path "$project_id" "$pr_number" 2>/dev/null || true)"
+  [[ -s "$path" ]] || return 1
+  pending="$(cat -- "$path" 2>/dev/null || true)"
+  session_id="$(jq -r '.session_id // empty' <<<"$pending" 2>/dev/null || true)"
+  native_id="$(jq -r '.native_id // empty' <<<"$pending" 2>/dev/null || true)"
+  workspace="$(jq -r '.workspace // empty' <<<"$pending" 2>/dev/null || true)"
+  envelope="$(jq -r '.envelope // empty' <<<"$pending" 2>/dev/null || true)"
+  legacy_envelope="$(jq -r '.legacy_envelope // empty' <<<"$pending" 2>/dev/null || true)"
+  request_id="$(jq -r '.request_id // empty' <<<"$pending" 2>/dev/null || true)"
+  [[ "$session_id" =~ ^[[:alnum:]._-]+$ && "$native_id" =~ ^[[:alnum:]-]{16,}$ && -n "$workspace" && -n "$envelope" ]] || return 1
+  [[ "$request_id" =~ ^[[:alnum:]_.-]+$ && "$envelope" == *"[PR_GREEN_DELIVERY_ID:$request_id]"* ]] || return 1
+  jq -e '(.submit_recovery_attempted_at // null) | numbers' <<<"$pending" >/dev/null 2>&1 && return 1
+  pr_green_delivery_recovery_identity "$project_id" "$pr_number" "$session_id" "$native_id" "$workspace" || return 1
+  runtime_handle="$PR_GREEN_DELIVERY_RECOVERY_RUNTIME"
+  listing="$(pr_green_find_native_rollouts "$workspace" '' "$native_id" 2>/dev/null || true)"
+  [[ -n "$listing" ]] || return 1
+  baseline="$(pr_green_delivery_ack_count "$listing" "$envelope" "$legacy_envelope" 2>/dev/null || true)"
+  [[ "$baseline" =~ ^[0-9]+$ && "$baseline" == 0 ]] || return 1
+
+  pane="$(pr_green_delivery_recovery_capture "$runtime_handle" 2>/dev/null || true)"
+  [[ -n "$pane" ]] || return 1
+  marker_count="$(grep -Ec '^[[:space:]]*›[[:space:]]' <<<"$pane" || true)"
+  [[ "$marker_count" == 1 ]] || return 1
+  region="$(pr_green_delivery_recovery_composer_region <<<"$pane")"
+  pr_green_delivery_recovery_composer_matches "$region" "$envelope" "$legacy_envelope" || return 1
+  normalized="$(pr_green_delivery_recovery_normalize <<<"$region")"
+  state_dir="$(dirname -- "$path")"
+  evidence_path="$state_dir/.${project_id}-${pr_number}-${request_id}.submit-recovery-pane"
+  tmp="$(mktemp "${evidence_path}.XXXXXX")" || return 1
+  if ! printf '%s\n' "$pane" >"$tmp" || ! chmod 600 -- "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  mv -- "$tmp" "$evidence_path" || { rm -f -- "$tmp"; return 1; }
+
+  # Re-read every identity and the composer immediately before the one Enter.
+  pending="$(cat -- "$path" 2>/dev/null || true)"
+  jq -e '(.submit_recovery_attempted_at // null) | numbers' <<<"$pending" >/dev/null 2>&1 && return 1
+  claim_path="${evidence_path}.lock"
+  mkdir -- "$claim_path" 2>/dev/null || return 1
+  if ! pr_green_delivery_recovery_identity "$project_id" "$pr_number" "$session_id" "$native_id" "$workspace" "$runtime_handle"; then
+    rmdir -- "$claim_path" 2>/dev/null || true
+    return 1
+  fi
+  second_pane="$(pr_green_delivery_recovery_capture "$runtime_handle" 2>/dev/null || true)"
+  [[ -n "$second_pane" ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
+  marker_count="$(grep -Ec '^[[:space:]]*›[[:space:]]' <<<"$second_pane" || true)"
+  if [[ "$marker_count" != 1 ]]; then
+    rmdir -- "$claim_path" 2>/dev/null || true
+    return 1
+  fi
+  second_region="$(pr_green_delivery_recovery_composer_region <<<"$second_pane")"
+  second_normalized="$(pr_green_delivery_recovery_normalize <<<"$second_region")"
+  if [[ "$second_normalized" != "$normalized" ]] || ! pr_green_delivery_recovery_composer_matches "$second_region" "$envelope" "$legacy_envelope"; then
+    rmdir -- "$claim_path" 2>/dev/null || true
+    return 1
+  fi
+  current_ack="$(pr_green_delivery_ack_count "$listing" "$envelope" "$legacy_envelope" 2>/dev/null || true)"
+  if [[ "$current_ack" =~ ^[0-9]+$ && "$current_ack" -gt "$baseline" ]]; then
+    pr_green_delivery_clear_pending "$project_id" "$pr_number"
+    return $?
+  fi
+  if ! pr_green_delivery_mark_recovery_attempted "$path" "$evidence_path"; then
+    rmdir -- "$claim_path" 2>/dev/null || true
+    return 1
+  fi
+  tmux send-keys -t "$runtime_handle" Enter || return 1
+  if pr_green_wait_for_delivery_ack "$listing" "$envelope" "$legacy_envelope" "$baseline"; then
+    pr_green_delivery_clear_pending "$project_id" "$pr_number"
+    return $?
+  fi
+  return 2
 }
 
 
@@ -862,8 +1064,9 @@ pr_green_reuse_session() {
         # reuse the persisted request instead of minting a fresh nonce.
         recovery_pending=1
       else
-        printf '%s\n' "PR $project_id#$pr_number has a live legacy delivery; deferring pointer recovery" >&2
-        return 4
+        # A live legacy delivery may already be sitting in the native composer;
+        # the scoped Enter-only proof below can submit it without appending text.
+        recovery_pending=1
       fi
       ;;
   esac
@@ -872,6 +1075,18 @@ pr_green_reuse_session() {
     acked) pr_green_delivery_clear_pending "$project_id" "$pr_number" || return 4 ;;
     pending)
       if [[ "$recovery_pending" -ne 1 ]]; then
+        if [[ "$terminated" != "true" ]] && pr_green_delivery_submit_pending_recovery "$project_id" "$pr_number"; then
+          printf '%s\n' reused
+          return 0
+        fi
+        printf '%s\n' "PR $project_id#$pr_number has an unresolved native delivery; suppressing duplicate prompt" >&2
+        return 4
+      fi
+      if [[ "$terminated" != "true" ]] && pr_green_delivery_submit_pending_recovery "$project_id" "$pr_number"; then
+        printf '%s\n' reused
+        return 0
+      fi
+      if [[ "$terminated" != "true" ]]; then
         printf '%s\n' "PR $project_id#$pr_number has an unresolved native delivery; suppressing duplicate prompt" >&2
         return 4
       fi
@@ -911,6 +1126,9 @@ pr_green_reuse_session() {
   fi
   if pr_green_wait_for_native_prompt "$native_listing" "$envelope" "$native_baseline"; then
     pr_green_delivery_clear_pending "$project_id" "$pr_number" || return 4
+    return 0
+  fi
+  if pr_green_delivery_submit_pending_recovery "$project_id" "$pr_number"; then
     return 0
   fi
   printf '%s\n' "AO session $session_id transport returned success without a native user turn; delivery_unconfirmed" >&2
