@@ -24,17 +24,21 @@ cat >"$fixture_dir/outcomes.jsonl" <<'EOF'
 {"ts":1100,"repo":"worldarchitect.ai","number":3,"url":"https://example.test/3","run_ts":1000,"result":"blocked","verified":false,"detail":"ambiguous"}
 {"ts":1100,"repo":"worldarchitect.ai","number":4,"url":"https://example.test/4","run_ts":1000,"head_before":"old-head","head_after":"new-head","session_action":"recovery_blocked","result":"dispatch_failed","verified":false,"detail":"native recovery blocked"}
 {"ts":1100,"repo":"worldarchitect.ai","number":5,"url":"https://example.test/5","run_ts":1000,"head_before":"same-head","head_after":"same-head","session_action":"delivery_unconfirmed","result":"dispatch_failed","native_ack_status":"missing","verified":false,"detail":"native user turn not observed"}
-{"ts":1100,"repo":"worldarchitect.ai","number":6,"url":"https://example.test/6","run_ts":1000,"head_before":"before-six","head_after":"after-six","session_action":"reused","result":"pushed_ci_pending","verified":true,"push_receipt":{"verified":true,"push_exit_code":0,"before_sha":"before-six","after_sha":"after-six","commit_url":"https://github.com/jleechanorg/worldarchitect.ai/commit/after-six","repo":"worldarchitect.ai","session_id":"session-six"},"detail":"job-owned push receipt"}
+EOF
+cat >"$fixture_dir/push-receipts.jsonl" <<'EOF'
+{"repo":"worldarchitect.ai","number":6,"session_id":"session-six","before_sha":"before-six","after_sha":"after-six","commit_url":"https://github.com/jleechanorg/worldarchitect.ai/commit/after-six","pushed_at":1100,"push_exit_code":0,"verified":true}
 EOF
 
 body="$(PR_GREEN_METRICS_DIR="$fixture_dir" PR_GREEN_REPORT_NOW=4600 PR_GREEN_REPORT_WINDOW_HOURS=1 "$job_dir/report.sh" stdout)"
 rg -q 'PRs analyzed: 4' <<<"$body"
-rg -q 'PRs with successful remote commits: 1' <<<"$body"
+rg -q 'PRs with successful remote commits: at least 1 verified' <<<"$body"
 rg -q 'https://github.com/jleechanorg/worldarchitect.ai/commit/after-six' <<<"$body"
 rg -q 'Verified green PR/heads \(unattributed to this job\): 1' <<<"$body"
 rg -q 'Exceptions: recovery-blocked 1; delivery-unconfirmed 1' <<<"$body"
-rg -q 'native ack observed 1, missing 1, untracked/legacy 5' <<<"$body"
-rg -q 'Repair attempts \(dispatch or session reuse\): 2' <<<"$body"
+rg -q 'Caveat: uncovered snapshots, legacy outcomes, and native-ack/push attribution not independently proven remain unknown—not zero\.' <<<"$body"
+rg -q 'Latest completed sweep' <<<"$body"
+rg -q 'Selected 2; dispatched 2; reused 0; restored 0' <<<"$body"
+rg -q 'Deferred: busy 1; cooldown 3; admission-cap 0; delivery-unconfirmed 0' <<<"$body"
 rg -q 'Deferred: busy 1; cooldown 3' <<<"$body"
 rg -q 'Other outcomes: blocked 1, no change 0, in progress 0, dispatch failures 2' <<<"$body"
 
@@ -61,17 +65,20 @@ worldarchitect.ai	11	Eleven	https://example.test/11	2026-09-23T00:00:00Z
 worldarchitect.ai	12	Twelve	https://example.test/12	2026-09-23T00:00:00Z
 EOF
 : >"$partial_dir/outcomes.jsonl"
+printf '%s\n' '{"ts":10,"repo":"worldarchitect.ai","number":11,"url":"https://example.test/11","head_before":"before-partial","head_after":"after-partial","push_receipt":{"verified":true,"push_exit_code":0,"before_sha":"before-partial","after_sha":"after-partial","pushed_at":1100,"commit_url":"https://github.com/jleechanorg/worldarchitect.ai/commit/after-partial","repo":"worldarchitect.ai","session_id":"session-partial"}}' >"$partial_dir/outcomes.jsonl"
 partial_body="$(PR_GREEN_METRICS_DIR="$partial_dir" PR_GREEN_REPORT_NOW=1200 PR_GREEN_REPORT_WINDOW_HOURS=1 "$job_dir/report.sh" stdout)"
 rg -q 'PRs analyzed: at least 2 unique \(1/2 runs covered\)' <<<"$partial_body"
+rg -q 'PRs with successful remote commits: at least 1 verified' <<<"$partial_body"
 
 invalid_receipt_dir="$fixture_dir/invalid-receipts"
 mkdir -p "$invalid_receipt_dir"
 printf '%s\n' '{"ts":1000,"discovered":1,"analyzed":1}' >"$invalid_receipt_dir/runs.jsonl"
 printf '%s\n' 'worldarchitect.ai\t21\tTwenty-one\thttps://example.test/21\t2026-09-23T00:00:00Z' >"$invalid_receipt_dir/discovery-1000.tsv"
 cat >"$invalid_receipt_dir/outcomes.jsonl" <<'EOF'
-{"ts":1100,"repo":"worldarchitect.ai","number":21,"push_receipt":{}}
-{"ts":1100,"repo":"worldarchitect.ai","number":22,"push_receipt":false}
-{"ts":1100,"repo":"worldarchitect.ai","number":23,"push_receipt":{"verified":true,"push_exit_code":0,"before_sha":"same","after_sha":"same","commit_url":"https://example.test/commit/same","repo":"worldarchitect.ai","session_id":"invalid"}}
+{"ts":1100,"repo":"worldarchitect.ai","number":21,"head_after":"after-empty","push_receipt":{}}
+{"ts":1100,"repo":"worldarchitect.ai","number":22,"head_after":"after-false","push_receipt":false}
+{"ts":1100,"repo":"worldarchitect.ai","number":23,"head_after":"same","push_receipt":{"verified":true,"push_exit_code":0,"before_sha":"same","after_sha":"same","pushed_at":1100,"commit_url":"https://example.test/commit/same","repo":"worldarchitect.ai","session_id":"invalid"}}
+{"ts":1100,"repo":"worldarchitect.ai","number":24,"head_after":"after-wrong-repo","push_receipt":{"verified":true,"push_exit_code":0,"before_sha":"before-wrong-repo","after_sha":"after-wrong-repo","pushed_at":1100,"commit_url":"https://example.test/commit/after-wrong-repo","repo":"other-repo","session_id":"invalid"}}
 EOF
 invalid_body="$(PR_GREEN_METRICS_DIR="$invalid_receipt_dir" PR_GREEN_REPORT_NOW=1200 PR_GREEN_REPORT_WINDOW_HOURS=1 "$job_dir/report.sh" stdout)"
 rg -q 'PRs with successful remote commits: unknown \(push receipts unavailable\)' <<<"$invalid_body"

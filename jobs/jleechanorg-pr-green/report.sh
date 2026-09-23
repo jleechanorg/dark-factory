@@ -19,6 +19,7 @@ WINDOW_SECONDS=$((WINDOW_HOURS * 3600))
 SINCE=$((NOW - WINDOW_SECONDS))
 RUNS_FILE="$METRICS_DIR/runs.jsonl"
 OUTCOMES_FILE="$METRICS_DIR/outcomes.jsonl"
+PUSH_RECEIPTS_FILE="$METRICS_DIR/push-receipts.jsonl"
 
 mkdir -p "$METRICS_DIR"
 # Delivery and cadence updates share one lock, including Slack/email overlap.
@@ -28,6 +29,7 @@ if [[ "$MODE" != "stdout" ]]; then
 fi
 [[ -f "$RUNS_FILE" ]] || : >"$RUNS_FILE"
 [[ -f "$OUTCOMES_FILE" ]] || : >"$OUTCOMES_FILE"
+[[ -f "$PUSH_RECEIPTS_FILE" ]] || : >"$PUSH_RECEIPTS_FILE"
 
 # Index discovery snapshots without treating report generation as a scheduler
 # run. A snapshot is trusted only when its row count agrees with both run totals.
@@ -47,8 +49,16 @@ done
 shopt -u nullglob
 
 summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" \
-  --slurpfile discoveries "$discovery_records_file" --argjson since "$SINCE" '
+  --slurpfile receipts "$PUSH_RECEIPTS_FILE" \
+  --slurpfile discoveries "$discovery_records_file" --argjson since "$SINCE" --argjson now "$NOW" '
   def recent: map(select((.ts // 0) >= $since));
+  def pushed_epoch:
+    (.push_receipt.pushed_at? // null) as $pushed_at
+    | if ($pushed_at | type) == "number" then $pushed_at
+      elif ($pushed_at | type) == "string" and ($pushed_at | test("^[0-9]+$")) then ($pushed_at | tonumber)
+      elif ($pushed_at | type) == "string" then (try ($pushed_at | fromdateiso8601) catch null)
+      else null
+      end;
   def valid_push_receipt:
     (.push_receipt? // null) as $receipt
     | ($receipt | type) == "object"
@@ -59,9 +69,31 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" \
       and ($receipt.before_sha != $receipt.after_sha)
       and (($receipt.commit_url // "") | tostring | length) > 0
       and (($receipt.repo // "") | tostring | length) > 0
-      and (($receipt.session_id // $receipt.session // "") | tostring | length) > 0;
+      and (($receipt.session_id // $receipt.session // "") | tostring | length) > 0
+      and (($receipt.pushed_at // "") | tostring | length) > 0
+      and ($receipt.repo == (.repo // ""))
+      and ($receipt.after_sha == (.head_after // ""))
+      and (($receipt.commit_url | tostring) | contains("/commit/" + ($receipt.after_sha | tostring)));
+  def push_receipt_in_window:
+    valid_push_receipt
+    and (pushed_epoch != null)
+    and (pushed_epoch >= $since and pushed_epoch <= $now);
   (recent) as $runs |
-  ($outcomes | recent) as $outcomes |
+  ($outcomes) as $all_outcomes |
+  ($all_outcomes | recent) as $outcomes |
+  ($receipts
+    | map(select(type == "object")
+      | . as $receipt
+      | {
+          repo: ($receipt.repo // ""),
+          number: ($receipt.number // 0),
+          url: ($receipt.pr_url // $receipt.url // "PR URL unavailable"),
+          head_after: ($receipt.after_sha // ""),
+          push_receipt: $receipt
+        })) as $ledger_records |
+  ($all_outcomes | map(select((.push_receipt? // null) != null))) as $legacy_records |
+  ($ledger_records + $legacy_records) as $push_records |
+  ($runs | sort_by(.ts // 0) | last // {}) as $latest_run |
   ($discoveries
     | map(. as $discovery
       | ($runs | map(select((.ts // 0) == $discovery.run_ts)) | .[0]) as $run
@@ -79,8 +111,8 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" \
   ((($runs | length) > 0)
     and (($discovery_runs | length) == ($runs | length))
     and all($discovery_runs[]; .complete)) as $discovery_complete |
-  ($outcomes
-    | map(select(valid_push_receipt))
+  ($push_records
+    | map(select(push_receipt_in_window))
     | unique_by([.repo, .number])) as $pushes |
   {
     runs: ($runs | length),
@@ -91,11 +123,12 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" \
     attempts: ($runs | map(.attempted // 0) | add // 0),
     busy_deferred: ($runs | map(.busy_deferred // 0) | add // 0),
     cooldown_deferred: ($runs | map(.cooldown_deferred // 0) | add // 0),
+    latest_run: $latest_run,
     analyzed_unique: ($unique_discovered | length),
     analyzed_coverage_complete: $discovery_complete,
     covered_runs: ($discovery_runs | map(select(.complete)) | length),
     pushes: $pushes,
-    push_receipts_available: (any($outcomes[]; valid_push_receipt)),
+    push_receipts_available: (any($pushes[]; true)),
     green_new_head_outcomes: ($outcomes
       | map(select(.result == "fixed" and (.verified == true)
         and ((.head_before // "") != (.head_after // ""))))
@@ -126,7 +159,13 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" \
 ' "$RUNS_FILE")"
 
 analyzed_label="$(jq -r 'if .analyzed_coverage_complete then (.analyzed_unique | tostring) elif .covered_runs > 0 then ("at least " + (.analyzed_unique | tostring) + " unique (" + (.covered_runs | tostring) + "/" + (.runs | tostring) + " runs covered)") else "unknown (coverage incomplete)" end' <<<"$summary")"
-pushed_label="$(jq -r 'if .push_receipts_available then (.pushes | length | tostring) else "unknown (push receipts unavailable)" end' <<<"$summary")"
+pushed_label="$(jq -r 'if (.pushes | length) == 0 then "unknown (push receipts unavailable)" else ("at least " + (.pushes | length | tostring) + " verified") end' <<<"$summary")"
+latest_run_time="$(jq -r '.latest_run.ts // empty' <<<"$summary")"
+if [[ -n "$latest_run_time" ]]; then
+  latest_run_time="$(date -d "@$latest_run_time" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || printf '%s' "$latest_run_time")"
+else
+  latest_run_time='none'
+fi
 push_lines="$(jq -r '
   .pushes[]?
   | "- " + (.repo // "unknown-repo") + "#" + ((.number // "?") | tostring)
@@ -148,14 +187,15 @@ Verified green PR/heads (unattributed to this job): $(jq -r '.green_new_head_out
 Verified pushed PRs (receipt evidence):
 ${push_lines}
 
-Funnel (per-run totals; repeated scans are not unique PRs):
-Actionable red/conflicting: $(jq -r '.actionable' <<<"$summary"); selected: $(jq -r '.selected' <<<"$summary")
-Repair attempts (dispatch or session reuse): $(jq -r '.attempts' <<<"$summary")
-Deferred: busy $(jq -r '.busy_deferred' <<<"$summary"); cooldown $(jq -r '.cooldown_deferred' <<<"$summary")
+Latest completed sweep (${latest_run_time}):
+Discovered $(jq -r '.latest_run.discovered // 0' <<<"$summary"); analyzed $(jq -r '.latest_run.analyzed // 0' <<<"$summary"); actionable $(jq -r '.latest_run.actionable // 0' <<<"$summary")
+Selected $(jq -r '.latest_run.selected // 0' <<<"$summary"); dispatched $(jq -r '.latest_run.dispatched // 0' <<<"$summary"); reused $(jq -r '.latest_run.reused // 0' <<<"$summary"); restored $(jq -r '.latest_run.restored // 0' <<<"$summary")
+Deferred: busy $(jq -r '.latest_run.busy_deferred // 0' <<<"$summary"); cooldown $(jq -r '.latest_run.cooldown_deferred // 0' <<<"$summary"); admission-cap $(jq -r '.latest_run.admission_deferred // 0' <<<"$summary"); delivery-unconfirmed $(jq -r '.latest_run.delivery_unconfirmed // 0' <<<"$summary")
 
 Exceptions: recovery-blocked $(jq -r '.recovery_blocked' <<<"$summary"); delivery-unconfirmed $(jq -r '.delivery_unconfirmed' <<<"$summary")
 Other outcomes: blocked $(jq -r '.blockers' <<<"$summary"), no change $(jq -r '.unchanged' <<<"$summary"), in progress $(jq -r '.in_progress' <<<"$summary"), dispatch failures $(jq -r '.dispatch_failures' <<<"$summary")
-Coverage: runs $(jq -r '.runs' <<<"$summary"), discovery observations $(jq -r '.discovered' <<<"$summary"), complete snapshots $(jq -r '.covered_runs' <<<"$summary")/$(jq -r '.runs' <<<"$summary"); native ack observed $(jq -r '.native_ack_observed' <<<"$summary"), missing $(jq -r '.native_ack_missing' <<<"$summary"), untracked/legacy $(jq -r '.native_ack_untracked' <<<"$summary"). Unknown is not zero.
+Coverage: runs $(jq -r '.runs' <<<"$summary"); complete discovery snapshots $(jq -r '.covered_runs' <<<"$summary")/$(jq -r '.runs' <<<"$summary"); observations $(jq -r '.discovered' <<<"$summary").
+Caveat: uncovered snapshots, legacy outcomes, and native-ack/push attribution not independently proven remain unknown—not zero.
 
 Policy: only explicit red CI or merge conflicts; no merges or force-pushes.
 Note: dispatches and session reuse are attempts, never fixes."

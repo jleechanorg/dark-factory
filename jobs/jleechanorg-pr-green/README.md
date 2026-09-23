@@ -44,11 +44,13 @@ zero.
 The successful-remote-commit count requires an explicit, independently
 verifiable `push_receipt` object with `verified: true`, `push_exit_code: 0`,
 non-empty differing `before_sha`/`after_sha`, a non-empty `commit_url`, and
-non-empty `repo` plus `session_id` (or `session`) provenance. Empty, false, or
-partial receipts are rejected. Receipt-backed PRs are listed with their PR URL
-and commit/evidence URL regardless of whether CI is green. A green new-head
-observation does not prove this job pushed the head; the report labels green
-state as unattributed unless the receipt is separately present.
+non-empty `repo` plus `session_id` (or `session`) provenance, and a
+window-bounded `pushed_at` timestamp. The receipt repo and `after_sha` must
+match the outcome row, and `commit_url` must identify that same commit. Empty,
+false, stale, or partial receipts are rejected. Receipt-backed PRs are listed
+with their PR URL and commit/evidence URL regardless of whether CI is green.
+A green new-head observation does not prove this job pushed the head; the report
+labels green state as unattributed unless the receipt is separately present.
 
 A repair is counted as green only when an outcome says `result=fixed` and
 `verified=true`. Dispatches and AO session reuse remain attempts. A successful
