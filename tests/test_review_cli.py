@@ -70,6 +70,11 @@ def _private_codex_home(_private_tmp_root, monkeypatch):
     home directory or its Codex installation.
     """
     home = _private_tmp_root / "home"
+    home.mkdir(mode=0o700)
+    # mkdir honors the host umask. The controller rejects a group-writable
+    # HOME ancestor, so make the fixture invariant explicit (this host uses
+    # umask 0002 and would otherwise create mode 0775 here).
+    home.chmod(0o700)
     codex_home = home / ".codex"
     codex_home.mkdir(mode=0o700, parents=True)
     auth = codex_home / "auth.json"
@@ -591,14 +596,14 @@ def test_task_file_read_binds_descriptor_before_replacement(tmp_path, replacemen
     sealed.write_text("sealed\n", encoding="utf-8")
     real_open = os.open
 
-    def race_open(path, flags, *args):
+    def race_open(path, flags, *args, **kwargs):
         if pathlib.Path(path) == task:
             task.unlink()
             if replacement == "symlink":
                 task.symlink_to(sealed)
             else:
                 os.link(sealed, task)
-        return real_open(path, flags, *args)
+        return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr("runner.review_cli.os.open", race_open)
     with pytest.raises(ReviewContractError, match="safe|regular"):

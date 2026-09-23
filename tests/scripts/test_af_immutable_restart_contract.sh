@@ -88,7 +88,7 @@ if [ "${args[*]}" = "--user restart $DARK_FACTORY_RESTART_UNIT" ]; then
   fi
   old_pid="$(cat "$FAKE_DAEMON_PID_FILE")"
   kill "$old_pid" >/dev/null 2>&1 || true
-  "$FAKE_DAEMON_BINARY" 120 &
+  "$FAKE_DAEMON_BINARY" 120 </dev/null >/dev/null 2>&1 &
   new_pid=$!
   printf '%s\n' "$new_pid" > "$FAKE_DAEMON_PID_FILE"
   printf '%s %s\n' "$new_pid" "$FAKE_DAEMON_BINARY" >> "$FAKE_DAEMON_PATHS_FILE"
