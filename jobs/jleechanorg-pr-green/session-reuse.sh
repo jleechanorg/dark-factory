@@ -76,10 +76,10 @@ pr_green_find_native_rollouts_indexed() {
   local created_at="${2:-}" wanted_id="${3:-}"
   local cutoff_epoch='' created_at_clean='' home db escaped_workspace rows
   local candidate_id rollout_path first metadata_id metadata_cwd metadata_timestamp metadata_epoch
-  local source_home relative match best_id='' best_timestamp='' candidate_timestamp
+  local source_home relative match best_id='' best_timestamp='' candidate_timestamp filesystem_rollout filesystem_relative filesystem_key
   local best_ties=0
   local -a homes=() matches=()
-  local -A seen_homes=() registry_queryable=() seen_ids=() id_timestamps=()
+  local -A seen_homes=() registry_queryable=() seen_ids=() id_timestamps=() seen_rollout_paths=()
   local candidates="${PR_GREEN_CODEX_HOME_CANDIDATES:-${HOME}/.codex:${CODEX_HOME:-${HOME}/.codex-dark-factory}}"
 
   if [[ -n "$created_at" ]]; then
@@ -134,10 +134,42 @@ pr_green_find_native_rollouts_indexed() {
           /*) source_home=/; relative="${rollout_path#/}" ;;
           *) continue ;;
         esac
+        seen_rollout_paths["$source_home/$relative"]=1
         matches+=("$candidate_id"$'\t'"$source_home"$'\t'"$relative")
       done <<<"$rows"
     done
   done
+  # A restored copy can exist in a profile whose thread index has not yet
+  # received metadata. For an exact requested id, include that filesystem
+  # copy alongside indexed rows instead of returning only the source profile.
+  if [[ -n "$wanted_id" ]]; then
+    for home in "${homes[@]}"; do
+      home="${home%/}"
+      [[ -d "$home/sessions" ]] || continue
+      while IFS= read -r -d '' filesystem_rollout; do
+        [[ -f "$filesystem_rollout" && ! -L "$filesystem_rollout" ]] || continue
+        first="$(head -n 1 "$filesystem_rollout" 2>/dev/null || true)"
+        metadata_id="$(jq -r 'select(.type == "session_meta") | (.payload.session_id // .payload.id // empty)' <<<"$first" 2>/dev/null || true)"
+        metadata_cwd="$(jq -r 'select(.type == "session_meta") | .payload.cwd // empty' <<<"$first" 2>/dev/null || true)"
+        metadata_timestamp="$(jq -r 'select(.type == "session_meta") | .timestamp // .payload.timestamp // empty' <<<"$first" 2>/dev/null || true)"
+        [[ "$metadata_id" == "$wanted_id" && "$metadata_cwd" == "$workspace" ]] || continue
+        if [[ -n "$cutoff_epoch" ]]; then
+          [[ -n "$metadata_timestamp" ]] || continue
+          metadata_epoch="$(date -u -d "$metadata_timestamp" +%s 2>/dev/null || true)"
+          [[ -n "$metadata_epoch" && "$metadata_epoch" -ge "$cutoff_epoch" ]] || continue
+        fi
+        filesystem_relative="${filesystem_rollout#"$home/"}"
+        filesystem_key="$home/$filesystem_relative"
+        [[ -n "${seen_rollout_paths[$filesystem_key]+yes}" ]] && continue
+        seen_rollout_paths["$filesystem_key"]=1
+        seen_ids["$wanted_id"]=1
+        if [[ -z "${id_timestamps[$wanted_id]+yes}" || "$metadata_timestamp" > "${id_timestamps[$wanted_id]}" ]]; then
+          id_timestamps["$wanted_id"]="$metadata_timestamp"
+        fi
+        matches+=("$wanted_id"$'\t'"$home"$'\t'"$filesystem_relative")
+      done < <(find "$home/sessions" -type f -name "*${wanted_id}*.jsonl" -print0 2>/dev/null)
+    done
+  fi
   ((${#seen_homes[@]} > 0)) || return 2
   for home in "${!seen_homes[@]}"; do
     ((registry_queryable[$home] == 1)) || return 2
@@ -678,12 +710,14 @@ pr_green_delivery_pending_status() {
 # sessions stay fail-closed until their existing composer is known safe.
 pr_green_delivery_upgrade_legacy() {
   local project_id="$1" pr_number="$2" listing="$3" native_id="$4" workspace="$5"
-  local path pending old_envelope prompt request_id brief_path envelope count tmp
+  local path pending old_envelope prompt request_id brief_path envelope count tmp legacy_pending
   path="$(pr_green_delivery_pending_path "$project_id" "$pr_number")" || return 1
   [[ -s "$path" ]] || { printf '%s\n' none; return 0; }
   pending="$(cat -- "$path" 2>/dev/null || true)"
   brief_path="$(jq -r '.brief_path // empty' <<<"$pending" 2>/dev/null || true)"
-  [[ -n "$brief_path" ]] && { printf '%s\n' current; return 0; }
+  legacy_pending="$(jq -r '.legacy_pending // false' <<<"$pending" 2>/dev/null || true)"
+  [[ -n "$brief_path" && "$legacy_pending" != true ]] && { printf '%s\n' current; return 0; }
+  [[ -n "$brief_path" && "$legacy_pending" == true ]] && { printf '%s\n' migrated; return 0; }
   old_envelope="$(jq -r '.envelope // empty' <<<"$pending" 2>/dev/null || true)"
   prompt="$(jq -r '.prompt // empty' <<<"$pending" 2>/dev/null || true)"
   request_id="$(jq -r '.request_id // empty' <<<"$pending" 2>/dev/null || true)"
@@ -724,7 +758,7 @@ pr_green_delivery_recovery_composer_region() {
       sub(/^[[:space:]]*›[[:space:]]*/, "", region)
       next
     }
-    found && $0 ~ /^[[:space:]]*(\? for shortcuts|Esc to interrupt|Ctrl\+[A-Za-z])([[:space:]]|$)/ { exit }
+    found && $0 ~ /^[[:space:]]*(\? for shortcuts|GPT-[0-9.]+-[[:alnum:]-]+[[:space:]]+high[[:space:]]+·[[:space:]]+~\/\.ao\/data\/worktrees\/[^·]+·[[:space:]]+Repair[[:space:]]+PR[[:space:]]+#[0-9]+[[:space:]]+tests[[:space:]]+⚠[[:space:]]*[0-9]+[[:space:]]+warnings?[[:space:]]*·[[:space:]]*f2[[:space:]]+to[[:space:]]+view)/ { exit }
     found { region=region "\n" $0 }
     END { if (found) print region }
   '
@@ -737,11 +771,14 @@ pr_green_delivery_recovery_normalize() {
 }
 
 pr_green_delivery_recovery_capture() {
-  local runtime_handle="$1" shape mode cursor_y pane_height
-  shape="$(tmux display-message -p -t "$runtime_handle" '#{pane_in_mode}:#{cursor_y}:#{pane_height}' 2>/dev/null || true)"
+  local pane_target="$1" shape mode cursor_y pane_height pane footer_line
+  shape="$(tmux display-message -p -t "$pane_target" '#{pane_in_mode}:#{cursor_y}:#{pane_height}' 2>/dev/null || true)"
   IFS=: read -r mode cursor_y pane_height <<<"$shape"
   [[ "$mode" == 0 && "$cursor_y" =~ ^[0-9]+$ && "$pane_height" =~ ^[0-9]+$ && "$cursor_y" -lt "$pane_height" ]] || return 1
-  tmux capture-pane -p -t "$runtime_handle" -S 0 -E "$cursor_y" 2>/dev/null
+  pane="$(tmux capture-pane -p -t "$pane_target" -S 0 -E "$((pane_height - 1))" 2>/dev/null || true)"
+  footer_line="$(grep -En '^[[:space:]]*(\? for shortcuts|GPT-[0-9.]+-[[:alnum:]-]+[[:space:]]+high[[:space:]]+·[[:space:]]+~\/\.ao\/data\/worktrees\/[^·]+·[[:space:]]+Repair[[:space:]]+PR[[:space:]]+#[0-9]+[[:space:]]+tests[[:space:]]+⚠[[:space:]]*[0-9]+[[:space:]]+warnings?[[:space:]]*·[[:space:]]*f2[[:space:]]+to[[:space:]]+view)' <<<"$pane" | head -n 1 | cut -d: -f1 || true)"
+  [[ "$footer_line" =~ ^[0-9]+$ && "$footer_line" -gt "$((cursor_y + 1))" ]] || return 1
+  printf '%s\n' "$pane"
 }
 
 pr_green_delivery_recovery_composer_matches() {
@@ -757,8 +794,8 @@ pr_green_delivery_recovery_composer_matches() {
 }
 
 pr_green_delivery_recovery_identity() {
-  local project_id="$1" pr_number="$2" session_id="$3" native_id="$4" workspace="$5" expected_runtime="${6:-}"
-  local record fresh_session row row_workspace row_native row_terminated live_home intended_home runtime_handle
+  local project_id="$1" pr_number="$2" session_id="$3" native_id="$4" workspace="$5" expected_runtime="${6:-}" expected_pane_id="${7:-}"
+  local record fresh_session row row_workspace row_native row_terminated live_home intended_home runtime_handle pane_id pane_ids
   local -a row_fields=()
   record="$(pr_green_session_record "$project_id" "$pr_number" 2>/dev/null || true)"
   fresh_session="$(jq -r '.id // empty' <<<"$record" 2>/dev/null || true)"
@@ -777,16 +814,22 @@ pr_green_delivery_recovery_identity() {
   pr_green_live_session_is_busy "$project_id" "$session_id" && return 2
   runtime_handle="$(pr_green_runtime_handle "$project_id" "$session_id" 2>/dev/null || true)"
   [[ -n "$runtime_handle" && ( -z "$expected_runtime" || "$runtime_handle" == "$expected_runtime" ) ]] || return 1
+  pane_ids="$(tmux list-panes -t "$runtime_handle" -F '#{pane_id}' 2>/dev/null || true)"
+  [[ -n "$pane_ids" && "$pane_ids" != *$'\n'* ]] || return 1
+  pane_id="$pane_ids"
+  [[ "$pane_id" =~ ^%[0-9]+$ && ( -z "$expected_pane_id" || "$pane_id" == "$expected_pane_id" ) ]] || return 1
   PR_GREEN_DELIVERY_RECOVERY_RUNTIME="$runtime_handle"
+  PR_GREEN_DELIVERY_RECOVERY_PANE_ID="$pane_id"
 }
 
 pr_green_delivery_mark_recovery_attempted() {
-  local path="$1" evidence_path="$2" tmp attempted_at
+  local path="$1" evidence_path="$2" runtime_handle="$3" pane_id="$4" envelope_digest="$5" tmp attempted_at
   attempted_at="$(date +%s)"
   [[ "$attempted_at" =~ ^[0-9]+$ ]] || return 1
   tmp="$(mktemp "${path}.tmp.XXXXXX")" || return 1
-  if ! jq --argjson attempted_at "$attempted_at" --arg evidence_path "$evidence_path" \
-    '. + {submit_recovery_attempted_at:$attempted_at,submit_recovery_evidence_path:$evidence_path}' \
+  if ! jq --argjson attempted_at "$attempted_at" --arg evidence_path "$evidence_path" --arg runtime_handle "$runtime_handle" \
+    --arg pane_id "$pane_id" --arg envelope_digest "$envelope_digest" \
+    '. + {submit_recovery_attempted_at:$attempted_at,submit_recovery_evidence_path:$evidence_path,submit_recovery_runtime_handle:$runtime_handle,submit_recovery_pane_id:$pane_id,submit_recovery_envelope_sha256:$envelope_digest}' \
     <"$path" >"$tmp"; then
     rm -f -- "$tmp"
     return 1
@@ -798,8 +841,8 @@ pr_green_delivery_mark_recovery_attempted() {
 # text, interrupts, kills, restarts, or replays an AO message.
 pr_green_delivery_submit_pending_recovery() {
   local project_id="$1" pr_number="$2" path pending session_id native_id workspace envelope legacy_envelope request_id
-  local listing baseline runtime_handle pane region normalized second_pane second_region second_normalized
-  local state_dir evidence_path tmp claim_path marker_count current_ack
+  local listing baseline runtime_handle pane region normalized second_pane second_region second_normalized pending_guard refreshed_pending
+  local state_dir evidence_path tmp claim_path marker_count current_ack pane_id refreshed_listing envelope_digest
   path="$(pr_green_delivery_pending_path "$project_id" "$pr_number" 2>/dev/null || true)"
   [[ -s "$path" ]] || return 1
   pending="$(cat -- "$path" 2>/dev/null || true)"
@@ -812,39 +855,50 @@ pr_green_delivery_submit_pending_recovery() {
   [[ "$session_id" =~ ^[[:alnum:]._-]+$ && "$native_id" =~ ^[[:alnum:]-]{16,}$ && -n "$workspace" && -n "$envelope" ]] || return 1
   [[ "$request_id" =~ ^[[:alnum:]_.-]+$ && "$envelope" == *"[PR_GREEN_DELIVERY_ID:$request_id]"* ]] || return 1
   jq -e '(.submit_recovery_attempted_at // null) | numbers' <<<"$pending" >/dev/null 2>&1 && return 1
-  pr_green_delivery_recovery_identity "$project_id" "$pr_number" "$session_id" "$native_id" "$workspace" || return 1
-  runtime_handle="$PR_GREEN_DELIVERY_RECOVERY_RUNTIME"
-  listing="$(pr_green_find_native_rollouts "$workspace" '' "$native_id" 2>/dev/null || true)"
-  [[ -n "$listing" ]] || return 1
-  baseline="$(pr_green_delivery_ack_count "$listing" "$envelope" "$legacy_envelope" 2>/dev/null || true)"
-  [[ "$baseline" =~ ^[0-9]+$ && "$baseline" == 0 ]] || return 1
-
-  pane="$(pr_green_delivery_recovery_capture "$runtime_handle" 2>/dev/null || true)"
-  [[ -n "$pane" ]] || return 1
-  marker_count="$(grep -Ec '^[[:space:]]*›[[:space:]]' <<<"$pane" || true)"
-  [[ "$marker_count" == 1 ]] || return 1
-  region="$(pr_green_delivery_recovery_composer_region <<<"$pane")"
-  pr_green_delivery_recovery_composer_matches "$region" "$envelope" "$legacy_envelope" || return 1
-  normalized="$(pr_green_delivery_recovery_normalize <<<"$region")"
+  pending_guard="$(jq -c . <<<"$pending" 2>/dev/null || true)"
+  [[ -n "$pending_guard" ]] || return 1
   state_dir="$(dirname -- "$path")"
   evidence_path="$state_dir/.${project_id}-${pr_number}-${request_id}.submit-recovery-pane"
-  tmp="$(mktemp "${evidence_path}.XXXXXX")" || return 1
-  if ! printf '%s\n' "$pane" >"$tmp" || ! chmod 600 -- "$tmp"; then
-    rm -f -- "$tmp"
-    return 1
-  fi
-  mv -- "$tmp" "$evidence_path" || { rm -f -- "$tmp"; return 1; }
-
-  # Re-read every identity and the composer immediately before the one Enter.
-  pending="$(cat -- "$path" 2>/dev/null || true)"
-  jq -e '(.submit_recovery_attempted_at // null) | numbers' <<<"$pending" >/dev/null 2>&1 && return 1
   claim_path="${evidence_path}.lock"
   mkdir -- "$claim_path" 2>/dev/null || return 1
-  if ! pr_green_delivery_recovery_identity "$project_id" "$pr_number" "$session_id" "$native_id" "$workspace" "$runtime_handle"; then
+  refreshed_pending="$(cat -- "$path" 2>/dev/null || true)"
+  [[ "$(jq -c . <<<"$refreshed_pending" 2>/dev/null || true)" == "$pending_guard" ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
+  if ! pr_green_delivery_recovery_identity "$project_id" "$pr_number" "$session_id" "$native_id" "$workspace"; then
     rmdir -- "$claim_path" 2>/dev/null || true
     return 1
   fi
-  second_pane="$(pr_green_delivery_recovery_capture "$runtime_handle" 2>/dev/null || true)"
+  runtime_handle="$PR_GREEN_DELIVERY_RECOVERY_RUNTIME"
+  pane_id="$PR_GREEN_DELIVERY_RECOVERY_PANE_ID"
+  listing="$(pr_green_find_native_rollouts "$workspace" '' "$native_id" 2>/dev/null || true)"
+  [[ -n "$listing" ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
+  baseline="$(pr_green_delivery_ack_count "$listing" "$envelope" "$legacy_envelope" 2>/dev/null || true)"
+  [[ "$baseline" =~ ^[0-9]+$ && "$baseline" == 0 ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
+
+  pane="$(pr_green_delivery_recovery_capture "$pane_id" 2>/dev/null || true)"
+  [[ -n "$pane" ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
+  marker_count="$(grep -Ec '^[[:space:]]*›[[:space:]]' <<<"$pane" || true)"
+  [[ "$marker_count" == 1 ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
+  region="$(pr_green_delivery_recovery_composer_region <<<"$pane")"
+  pr_green_delivery_recovery_composer_matches "$region" "$envelope" "$legacy_envelope" || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
+  normalized="$(pr_green_delivery_recovery_normalize <<<"$region")"
+  tmp="$(mktemp "${evidence_path}.XXXXXX")" || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
+  if ! printf '%s\n' "$pane" >"$tmp" || ! chmod 600 -- "$tmp"; then
+    rm -f -- "$tmp"
+    rmdir -- "$claim_path" 2>/dev/null || true
+    return 1
+  fi
+  mv -- "$tmp" "$evidence_path" || { rm -f -- "$tmp"; rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
+
+  # Re-read every identity and the composer immediately before the one Enter.
+  pending="$(cat -- "$path" 2>/dev/null || true)"
+  [[ "$(jq -c . <<<"$pending" 2>/dev/null || true)" == "$pending_guard" ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
+  jq -e '(.submit_recovery_attempted_at // null) | numbers' <<<"$pending" >/dev/null 2>&1 && { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
+  if ! pr_green_delivery_recovery_identity "$project_id" "$pr_number" "$session_id" "$native_id" "$workspace" "$runtime_handle" "$pane_id"; then
+    rmdir -- "$claim_path" 2>/dev/null || true
+    return 1
+  fi
+  [[ "$PR_GREEN_DELIVERY_RECOVERY_PANE_ID" == "$pane_id" ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
+  second_pane="$(pr_green_delivery_recovery_capture "$pane_id" 2>/dev/null || true)"
   [[ -n "$second_pane" ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
   marker_count="$(grep -Ec '^[[:space:]]*›[[:space:]]' <<<"$second_pane" || true)"
   if [[ "$marker_count" != 1 ]]; then
@@ -857,17 +911,24 @@ pr_green_delivery_submit_pending_recovery() {
     rmdir -- "$claim_path" 2>/dev/null || true
     return 1
   fi
-  current_ack="$(pr_green_delivery_ack_count "$listing" "$envelope" "$legacy_envelope" 2>/dev/null || true)"
+  refreshed_listing="$(pr_green_find_native_rollouts "$workspace" '' "$native_id" 2>/dev/null || true)"
+  [[ "${refreshed_listing%%$'\n'*}" == "$native_id" ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
+  current_ack="$(pr_green_delivery_ack_count "$refreshed_listing" "$envelope" "$legacy_envelope" 2>/dev/null || true)"
+  if [[ ! "$current_ack" =~ ^[0-9]+$ ]]; then
+    rmdir -- "$claim_path" 2>/dev/null || true
+    return 1
+  fi
   if [[ "$current_ack" =~ ^[0-9]+$ && "$current_ack" -gt "$baseline" ]]; then
     pr_green_delivery_clear_pending "$project_id" "$pr_number"
     return $?
   fi
-  if ! pr_green_delivery_mark_recovery_attempted "$path" "$evidence_path"; then
+  envelope_digest="$(printf '%s' "$envelope" | sha256sum | awk '{print $1}')"
+  if ! pr_green_delivery_mark_recovery_attempted "$path" "$evidence_path" "$runtime_handle" "$pane_id" "$envelope_digest"; then
     rmdir -- "$claim_path" 2>/dev/null || true
     return 1
   fi
-  tmux send-keys -t "$runtime_handle" Enter || return 1
-  if pr_green_wait_for_delivery_ack "$listing" "$envelope" "$legacy_envelope" "$baseline"; then
+  tmux send-keys -t "$pane_id" Enter || return 1
+  if pr_green_wait_for_delivery_ack "$refreshed_listing" "$envelope" "$legacy_envelope" "$baseline"; then
     pr_green_delivery_clear_pending "$project_id" "$pr_number"
     return $?
   fi

@@ -19,7 +19,9 @@ recovery_identity_ok=0
 recovery_pane_output=''
 recovery_capture_count=0
 late_ack_on_capture=0
-recovery_cursor_y=20
+recovery_pane_mode=0
+recovery_emit_footer=1
+recovery_cursor_y=0
 recovery_pane_height=40
 recovery_dir="$(mktemp -d)"
 recovery_home="$recovery_dir/codex"
@@ -112,7 +114,8 @@ curl() {
 tmux() {
   case "$1 $2" in
     "has-session -t") [[ "$3" == "$busy_runtime_handle" ]] ;;
-    "display-message -p") printf '0:%s:%s\n' "$recovery_cursor_y" "$recovery_pane_height" ;;
+    "display-message -p") printf '%s:%s:%s\n' "$recovery_pane_mode" "$recovery_cursor_y" "$recovery_pane_height" ;;
+    "list-panes -t") printf '%%12\n' ;;
     "capture-pane -p")
       recovery_capture_count=$((recovery_capture_count + 1))
       if [[ "$late_ack_on_capture" -eq 1 && "$*" == *"-S 0"* && -n "$enter_ack_file" ]]; then
@@ -124,9 +127,12 @@ tmux() {
       else
         printf '%s\n' "$busy_pane_output"
       fi
+      if [[ "$recovery_emit_footer" -eq 1 && "$*" == *"-S 0"* ]]; then
+        printf '%s\n' 'GPT-5.6-Sol high · ~/.ao/data/worktrees/worldarchitect.ai/worldarchitect.ai-32 · Repair PR #901 tests ⚠ 2 warnings · f2 to view'
+      fi
       ;;
     "send-keys -t")
-      [[ "$4" == Enter ]] || { printf 'unexpected tmux send-keys: %s\n' "$*" >&2; return 1; }
+      [[ "$3" == %12 && "$4" == Enter ]] || { printf 'unexpected tmux send-keys: %s\n' "$*" >&2; return 1; }
       enter_count=$((enter_count + 1))
       if [[ -n "$enter_ack_file" ]]; then
         jq -cn --arg prompt "$enter_ack_envelope" '{type:"response_item",payload:{role:"user",content:[{type:"input_text",text:$prompt}]},timestamp:"2026-09-23T16:00:00Z"}' >>"$enter_ack_file"
@@ -166,6 +172,20 @@ enter_count=0
 pr_green_reuse_session worldarchitect.ai 901 'ignored replacement' >/dev/null || true
 assert_eq "$enter_count" 0
 
+# Modal panes, a composer without the ordinary footer, and suffix text all
+# fail closed before the single Enter claim.
+recovery_pane_mode=1
+enter_count=0
+pr_green_reuse_session worldarchitect.ai 901 'ignored replacement' >/dev/null || true
+assert_eq "$enter_count" 0
+recovery_pane_mode=0
+recovery_emit_footer=0
+recovery_pane_output=$'› Read and execute /tmp/pr-green-901.brief. [PR_GREEN_DELIVERY_ID:recovery-901]\nEsc to interrupt'
+enter_count=0
+pr_green_reuse_session worldarchitect.ai 901 'ignored replacement' >/dev/null || true
+assert_eq "$enter_count" 0
+recovery_emit_footer=1
+
 tmp_pending="${pending_path}.tmp"
 jq '.request_id = ""' "$pending_path" >"$tmp_pending" && mv -- "$tmp_pending" "$pending_path"
 recovery_identity_ok=1
@@ -202,6 +222,26 @@ native_ack_file=''
 assert_eq "$enter_count" 0
 [[ ! -e "$pending_path" ]] || { printf 'already-acked pending state was not cleared\n' >&2; exit 1; }
 
+recovery_envelope_suffix='Read and execute /tmp/pr-green-906.brief. [PR_GREEN_DELIVERY_ID:recovery-906]'
+jq -cn --arg workspace "$recovery_workspace" --arg envelope "$recovery_envelope_suffix" \
+  '{project_id:"worldarchitect.ai",pr_number:901,session_id:"wa-live",native_id:"native-session-live",workspace:$workspace,prompt:"recovery prompt",envelope:$envelope,brief_path:"/tmp/pr-green-906.brief",request_id:"recovery-906",created_at:1}' \
+  >"$pending_path"
+recovery_pane_output=$'› Read and execute /tmp/pr-green-906.brief. [PR_GREEN_DELIVERY_ID:recovery-906]\ntrailing composer text'
+enter_count=0
+pr_green_reuse_session worldarchitect.ai 901 'ignored replacement' >/dev/null || true
+assert_eq "$enter_count" 0
+
+recovery_envelope_lock='Read and execute /tmp/pr-green-907.brief. [PR_GREEN_DELIVERY_ID:recovery-907]'
+jq -cn --arg workspace "$recovery_workspace" --arg envelope "$recovery_envelope_lock" \
+  '{project_id:"worldarchitect.ai",pr_number:901,session_id:"wa-live",native_id:"native-session-live",workspace:$workspace,prompt:"recovery prompt",envelope:$envelope,brief_path:"/tmp/pr-green-907.brief",request_id:"recovery-907",created_at:1}' \
+  >"$pending_path"
+recovery_pane_output=$'› Read and execute /tmp/pr-green-907.brief. [PR_GREEN_DELIVERY_ID:recovery-907]'
+mkdir -p -- "$recovery_dir/delivery/.worldarchitect.ai-901-recovery-907.submit-recovery-pane.lock"
+enter_count=0
+pr_green_reuse_session worldarchitect.ai 901 'ignored replacement' >/dev/null || true
+assert_eq "$enter_count" 0
+rmdir -- "$recovery_dir/delivery/.worldarchitect.ai-901-recovery-907.submit-recovery-pane.lock"
+
 jq -cn --arg workspace "$recovery_workspace" --arg envelope "$recovery_envelope" \
   '{project_id:"worldarchitect.ai",pr_number:901,session_id:"wa-live",native_id:"native-session-live",workspace:$workspace,prompt:"recovery prompt",envelope:$envelope,brief_path:"/tmp/pr-green-901.brief",request_id:"recovery-901",created_at:1}' \
   >"$pending_path"
@@ -231,6 +271,14 @@ pr_green_reuse_session worldarchitect.ai 901 'ignored replacement' >/dev/null ||
 native_ack_file=''
 assert_eq "$enter_count" 0
 [[ ! -e "$pending_path" ]] || { printf 'legacy envelope ACK was not recognized\n' >&2; exit 1; }
+
+# A migrated legacy pending record must remain on the replay/recovery path on
+# later scans, including when its immutable brief already exists.
+jq -cn --arg workspace "$recovery_workspace" --arg envelope "$recovery_envelope" \
+  '{project_id:"worldarchitect.ai",pr_number:901,session_id:"wa-live",native_id:"native-session-live",workspace:$workspace,prompt:"recovery prompt",envelope:$envelope,brief_path:"/tmp/pr-green-903.brief",legacy_envelope:"legacy raw prompt [PR_GREEN_DELIVERY_ID:recovery-903]",legacy_pending:true,request_id:"recovery-903",created_at:1}' \
+  >"$pending_path"
+assert_eq "$(pr_green_delivery_upgrade_legacy worldarchitect.ai 901 "" native-session-live "$recovery_workspace")" migrated
+rm -f -- "$pending_path"
 
 recovery_envelope_late='Read and execute /tmp/pr-green-905.brief. [PR_GREEN_DELIVERY_ID:recovery-905]'
 jq -cn --arg workspace "$recovery_workspace" --arg envelope "$recovery_envelope_late" \
@@ -292,7 +340,7 @@ assert_eq "$action" reused
 mapfile -t ao_calls <"$ao_calls_file"
 assert_eq "${#ao_calls[@]}" 2
 [[ "${ao_calls[1]}" == 'send --session wa-live --message Read and execute '* ]]
-if rg -q '^spawn ' "$ao_calls_file"; then
+if grep -Eq '^spawn ' "$ao_calls_file"; then
   printf 'live-session reuse must not spawn a second session\n' >&2
   exit 1
 fi
@@ -324,7 +372,7 @@ if [[ "$rc" -ne 4 ]]; then
   printf 'unresolved old delivery must suppress a new prompt (got %s)\n' "$rc" >&2
   exit 1
 fi
-if rg -q '^send ' "$ao_calls_file"; then
+if grep -Eq '^send ' "$ao_calls_file"; then
   printf 'unresolved old delivery appended a new prompt\n' >&2
   exit 1
 fi
@@ -364,7 +412,7 @@ pr_green_reuse_session worldarchitect.ai 123 'must not cross native identity' >/
 rc=$?
 set -e
 assert_eq "$rc" 4
-if rg -q '^send ' "$ao_calls_file"; then
+if grep -Eq '^send ' "$ao_calls_file"; then
   printf 'native identity mismatch must not send through the live session\n' >&2
   exit 1
 fi
@@ -382,7 +430,7 @@ pr_green_reuse_session worldarchitect.ai 777 'must not queue this prompt' >"$act
 action="$(<"$action_file")"
 rm -f "$action_file"
 assert_eq "$action" busy_deferred
-if rg -q '^send ' "$ao_calls_file"; then
+if grep -Eq '^send ' "$ao_calls_file"; then
   printf 'busy live session must not receive a queued prompt\n' >&2
   exit 1
 fi
@@ -423,7 +471,7 @@ pr_green_reuse_session worldarchitect.ai 456 'restore must respect cap' >/dev/nu
 rc=$?
 set -e
 [[ "$rc" -eq 2 ]] || { printf 'restore admission hook must suppress capped restore (got %s)\n' "$rc" >&2; exit 1; }
-if rg -q '^session restore ' "$ao_calls_file"; then
+if grep -Eq '^session restore ' "$ao_calls_file"; then
   printf 'capped restore reached AO restore\n' >&2
   exit 1
 fi
@@ -507,7 +555,7 @@ if [[ "$rc" -ne 3 ]]; then
   printf 'missing native history must return recovery-blocked code 3 (got %s)\n' "$rc" >&2
   exit 1
 fi
-if rg -q 'session restore|^send ' "$ao_calls_file"; then
+if grep -Eq 'session restore|^send ' "$ao_calls_file"; then
   printf 'recovery-blocked session must not restore or send\n' >&2
   exit 1
 fi
@@ -541,6 +589,21 @@ assert_eq "$(printf '%s\n' "$indexed_result" | sed -n '1p')" "$indexed_id"
   printf 'indexed lookup did not return the exact rollout mapping\n' >&2
   exit 1
 }
+
+# An exact id may have a restored filesystem copy before its threads row is
+# indexed in the intended profile; retain both source and copy mappings.
+indexed_copy_home="$recovery_dir/indexed-copy-codex"
+mkdir -p "$indexed_copy_home/sessions/2026/09/23"
+: >"$indexed_copy_home/state_5.sqlite"
+indexed_copy_rollout="$indexed_copy_home/sessions/2026/09/23/rollout-$indexed_id.jsonl"
+printf '%s\n' '{"type":"session_meta","payload":{"session_id":"'"$indexed_id"'","cwd":"'"$recovery_workspace"'"},"timestamp":"2026-09-23T16:02:01Z"}' >"$indexed_copy_rollout"
+export PR_GREEN_CODEX_HOME_CANDIDATES="$indexed_home:$indexed_copy_home"
+indexed_copy_result="$(pr_green_find_native_rollouts "$recovery_workspace" '2026-09-23T16:00:00Z' "$indexed_id")"
+[[ "$indexed_copy_result" == *$'\t'"$indexed_copy_home"$'\t'"sessions/2026/09/23/rollout-$indexed_id.jsonl" ]] || {
+  printf 'indexed lookup omitted the exact filesystem copy\n' >&2
+  exit 1
+}
+export PR_GREEN_CODEX_HOME_CANDIDATES="$indexed_home"
 
 # Multiple valid indexed rows must return success even when a nonselected row
 # is the final match inspected by the output loop.
