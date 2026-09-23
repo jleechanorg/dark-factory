@@ -1593,6 +1593,33 @@ fn run_cargo_tests(
             continue;
         }
 
+        let mut list_args: Vec<String> = vec![
+            "test".to_string(),
+            "--test".to_string(),
+            basename.to_string(),
+        ];
+        if let Some(m) = manifest {
+            list_args.push("--manifest-path".to_string());
+            list_args.push(m.to_string_lossy().into_owned());
+        }
+        list_args.push("--".to_string());
+        list_args.push("--list".to_string());
+        let listed = Command::new(&cargo_bin)
+            .current_dir(repo_root)
+            .args(&list_args)
+            .output()
+            .map_err(|e| RedGreenError::CargoNotFound(format!(
+                "spawn {}: {e}; cargo binary not usable from this environment",
+                cargo_bin.display()
+            )))?;
+        let Some(qualified_name) = resolve_cargo_exact_name(
+            &String::from_utf8_lossy(&listed.stdout),
+            &target.name,
+        ) else {
+            failing.push(format!("{}:NEVER_RAN", target.name));
+            continue;
+        };
+
         let mut args: Vec<String> = vec![
             "test".to_string(),
             "--test".to_string(),
@@ -1603,7 +1630,7 @@ fn run_cargo_tests(
             args.push(m.to_string_lossy().into_owned());
         }
         args.push("--".to_string());
-        args.push(target.name.clone());
+        args.push(qualified_name.clone());
         args.push("--exact".to_string());
 
         let out = Command::new(&cargo_bin)
@@ -1626,7 +1653,7 @@ fn run_cargo_tests(
             compile_errored = true;
         }
 
-        let name = &target.name;
+        let name = &qualified_name;
         let passed_marker = format!("test {name} ... ok");
         let failed_marker = format!("test {name} ... FAILED");
         let ignored_marker = format!("test {name} ... ignored");
@@ -1641,6 +1668,20 @@ fn run_cargo_tests(
         failing,
         compile_errored,
     })
+}
+
+/// Cargo's `--exact` accepts the fully-qualified test identity emitted by
+/// `--list`; source discovery deliberately retains only a bare function name.
+/// Resolve that name only when it identifies one test, so a duplicate nested
+/// name cannot make the red/green detector accept an unrelated passing test.
+fn resolve_cargo_exact_name(list_output: &str, bare_name: &str) -> Option<String> {
+    let matches: Vec<&str> = list_output
+        .lines()
+        .filter_map(|line| line.strip_suffix(": test"))
+        .map(str::trim)
+        .filter(|name| *name == bare_name || name.ends_with(&format!("::{bare_name}")))
+        .collect();
+    (matches.len() == 1).then(|| matches[0].to_string())
 }
 
 fn should_skip_cargo_target(path: &Path) -> bool {
@@ -2727,6 +2768,25 @@ fn b() {
             !should_skip_cargo_target(&top_level_mod),
             "tests/mod.rs is a top-level Cargo integration target and must run"
         );
+    }
+
+    #[test]
+    fn cargo_exact_name_uses_unique_module_qualified_identity() {
+        let listed = "unit_tests::nested_target: test\ntop_level_target: test\n";
+        assert_eq!(
+            resolve_cargo_exact_name(listed, "nested_target"),
+            Some("unit_tests::nested_target".to_string())
+        );
+        assert_eq!(
+            resolve_cargo_exact_name(listed, "top_level_target"),
+            Some("top_level_target".to_string())
+        );
+    }
+
+    #[test]
+    fn cargo_exact_name_rejects_ambiguous_nested_identity() {
+        let listed = "one::same_name: test\ntwo::same_name: test\n";
+        assert_eq!(resolve_cargo_exact_name(listed, "same_name"), None);
     }
 
     /// Create a unique temp directory under `std::env::temp_dir()`. The
