@@ -139,26 +139,16 @@ pipeline before invoking `dark-factory`, unless the user passed `--pipeline`.
 ## Architecture
 
 ### Agent Orchestrator (AO) Repository Policy
-- The actual production worker-spawn path — `ao_spawn_command_with_mode()` in
-  `daemon/src/adapters.rs` — is hard-pinned to the **Node/TS fork**
-  (`@jleechanorg/ao-cli`), not the Go rewrite. It sets
-  `NODE_OPTIONS=--import=<path>` to preload
-  `daemon/scripts/ao-spawn-v013-bridge.mjs`, and that bridge script itself
-  refuses to run unless the resolved `ao` binary's `package.json` reports
-  `name === "@jleechanorg/ao-cli"` and `version === "0.1.3"`
-  (`daemon/scripts/ao-spawn-v013-bridge.mjs:30-41`). This is enforced by the
-  bridge's own runtime check, independent of anything stated here.
-- A separate **Go rewrite** (`ao-go`, upstream
+- The canonical engine is Go `agent-orchestrator` (`ao-go`, upstream
   `https://github.com/strongdm/agent-orchestrator` /
-  `jleechanorg/agent-orchestrator`) exists on the production host as its own
-  binary with its own systemd unit (`ao-daemon.service`) and project
-  registry, but as of 2026-09 it has never had `dark-factory` registered as a
-  project, and no code under `daemon/src/*.rs` calls it — it is an
-  aspirational/future migration target, not the engine currently in use.
-  (`daemon/factory-ao-remediate.sh`, a legacy Mac-side shell script separate
-  from the Rust daemon's tick loop, defaults to `~/bin/ao-go` for its own
-  narrower remediation purpose, but that script is not part of the
-  `adapters.rs` spawn path either.)
+  `jleechanorg/agent-orchestrator`). Set `DARK_FACTORY_AO_ENGINE=strongdm-go`
+  for `ao_spawn_command_with_mode()` in `daemon/src/adapters.rs` to select
+  its Go dispatch path. Verify the deployed binary and effective service
+  configuration; source support alone does not prove runtime activation.
+- The legacy Node/TS compatibility path remains in the adapter when that
+  engine setting is absent. It uses `daemon/scripts/ao-spawn-v013-bridge.mjs`
+  and requires `@jleechanorg/ao-cli` version `0.1.3`; do not mistake that
+  compatibility code for the configured Go engine or install it for this job.
 - The AO repository (whichever engine) is **read-only / reference only**. We
   almost never want to modify or open PRs against AO; all session liveness
   interpretation, reaping triggers, timeout logic, and promotion handling
