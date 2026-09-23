@@ -25,14 +25,17 @@ METRICS_DIR="${PR_GREEN_METRICS_DIR:-$HOME/.local/state/jleechanorg-pr-green}"
 STATE_DIR="$METRICS_DIR/pr-state"
 export PR_GREEN_DELIVERY_STATE_DIR="${PR_GREEN_DELIVERY_STATE_DIR:-$METRICS_DIR/pending-delivery}"
 AO_SPAWN_LOCK_DIR="${PR_GREEN_AO_SPAWN_LOCK_DIR:-/run/user/${UID}}"
+GLOBAL_ADMISSION_LOCK_FILE="$AO_SPAWN_LOCK_DIR/jleechanorg-pr-green-global-admission.lock"
 export AO_CONFIG_PATH="${PR_GREEN_AO_CONFIG_PATH:-$HOME/agent-orchestrator.yaml}"
 mkdir -p "$METRICS_DIR"
+mkdir -p "$AO_SPAWN_LOCK_DIR"
+exec 8>"$GLOBAL_ADMISSION_LOCK_FILE"
 run_started="${PR_GREEN_RUN_STARTED:-$(date +%s)}"
 analyzed=0
+analysis_failed=0
 actionable=0
 attempted=0
 dispatched=0
-admission_reservations=0
 
 # Count all non-terminated AO sessions through the daemon's own SQLite source.
 # This is deliberately a read-only aggregate: project-scoped session APIs do
@@ -55,11 +58,11 @@ pr_green_admission_available() {
     echo "$LOG_PREFIX active-session count unavailable; suppressing new admission" >&2
     return 1
   }
-  (( active_count + admission_reservations < GLOBAL_ACTIVE_CAP ))
+  (( active_count < GLOBAL_ACTIVE_CAP ))
 }
 
-pr_green_record_admission() {
-  admission_reservations=$((admission_reservations + 1))
+pr_green_release_admission_lock() {
+  flock -u 8 2>/dev/null || true
 }
 
 command -v gh >/dev/null || { echo "$LOG_PREFIX gh is required" >&2; exit 127; }
@@ -286,10 +289,14 @@ pr_green_register_project() {
 while IFS=$'\t' read -r repo number title url updated; do
   [[ -n "$repo" && -n "$number" ]] || continue
   : "$updated" # retained from discovery for the audit TSV ordering
-  analyzed=$((analyzed + 1))
   live_state="$(pr_green_fetch_live_state "$url" 2>/dev/null || true)"
   live_state="$(pr_green_apply_required_contract "$repo" "$live_state")"
-  [[ -n "$live_state" ]] || { echo "$LOG_PREFIX unable to inspect $repo#$number" >&2; continue; }
+  if [[ -z "$live_state" ]]; then
+    analysis_failed=$((analysis_failed + 1))
+    echo "$LOG_PREFIX unable to inspect $repo#$number" >&2
+    continue
+  fi
+  analyzed=$((analyzed + 1))
   mergeable="$(jq -r '.mergeability // (if .conflicting then "CONFLICTING" else "MERGEABLE" end)' <<<"$live_state")"
   failures="$(jq -r '.failed_checks | join(",")' <<<"$live_state")"
   previous_snapshot="$(pr_green_read_snapshot "$STATE_DIR" "$repo" "$number" || true)"
@@ -325,6 +332,7 @@ while IFS=$'\t' read -r repo number title url updated; do
   cursor_tmp="${selection_cursor_file}.tmp.$$"
   printf '%s#%s\n' "$repo" "$number" >"$cursor_tmp"
   mv -- "$cursor_tmp" "$selection_cursor_file"
+  echo "$LOG_PREFIX selected $repo#$number"
 
   prompt="$(cat <<EOF
 Work on ${url} in ${repo}. This is an automated daily repair pass for a PR updated in the last ${WINDOW_HOURS} hours. Inspect the exact current PR head and base first.
@@ -389,32 +397,45 @@ EOF
   needs_new_admission=1
   if [[ -n "$existing_session_record" && "$existing_session_terminated" == false ]]; then
     needs_new_admission=0
-  elif [[ -z "$existing_session_record" && ( "$pending_delivery_status" == pending || "$pending_delivery_status" == acked ) ]]; then
+  elif [[ -z "$existing_session_record" && "$pending_delivery_status" == pending ]]; then
     # Let the delivery/reuse helper resolve an existing durable request; it is
     # not a new AO worker admission.
     needs_new_admission=0
   fi
-  if (( needs_new_admission == 1 )) && ! pr_green_admission_available; then
-    admission_deferred=$((admission_deferred + 1))
-    record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" no_change admission_cap_deferred
-    echo "$LOG_PREFIX active-session cap reached ($GLOBAL_ACTIVE_CAP); deferring new admission for $repo#$number" >&2
-    continue
+  admission_lock_held=0
+  if (( needs_new_admission == 1 )); then
+    if ! flock -n 8; then
+      admission_deferred=$((admission_deferred + 1))
+      record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" no_change admission_cap_deferred
+      echo "$LOG_PREFIX another bounded run holds the admission lock; deferring $repo#$number" >&2
+      continue
+    fi
+    admission_lock_held=1
+    if ! pr_green_admission_available; then
+      admission_deferred=$((admission_deferred + 1))
+      record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" no_change admission_cap_deferred
+      pr_green_release_admission_lock
+      echo "$LOG_PREFIX active-session cap reached ($GLOBAL_ACTIVE_CAP); deferring new admission for $repo#$number" >&2
+      continue
+    fi
   fi
   if session_action="$(pr_green_reuse_session "$project_id" "$number" "$prompt")"; then
     case "$session_action" in
       restored)
       attempted=$((attempted + 1))
       restored=$((restored + 1))
-      pr_green_record_admission
+      pr_green_release_admission_lock
       echo "$LOG_PREFIX restored and reused AO session for $repo#$number"
         ;;
       busy_deferred)
       busy_deferred=$((busy_deferred + 1))
+      pr_green_release_admission_lock
       echo "$LOG_PREFIX AO session for $repo#$number is visibly busy; deferred without queuing a prompt"
         ;;
       *)
         attempted=$((attempted + 1))
         reused=$((reused + 1))
+      pr_green_release_admission_lock
       echo "$LOG_PREFIX reused AO session for $repo#$number"
       ;;
     esac
@@ -424,22 +445,32 @@ EOF
     session_reuse_rc=$?
     if [[ "$session_reuse_rc" -eq 4 ]]; then
       delivery_unconfirmed=$((delivery_unconfirmed + 1))
+      pr_green_release_admission_lock
       record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed delivery_unconfirmed || true
       echo "$LOG_PREFIX delivery unconfirmed for $repo#$number; duplicate spawn suppressed" >&2
       continue
     fi
     if [[ "$session_reuse_rc" -eq 3 ]]; then
       recovery_blocked=$((recovery_blocked + 1))
+      pr_green_release_admission_lock
       record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed recovery_blocked || true
       echo "$LOG_PREFIX native recovery blocked for $repo#$number; duplicate spawn suppressed" >&2
       continue
     fi
     if [[ "$session_reuse_rc" -eq 2 ]]; then
       attempted=$((attempted + 1))
+      pr_green_release_admission_lock
       echo "$LOG_PREFIX existing AO session for $repo#$number rejected update; skipping duplicate spawn" >&2
       reconcile_pr "$repo" "$number" "$url" "$live_state" reuse_rejected || true
       continue
     fi
+  fi
+  if (( admission_lock_held == 1 )) && ! pr_green_admission_available; then
+    admission_deferred=$((admission_deferred + 1))
+    record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" no_change admission_cap_deferred
+    pr_green_release_admission_lock
+    echo "$LOG_PREFIX active-session cap reached before spawn ($GLOBAL_ACTIVE_CAP); deferring $repo#$number" >&2
+    continue
   fi
   # AO serializes spawns per project; mirror that lock so candidates are
   # deferred instead of producing concurrent-spawn refusals.
@@ -448,33 +479,29 @@ EOF
   spawn_cmd=(flock -n "$ao_spawn_lock" ao spawn --project "$project_id" --claim-pr "$number" --name "$session_name" --harness codex --prompt "$prompt")
   attempted=$((attempted + 1))
   spawn_err="$(mktemp)"
-  # AO keeps its CLI attached to the worker. Detach it instead of killing the
-  # worker on timeout; inspect early output only for stale-worktree recovery.
+  # The Go AO CLI creates and claims the worker, then returns. Wait for that
+  # command while the global admission lock is held; never infer dispatch from
+  # a still-running process.
   "${spawn_cmd[@]}" >"$spawn_err" 2>&1 &
   spawn_pid=$!
-  sleep "${PR_GREEN_SPAWN_PROBE_SECONDS:-5}"
-  if kill -0 "$spawn_pid" 2>/dev/null; then
-    echo "$LOG_PREFIX dispatched $repo#$number (AO worker detached)"
-    dispatched=$((dispatched + 1))
-    pr_green_record_admission
-    rm -f "$spawn_err"
-    reconcile_pr "$repo" "$number" "$url" "$live_state" dispatched || true
-    continue
-  fi
   spawn_rc=0
   wait "$spawn_pid" || spawn_rc=$?
   if [[ -s "$spawn_err" ]]; then
     cat "$spawn_err" >&2
-    # `ao spawn` may successfully create/claim a session and then remain
-    # attached to the worker until the timeout. Treat durable creation proof as
-    # success; do not kill the newly-created worker just because the CLI stayed
-    # attached.
+    # Require both the acknowledged output and the project-scoped durable row.
     if pr_green_spawn_output_is_success "$spawn_err"; then
-      echo "$LOG_PREFIX dispatched $repo#$number (AO session created; CLI wait bounded)"
-      dispatched=$((dispatched + 1))
-      pr_green_record_admission
+      if pr_green_session_record "$project_id" "$number" >/dev/null 2>&1; then
+        echo "$LOG_PREFIX dispatched $repo#$number (AO session acknowledged)"
+        dispatched=$((dispatched + 1))
+        pr_green_release_admission_lock
+        rm -f "$spawn_err"
+        reconcile_pr "$repo" "$number" "$url" "$live_state" dispatched || true
+        continue
+      fi
+      echo "$LOG_PREFIX AO spawn acknowledged but durable session row was not observable for $repo#$number" >&2
+      record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_unverified
+      pr_green_release_admission_lock
       rm -f "$spawn_err"
-      reconcile_pr "$repo" "$number" "$url" "$live_state" dispatched || true
       continue
     fi
     if ! ao project get "$project_id" --json >/dev/null 2>&1; then
@@ -483,43 +510,45 @@ EOF
     if ! pr_green_ensure_codex_scope "$project_id"; then
       echo "$LOG_PREFIX failed to register $repo#$number" >&2
       record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed ao_registration_failed
+      pr_green_release_admission_lock
       rm -f "$spawn_err"
       continue
     fi
     retry_err="$(mktemp)"
     "${spawn_cmd[@]}" >"$retry_err" 2>&1 &
     retry_pid=$!
-    sleep "${PR_GREEN_SPAWN_PROBE_SECONDS:-5}"
-    if kill -0 "$retry_pid" 2>/dev/null; then
-      echo "$LOG_PREFIX dispatched $repo#$number after AO registration"
-      dispatched=$((dispatched + 1))
-      pr_green_record_admission
-      rm -f "$spawn_err" "$retry_err"
-      reconcile_pr "$repo" "$number" "$url" "$live_state" registered_and_dispatched || true
-      continue
-    fi
     retry_rc=0
     wait "$retry_pid" || retry_rc=$?
     if [[ -s "$retry_err" ]] && pr_green_spawn_output_is_success "$retry_err"; then
-      echo "$LOG_PREFIX dispatched $repo#$number after AO registration (session acknowledged)"
-      dispatched=$((dispatched + 1))
-      pr_green_record_admission
+      if pr_green_session_record "$project_id" "$number" >/dev/null 2>&1; then
+        echo "$LOG_PREFIX dispatched $repo#$number after AO registration (session acknowledged)"
+        dispatched=$((dispatched + 1))
+        pr_green_release_admission_lock
+        rm -f "$spawn_err" "$retry_err"
+        reconcile_pr "$repo" "$number" "$url" "$live_state" registered_and_dispatched || true
+        continue
+      fi
+      echo "$LOG_PREFIX AO retry acknowledged but durable session row was not observable for $repo#$number" >&2
+      record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_retry_unverified
+      pr_green_release_admission_lock
       rm -f "$spawn_err" "$retry_err"
-      reconcile_pr "$repo" "$number" "$url" "$live_state" registered_and_dispatched || true
       continue
     fi
     [[ ! -s "$retry_err" ]] || cat "$retry_err" >&2
     echo "$LOG_PREFIX AO retry failed for $repo#$number (rc=$retry_rc)" >&2
     record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_retry_failed
+    pr_green_release_admission_lock
     rm -f "$spawn_err" "$retry_err"
     continue
   fi
   record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_failed
   echo "$LOG_PREFIX AO spawn failed for $repo#$number (rc=$spawn_rc)" >&2
+  pr_green_release_admission_lock
   rm -f "$spawn_err"
 done <<< "$ordered_prs"
 
 jq -n --argjson ts "$run_started" --argjson analyzed "$analyzed" \
+  --argjson analysis_failed "$analysis_failed" \
   --argjson discovered "$discovered_count" \
   --argjson actionable "$actionable" --argjson selected "$selected" \
   --argjson attempted "$attempted" \
@@ -530,6 +559,6 @@ jq -n --argjson ts "$run_started" --argjson analyzed "$analyzed" \
   --argjson recovery_blocked "$recovery_blocked" \
   --argjson delivery_unconfirmed "$delivery_unconfirmed" \
   --argjson fixed_confirmed "$fixed_confirmed" \
-  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, busy_deferred:$busy_deferred, cooldown_deferred:$cooldown_deferred, admission_deferred:$admission_deferred, recovery_blocked:$recovery_blocked, delivery_unconfirmed:$delivery_unconfirmed, fixed_confirmed:$fixed_confirmed}' \
+  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, analysis_failed:$analysis_failed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, busy_deferred:$busy_deferred, cooldown_deferred:$cooldown_deferred, admission_deferred:$admission_deferred, recovery_blocked:$recovery_blocked, delivery_unconfirmed:$delivery_unconfirmed, fixed_confirmed:$fixed_confirmed}' \
   >> "$METRICS_DIR/runs.jsonl"
 echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored busy_deferred=$busy_deferred cooldown_deferred=$cooldown_deferred recovery_blocked=$recovery_blocked delivery_unconfirmed=$delivery_unconfirmed fixed_confirmed=$fixed_confirmed"

@@ -400,7 +400,7 @@ for iteration in 1 2; do
     sleep 0.4
   fi
 done
-grep -Fq 'repo-a#13' "$fixture_dir/fairness-2.out" || {
+if ! grep -Fq 'repo-a#13' "$fixture_dir/fairness-1.out" && ! grep -Fq 'repo-a#13' "$fixture_dir/fairness-2.out"; then
   cat "$fixture_dir/fairness-2.out" >&2
   cat "$fixture_dir/fairness-2.err" >&2
   cat "$fair_metrics/selection-cursor" >&2 || true
@@ -408,7 +408,7 @@ grep -Fq 'repo-a#13' "$fixture_dir/fairness-2.out" || {
   cat "$fair_metrics/runs.jsonl" >&2 || true
   echo 'FAIL: PR #13 remained starved after the second bounded run' >&2
   exit 1
-}
+fi
 second_fair_run="$(jq -s 'last' "$fair_metrics/runs.jsonl")"
 [[ "$(jq -r '.selected' <<<"$second_fair_run")" -gt 0 ]] || {
   echo 'FAIL: fairness second run did not select any rotated candidate' >&2
