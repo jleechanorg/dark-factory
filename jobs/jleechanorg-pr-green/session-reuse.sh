@@ -4,11 +4,11 @@
 # use AO's project-scoped JSON API rather than scraping daemon internals.
 
 # Recognize both legacy and current Go AO spawn acknowledgements. The Go CLI
-# exits after claiming a PR and reports e.g. "spawned session
-# worldarchitect.ai-31 (idle) (claimed URL)" rather than the older SESSION= or
-# Worktree markers.
+# exits after claiming a PR and reports either a generic "claimed URL" or the
+# actual claimed pull-request URL, rather than the older SESSION= or Worktree
+# markers.
 pr_green_spawn_output_is_success() {
-  grep -Eq 'SESSION=wa-[0-9]+|created and claimed PR|Worktree: |spawned session [^[:space:]]+ .*claimed URL' "$1"
+  grep -Eq 'SESSION=wa-[0-9]+|created and claimed PR|Worktree: |spawned session [^[:space:]]+ .*claimed (URL|https?://)' "$1"
 }
 
 # Return the newest session whose display name is the stable PR key used by the

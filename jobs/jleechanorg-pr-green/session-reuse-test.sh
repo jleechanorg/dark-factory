@@ -49,6 +49,8 @@ assert_eq() {
 success_fixture="$(mktemp)"
 printf '%s\n' 'spawned session worldarchitect.ai-31 (idle) (claimed URL)' >"$success_fixture"
 pr_green_spawn_output_is_success "$success_fixture"
+printf '%s\n' 'spawned session worldarchitect.ai-36 (idle) (claimed https://github.com/jleechanorg/worldarchitect.ai/pull/9970)' >"$success_fixture"
+pr_green_spawn_output_is_success "$success_fixture"
 printf '%s\n' 'spawn acknowledgement parser accepted current Go output'
 printf '%s\n' 'spawn failed: another ao spawn is in progress' >"$success_fixture"
 if pr_green_spawn_output_is_success "$success_fixture"; then
