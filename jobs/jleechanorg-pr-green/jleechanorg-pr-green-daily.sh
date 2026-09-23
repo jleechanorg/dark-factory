@@ -18,6 +18,7 @@ LOG_PREFIX="[pr-green-daily]"
 AO_PROJECT_ROOT="${PR_GREEN_AO_PROJECT_ROOT:-$HOME/.ao/daily-projects}"
 METRICS_DIR="${PR_GREEN_METRICS_DIR:-$HOME/.local/state/jleechanorg-pr-green}"
 STATE_DIR="$METRICS_DIR/pr-state"
+AO_SPAWN_LOCK_DIR="${PR_GREEN_AO_SPAWN_LOCK_DIR:-/run/user/${UID}}"
 export AO_CONFIG_PATH="${PR_GREEN_AO_CONFIG_PATH:-$HOME/agent-orchestrator.yaml}"
 mkdir -p "$METRICS_DIR"
 run_started="$(date +%s)"
@@ -33,10 +34,58 @@ since="$(date -u -d "-${WINDOW_HOURS} hours" '+%Y-%m-%dT%H:%M:%SZ')"
 echo "$LOG_PREFIX scanning jleechanorg PRs updated since $since (max $MAX_PRS)"
 
 since_date="${since:0:10}"
-prs="$(gh search prs --owner jleechanorg --state open --updated ">=${since_date}" --limit 100 \
-  --json repository,number,title,url,updatedAt,isDraft \
-  | jq -r --arg since "$since" '.[] | select((.isDraft|not) and .updatedAt >= $since) | [.repository.name, .number, .title, .url, .updatedAt] | @tsv' \
-  | sort -k5r | head -n 100)"
+# REST Search is exhaustively paginated only below GitHub's documented
+# 1,000-result ceiling. Validate every page before trusting it; an incomplete
+# response or a count mismatch falls back to repository-wise PR pagination.
+discover_prs() {
+  local search_json search_total search_items search_complete repos_json repo pulls
+  search_json="$(gh api --paginate --slurp -X GET /search/issues \
+    -f "q=org:jleechanorg is:pr is:open updated:>=${since_date}" -f per_page=100)"
+  search_total="$(jq -r '([.[].total_count? // 0] | max) // 0' <<<"$search_json")"
+  search_items="$(jq -r '[.[].items[]?] | length' <<<"$search_json")"
+  search_complete="$(jq -r '
+    ([.[].incomplete_results? // false] | any) as $incomplete
+    | ([.[].total_count?] | all(type == "number")) as $counts_numeric
+    | ($counts_numeric and ($incomplete | not))
+  ' <<<"$search_json" 2>/dev/null || printf 'false\n')"
+  jq -n --arg cutoff "$since" --arg source search \
+    --argjson pages "$search_json" --argjson total "$search_total" \
+    --argjson item_count "$search_items" --argjson complete "$search_complete" \
+    '{cutoff:$cutoff,source:$source,pages:$pages,total_count:$total,item_count:$item_count,incomplete_results:($complete|not)}' \
+    >"$METRICS_DIR/discovery-${run_started}.json"
+  if [[ "$search_complete" == true ]] && (( search_total <= 1000 )) && (( search_items == search_total )); then
+    jq -r --arg since "$since" '
+      .[] | .items[]?
+      | select(.updated_at >= $since and ((.draft // false) | not))
+      | [(.repository_url | split("/") | .[-1]), .number, .title, .html_url, .updated_at]
+      | @tsv
+    ' <<<"$search_json"
+    return 0
+  fi
+
+  echo "$LOG_PREFIX search response incomplete, count-mismatched, or above 1000; using repository-wise fallback" >&2
+  repos_json="$(gh api --paginate --slurp -X GET /orgs/jleechanorg/repos \
+    -f type=all -f per_page=100)"
+  jq -n --arg cutoff "$since" --arg source repo_fallback \
+    --argjson pages "$search_json" --argjson total "$search_total" \
+    --argjson item_count "$search_items" --argjson complete "$search_complete" \
+    '{cutoff:$cutoff,source:$source,pages:$pages,total_count:$total,item_count:$item_count,incomplete_results:($complete|not)}' \
+    >"$METRICS_DIR/discovery-${run_started}.json"
+  while IFS= read -r repo; do
+    [[ -n "$repo" ]] || continue
+    pulls="$(gh api --paginate --slurp -X GET "/repos/jleechanorg/${repo}/pulls" \
+      -f state=open -f per_page=100)"
+    jq -r --arg repo "$repo" --arg since "$since" '
+      .[][]?
+      | select(((.state // "open") | ascii_downcase) == "open")
+      | select(.updated_at >= $since and ((.draft // false) | not))
+      | [$repo, .number, .title, .html_url, .updated_at]
+      | @tsv
+    ' <<<"$pulls"
+  done < <(jq -r '.[][]? | .name // empty' <<<"$repos_json")
+}
+
+prs="$(discover_prs | sort -t $'\t' -k5,5r -k1,1 -k2,2n -k4,4)"
 
 # Persist the complete discovery set for the report/audit. Dispatch caps are
 # intentionally separate from discovery: a capped repair pass must not pretend
@@ -85,6 +134,7 @@ record_outcome() {
 reconcile_pr() {
   local repo="$1" number="$2" url="$3" before="$4" action="$5" after classification snapshot_path
   after="$(pr_green_fetch_live_state "$url" 2>/dev/null || true)"
+  after="$(pr_green_apply_required_contract "$repo" "$after")"
   [[ -n "$after" ]] || { echo "$LOG_PREFIX unable to re-read $repo#$number after $action" >&2; return 1; }
   classification="$(pr_green_classify_outcome "$before" "$after")"
   record_outcome "$repo" "$number" "$url" "$before" "$after" "$classification" "$action"
@@ -102,18 +152,30 @@ while IFS=$'\t' read -r repo number title url updated; do
   : "$updated" # retained from discovery for the audit TSV ordering
   analyzed=$((analyzed + 1))
   live_state="$(pr_green_fetch_live_state "$url" 2>/dev/null || true)"
+  live_state="$(pr_green_apply_required_contract "$repo" "$live_state")"
   [[ -n "$live_state" ]] || { echo "$LOG_PREFIX unable to inspect $repo#$number" >&2; continue; }
-  mergeable="$(jq -r 'if .conflicting then "CONFLICTING" else "MERGEABLE" end' <<<"$live_state")"
+  mergeable="$(jq -r '.mergeability // (if .conflicting then "CONFLICTING" else "MERGEABLE" end)' <<<"$live_state")"
   failures="$(jq -r '.failed_checks | join(",")' <<<"$live_state")"
+  required_missing="$(jq -r '(.required_checks_missing // []) | length' <<<"$live_state")"
   previous_snapshot="$(pr_green_read_snapshot "$STATE_DIR" "$repo" "$number" || true)"
   if [[ -n "$previous_snapshot" ]]; then
+    previous_snapshot="$(pr_green_apply_required_contract "$repo" "$previous_snapshot")"
     reconcile_pr "$repo" "$number" "$url" "$previous_snapshot" reconciled || true
   fi
-  if [[ "$mergeable" != "CONFLICTING" && -z "$failures" ]]; then
+  if [[ "$mergeable" == "UNKNOWN" ]]; then
+    echo "$LOG_PREFIX skip $repo#$number (mergeability unknown; pending)"
+    continue
+  fi
+  if [[ "$mergeable" != "CONFLICTING" && -z "$failures" && "$required_missing" == 0 ]]; then
     echo "$LOG_PREFIX skip $repo#$number (no conflict or failed check)"
     continue
   fi
   actionable=$((actionable + 1))
+  if [[ "$repo" == "agent-orchestrator" || "$repo" == "agent-orchestrator-golang" ]]; then
+    record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" no_change authorization_excluded
+    echo "$LOG_PREFIX authorization excludes AO repository mutation for $repo#$number"
+    continue
+  fi
   if pr_green_same_head_cooldown_applies "$METRICS_DIR/outcomes.jsonl" "$repo" "$number" "$live_state" "$(date +%s)" "${PR_GREEN_SAME_HEAD_COOLDOWN_SECONDS:-28800}"; then
     cooldown_deferred=$((cooldown_deferred + 1))
     record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" no_change cooldown_deferred
@@ -211,7 +273,8 @@ EOF
   fi
   # AO serializes spawns per project; mirror that lock so candidates are
   # deferred instead of producing concurrent-spawn refusals.
-  ao_spawn_lock="/run/user/${UID}/jleechanorg-pr-green-ao-${project_id}.lock"
+  mkdir -p "$AO_SPAWN_LOCK_DIR"
+  ao_spawn_lock="$AO_SPAWN_LOCK_DIR/jleechanorg-pr-green-ao-${project_id}.lock"
   spawn_cmd=(flock -n "$ao_spawn_lock" ao spawn --project "$project_id" --claim-pr "$number" --name "$session_name" --harness codex --prompt "$prompt")
   attempted=$((attempted + 1))
   spawn_err="$(mktemp)"

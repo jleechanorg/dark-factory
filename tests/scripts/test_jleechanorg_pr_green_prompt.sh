@@ -13,8 +13,8 @@ printf '%s\n' '{"tokens":{}}' >"$codex_home/auth.json"
 cat >"$mock_bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "$1" == "search" && "$2" == "prs" ]]; then
-  printf '%s\n' '[{"repository":{"name":"worldarchitect.ai"},"number":9941,"title":"prompt integration","url":"https://github.com/jleechanorg/worldarchitect.ai/pull/9941","updatedAt":"2099-01-01T00:00:00Z","isDraft":false}]'
+if [[ "$1" == "api" ]]; then
+  printf '%s\n' '[{"total_count":1,"incomplete_results":false,"items":[{"repository_url":"https://api.github.com/repos/jleechanorg/worldarchitect.ai","number":9941,"title":"prompt integration","html_url":"https://github.com/jleechanorg/worldarchitect.ai/pull/9941","updated_at":"2099-01-01T00:00:00Z","draft":false}]}]'
 elif [[ "$1" == "pr" && "$2" == "view" ]]; then
   printf '%s\n' '{"headRefOid":"head-before","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","statusCheckRollup":[]}'
 else

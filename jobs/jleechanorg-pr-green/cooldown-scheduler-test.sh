@@ -18,9 +18,9 @@ EOF
 cat >"$mock_bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "$1" == "search" ]]; then
+if [[ "$1" == "api" ]]; then
   updated="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  jq -cn --arg updated "$updated" '[{repository:{name:"worldarchitect.ai"},number:9941,title:"conflict",url:"https://github.com/jleechanorg/worldarchitect.ai/pull/9941",updatedAt:$updated,isDraft:false}]'
+  jq -cn --arg updated "$updated" '[{total_count:1,incomplete_results:false,items:[{repository_url:"https://api.github.com/repos/jleechanorg/worldarchitect.ai",number:9941,title:"conflict",html_url:"https://github.com/jleechanorg/worldarchitect.ai/pull/9941",updated_at:$updated,draft:false}]}]'
   exit 0
 fi
 if [[ "$1 $2" == "pr view" ]]; then

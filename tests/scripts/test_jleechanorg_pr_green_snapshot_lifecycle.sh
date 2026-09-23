@@ -13,14 +13,14 @@ mkdir -p "$mock_bin" "$metrics_dir/pr-state"
 cat >"$mock_bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "$1" == "search" && "$2" == "prs" ]]; then
+if [[ "$1" == "api" ]]; then
   updated="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  jq -cn --arg updated "$updated" '[{repository:{name:"worldarchitect.ai"},number:9941,title:"reconciled",url:"https://github.com/jleechanorg/worldarchitect.ai/pull/9941",updatedAt:$updated,isDraft:false}]'
+  jq -cn --arg updated "$updated" '[{total_count:1,incomplete_results:false,items:[{repository_url:"https://api.github.com/repos/jleechanorg/worldarchitect.ai",number:9941,title:"reconciled",html_url:"https://github.com/jleechanorg/worldarchitect.ai/pull/9941",updated_at:$updated,draft:false}]}]'
 elif [[ "$1" == "pr" && "$2" == "view" ]]; then
   if [[ -n "${PR_GREEN_VIEW_STATE_FILE:-}" ]]; then
     cat "$PR_GREEN_VIEW_STATE_FILE"
   else
-    printf '%s\n' '{"headRefOid":"green-head","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[]}'
+    printf '%s\n' '{"headRefOid":"green-head","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"Green Gate","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"Tests Required Gate","status":"COMPLETED","conclusion":"SUCCESS"}]}'
   fi
 else
   printf 'unexpected gh invocation: %s\n' "$*" >&2
@@ -65,7 +65,7 @@ PATH="$mock_bin:$PATH" \
 # only the later green read may retire it and emit one confirmed fix.
 fixed_before="$(jq -s '[.[] | select(.result == "fixed" and .verified == true)] | length' "$metrics_dir/outcomes.jsonl")"
 cat >"$state_file" <<'EOF'
-{"headRefOid":"replacement-head","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"unit","status":"IN_PROGRESS"}]}
+{"headRefOid":"replacement-head","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"Green Gate","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"Tests Required Gate","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"unit","status":"IN_PROGRESS"}]}
 EOF
 printf '%s\n' '{"head_sha":"blocked-head","conflicting":true,"failed_checks":[],"pending_checks":false}' >"$metrics_dir/pr-state/worldarchitect.ai-9941.json"
 PATH="$mock_bin:$PATH" \
@@ -79,7 +79,7 @@ PATH="$mock_bin:$PATH" \
 }
 
 cat >"$state_file" <<'EOF'
-{"headRefOid":"replacement-head","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"unit","status":"COMPLETED","conclusion":"SUCCESS"}]}
+{"headRefOid":"replacement-head","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"Green Gate","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"Tests Required Gate","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"unit","status":"COMPLETED","conclusion":"SUCCESS"}]}
 EOF
 PATH="$mock_bin:$PATH" \
   HOME="$fixture_dir/home" \

@@ -30,6 +30,19 @@ assert_eq "$(jq -r '.head_sha' <<<"$state")" after
 assert_eq "$(jq -r '.failed_checks | join(",")' <<<"$state")" lint
 assert_eq "$(jq -r '.pending_checks' <<<"$state")" true
 
+unknown='{"headRefOid":"after","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","statusCheckRollup":[]}'
+assert_eq "$(jq -r '.pending_checks' <<<"$(pr_green_state_from_pr_json <<<"$unknown")")" true
+gates='{"head_sha":"after","conflicting":false,"failed_checks":[],"pending_checks":false,"check_statuses":{"Green Gate":"SUCCESS","Tests Required Gate":"SUCCESS"}}'
+assert_eq "$(jq -r '.required_checks_missing | length' <<<"$(pr_green_apply_required_contract worldarchitect.ai "$gates")")" 0
+missing_gate='{"head_sha":"after","conflicting":false,"failed_checks":[],"pending_checks":false,"check_statuses":{"Green Gate":"SUCCESS"}}'
+missing_state="$(pr_green_apply_required_contract worldarchitect.ai "$missing_gate")"
+assert_eq "$(jq -r '.required_checks_missing | join(",")' <<<"$missing_state")" 'Tests Required Gate'
+assert_eq "$(pr_green_classify_outcome "$before" "$missing_state")" pushed_ci_pending
+
+error_check='{"headRefOid":"after","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"tests","conclusion":"ERROR","status":"COMPLETED"}]}'
+state="$(pr_green_state_from_pr_json <<<"$error_check")"
+assert_eq "$(jq -r '.failed_checks | join(",")' <<<"$state")" tests
+
 # A new head can be returned before GitHub has registered any check contexts.
 # For a CI-origin repair that is a pending verification state, not a fix.
 ci_before='{"head_sha":"before","conflicting":false,"failed_checks":["unit"],"pending_checks":false}'

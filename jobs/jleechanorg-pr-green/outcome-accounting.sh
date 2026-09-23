@@ -59,7 +59,9 @@ pr_green_classify_outcome() {
   jq -nr --argjson before "$before" --argjson after "$after" '
     if $before.head_sha == $after.head_sha then "no_change"
     elif ($after.conflicting or (($after.failed_checks | length) > 0)) then "pushed_still_blocked"
-    elif $after.pending_checks then "pushed_ci_pending"
+    elif $after.pending_checks or $after.verification_pending
+      or ((($after.required_checks_missing // []) | length) > 0)
+    then "pushed_ci_pending"
     # A head pushed to repair a CI failure can briefly have an empty rollup
     # while GitHub registers the new check-runs.  Do not treat that gap as a
     # green CI result.  Conflict-only repairs are intentionally exempt: they
@@ -91,12 +93,13 @@ pr_green_outcome_result() {
 # replacement completes.
 pr_green_state_from_pr_json() {
   jq -c '
-    def failed: ["FAILURE","FAILED","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE"];
+    def failed: ["FAILURE","FAILED","ERROR","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE"];
     def state: ((.conclusion // .state // "") | ascii_upcase);
     def status: ((.status // "") | ascii_upcase);
     def completed: (status == "" or status == "COMPLETED");
     {
       head_sha: (.headRefOid // .headRefName // ""),
+      mergeability: ((.mergeable // "") | ascii_upcase),
       conflicting: ((.mergeable == "CONFLICTING") or (.mergeStateStatus == "DIRTY") or (.mergeStateStatus == "CONFLICTING")),
       failed_checks: [(.statusCheckRollup // [])[]?
         | select(state as $state | failed | index($state))
@@ -104,11 +107,24 @@ pr_green_state_from_pr_json() {
       check_count: [(.statusCheckRollup // [])[]?] | length,
       successful_completed_checks: [(.statusCheckRollup // [])[]?
         | select(state == "SUCCESS" and completed)] | length,
-      pending_checks: any((.statusCheckRollup // [])[]?;
+      check_statuses: (reduce ((.statusCheckRollup // [])[]?) as $check ({};
+        .[($check.name // $check.context // "")] = (($check.conclusion // $check.state // "") | ascii_upcase))),
+      pending_checks: (any((.statusCheckRollup // [])[]?;
         (state == "" and status != "COMPLETED")
         or (state | IN("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "REQUESTED"))
-      )
+      ) or (((.mergeable // "") | ascii_upcase) == "UNKNOWN")
+        or (((.mergeStateStatus // "") | ascii_upcase) == "UNKNOWN"))
     }'
+}
+
+pr_green_apply_required_contract() {
+  local repo="$1" state="$2"
+  if [[ "$repo" != "worldarchitect.ai" ]]; then
+    jq -c '. + {verification_pending:true,verification_reason:"required_check_contract_unknown"}' <<<"$state"
+    return
+  fi
+  jq -c '. as $root | . + {required_checks:["Green Gate","Tests Required Gate"]}
+    | .required_checks_missing=[.required_checks[] | select(($root.check_statuses[.]) != "SUCCESS")]' <<<"$state"
 }
 
 pr_green_fetch_live_state() {
