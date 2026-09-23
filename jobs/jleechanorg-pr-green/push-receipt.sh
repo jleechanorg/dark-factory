@@ -53,35 +53,45 @@ main() {
   touch -- "$ledger" || { fail 'receipt ledger is not writable'; return 1; }
 
   local pr_url="https://github.com/jleechanorg/$repo/pull/$number"
-  local pr_json head_branch head_oid head_repo branch upstream remote target_branch remote_url
+  local pr_json head_branch head_oid head_repo branch upstream remote target_branch remote_url push_remote_url
   pr_json="$(gh pr view "$pr_url" --json headRefName,headRefOid,headRepository,baseRefName 2>/dev/null)" \
     || { fail 'GitHub PR read failed'; return 1; }
   head_branch="$(jq -r '.headRefName // empty' <<<"$pr_json")"
   head_oid="$(jq -r '.headRefOid // empty' <<<"$pr_json")"
   head_repo="$(jq -r '.headRepository.nameWithOwner // empty' <<<"$pr_json")"
   [[ "$head_repo" == "jleechanorg/$repo" ]] || { fail 'PR head repository mismatch'; return 1; }
-  [[ "$head_oid" == "$after_sha" ]] || { fail 'GitHub PR head does not equal after SHA'; return 1; }
+  [[ "$head_oid" == "$before_sha" ]] || { fail 'GitHub PR head does not equal before SHA'; return 1; }
   [[ -n "$head_branch" && "$head_branch" != *$'\n'* ]] || { fail 'GitHub PR head branch missing'; return 1; }
 
   branch="$(git -C "$worktree" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
-  [[ "$branch" == "$head_branch" ]] || { fail 'checked-out branch does not equal PR head branch'; return 1; }
   [[ "$(git -C "$worktree" rev-parse HEAD 2>/dev/null || true)" == "$after_sha" ]] || { fail 'local HEAD does not equal after SHA'; return 1; }
   upstream="$(git -C "$worktree" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
   [[ "$upstream" =~ ^([^/]+)/(.+)$ ]] || { fail 'branch has no explicit upstream tracking'; return 1; }
   remote="${BASH_REMATCH[1]}"
   target_branch="${BASH_REMATCH[2]}"
-  [[ "$target_branch" == "$branch" ]] || { fail 'upstream branch does not equal checked-out branch'; return 1; }
+  [[ "$target_branch" == "$head_branch" ]] || { fail 'upstream branch does not equal GitHub PR head branch'; return 1; }
   remote_url="$(git -C "$worktree" remote get-url "$remote" 2>/dev/null || true)"
   case "${remote_url%.git}" in
     "https://github.com/jleechanorg/$repo"|"git@github.com:jleechanorg/$repo"|"ssh://git@github.com/jleechanorg/$repo") ;;
     *) fail 'upstream remote URL does not match the PR repository'; return 1 ;;
   esac
+  push_remote_url="$(git -C "$worktree" remote get-url --push "$remote" 2>/dev/null || true)"
+  case "${push_remote_url%.git}" in
+    "https://github.com/jleechanorg/$repo"|"git@github.com:jleechanorg/$repo"|"ssh://git@github.com/jleechanorg/$repo") ;;
+    *) fail 'push remote URL does not match the PR repository'; return 1 ;;
+  esac
 
-  printf 'branch=%s\nupstream=%s\ntarget=%s:refs/heads/%s\n' "$branch" "$upstream" "$remote" "$target_branch"
+  printf 'branch=%s\nupstream=%s\ntarget=%s:refs/heads/%s\n' "$branch" "$upstream" "$remote" "$target_branch" >&2
 
   local remote_before remote_after ls_line push_output push_url
-  push_url="$(git -C "$worktree" config --get "remote.$remote.pushurl" 2>/dev/null || true)"
-  [[ -n "$push_url" ]] || push_url="$remote"
+  local -a push_urls=()
+  mapfile -t push_urls < <(git -C "$worktree" config --get-all "remote.$remote.pushurl" 2>/dev/null || true)
+  ((${#push_urls[@]} <= 1)) || { fail 'multiple push URLs are ambiguous'; return 1; }
+  if ((${#push_urls[@]} == 1)); then
+    push_url="${push_urls[0]}"
+  else
+    push_url="$remote_url"
+  fi
   ls_line="$(git -C "$worktree" ls-remote --heads "$push_url" "refs/heads/$target_branch" 2>/dev/null || true)"
   remote_before="${ls_line%%$'\t'*}"
   [[ "$remote_before" == "$before_sha" ]] || { fail 'remote PR head does not equal before SHA'; return 1; }
@@ -97,7 +107,7 @@ main() {
 
   push_output="$(git -C "$worktree" push --porcelain "$remote" "HEAD:refs/heads/$target_branch" 2>&1)" \
     || { printf '%s\n' "$push_output" >&2; fail 'normal git push failed'; return 1; }
-  printf '%s\n' "$push_output"
+  printf '%s\n' "$push_output" >&2
   [[ "$push_output" != *'up to date'* && "$push_output" != *'Everything up-to-date'* ]] \
     || { fail 'git reported an up-to-date ref instead of an update'; return 1; }
   grep -Eq '[0-9a-fA-F]+\.\.[0-9a-fA-F]+' <<<"$push_output" \
@@ -106,6 +116,15 @@ main() {
   ls_line="$(git -C "$worktree" ls-remote --heads "$push_url" "refs/heads/$target_branch" 2>/dev/null || true)"
   remote_after="${ls_line%%$'\t'*}"
   [[ "$remote_after" == "$after_sha" ]] || { fail 'remote ref does not equal after SHA after push'; return 1; }
+
+  local post_json post_branch post_oid post_repo
+  post_json="$(gh pr view "$pr_url" --json headRefName,headRefOid,headRepository,baseRefName 2>/dev/null)" \
+    || { fail 'post-push GitHub PR read failed'; return 1; }
+  post_branch="$(jq -r '.headRefName // empty' <<<"$post_json")"
+  post_oid="$(jq -r '.headRefOid // empty' <<<"$post_json")"
+  post_repo="$(jq -r '.headRepository.nameWithOwner // empty' <<<"$post_json")"
+  [[ "$post_repo" == "jleechanorg/$repo" && "$post_branch" == "$head_branch" && "$post_oid" == "$after_sha" ]] \
+    || { fail 'post-push GitHub PR head verification failed'; return 1; }
 
   local pushed_at receipt
   pushed_at="$(date +%s)"
