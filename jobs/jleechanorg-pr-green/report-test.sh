@@ -9,14 +9,15 @@ cat >"$fixture_dir/runs.jsonl" <<'EOF'
 {"ts":1000,"discovered":5,"analyzed":4,"actionable":2,"selected":2,"attempted":2,"dispatched":2,"busy_deferred":1,"cooldown_deferred":3}
 EOF
 cat >"$fixture_dir/outcomes.jsonl" <<'EOF'
-{"ts":1100,"repo":"worldarchitect.ai","number":1,"url":"https://example.test/1","run_ts":1000,"head_after":"same-head","result":"fixed","verified":true,"detail":"tests passed"}
-{"ts":1150,"repo":"worldarchitect.ai","number":1,"url":"https://example.test/1","run_ts":1050,"head_after":"same-head","result":"fixed","verified":true,"detail":"reconciled duplicate"}
+{"ts":1100,"repo":"worldarchitect.ai","number":1,"url":"https://example.test/1","run_ts":1000,"head_before":"old-head","head_after":"new-head","session_action":"dispatched","result":"fixed","verified":true,"detail":"tests passed"}
+{"ts":1150,"repo":"worldarchitect.ai","number":1,"url":"https://example.test/1","run_ts":1050,"head_before":"old-head","head_after":"new-head","session_action":"reconciled","result":"fixed","verified":true,"detail":"reconciled duplicate"}
 {"ts":1100,"repo":"worldarchitect.ai","number":2,"url":"https://example.test/2","run_ts":1000,"result":"fixed","verified":false,"detail":"unverified claim"}
 {"ts":1100,"repo":"worldarchitect.ai","number":3,"url":"https://example.test/3","run_ts":1000,"result":"blocked","verified":false,"detail":"ambiguous"}
 EOF
 
 body="$(PR_GREEN_METRICS_DIR="$fixture_dir" PR_GREEN_REPORT_NOW=1200 PR_GREEN_REPORT_WINDOW_HOURS=1 "$job_dir/report.sh" stdout)"
-rg -q 'Confirmed fixes \(unique PR/head, verified\): 1' <<<"$body"
+rg -q 'Verified new-head green outcomes \(job-attributed, unique PR/head\): 1' <<<"$body"
+rg -q 'Observed green outcomes from reconciliation \(attribution not independently verified, unique PR/head\): 1' <<<"$body"
 rg -q 'Repair attempts \(dispatch or session reuse\): 2' <<<"$body"
 rg -q 'Busy sessions deferred \(no prompt queued\): 1' <<<"$body"
 rg -q 'Unchanged blockers deferred by cooldown \(no inference\): 3' <<<"$body"

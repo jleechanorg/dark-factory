@@ -43,8 +43,16 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" --argjson since "$SINCE" 
     busy_deferred: ($runs | map(.busy_deferred // 0) | add // 0),
     cooldown_deferred: ($runs | map(.cooldown_deferred // 0) | add // 0),
     outcome_records: ($outcomes | length),
-    confirmed_fixes: ($outcomes
-      | map(select(.result == "fixed" and (.verified == true)))
+    verified_new_head_green_outcomes: ($outcomes
+      | map(select(.result == "fixed" and (.verified == true)
+        and ((.head_before // "") != (.head_after // ""))
+        and ((.session_action // "") != "reconciled")))
+      | unique_by([.repo, .number, .head_after])
+      | length),
+    reconciled_green_observations: ($outcomes
+      | map(select(.result == "fixed" and (.verified == true)
+        and ((.head_before // "") != (.head_after // ""))
+        and ((.session_action // "") == "reconciled")))
       | unique_by([.repo, .number, .head_after])
       | length),
     blockers: ($outcomes | map(select(.result == "blocked")) | length),
@@ -66,7 +74,8 @@ Busy sessions deferred (no prompt queued): $(jq -r '.busy_deferred' <<<"$summary
 Unchanged blockers deferred by cooldown (no inference): $(jq -r '.cooldown_deferred' <<<"$summary")
 
 Durable PR outcomes: $(jq -r '.outcome_records' <<<"$summary")
-Confirmed fixes (unique PR/head, verified): $(jq -r '.confirmed_fixes' <<<"$summary")
+Verified new-head green outcomes (job-attributed, unique PR/head): $(jq -r '.verified_new_head_green_outcomes' <<<"$summary")
+Observed green outcomes from reconciliation (attribution not independently verified, unique PR/head): $(jq -r '.reconciled_green_observations' <<<"$summary")
 Blocked: $(jq -r '.blockers' <<<"$summary")
 No change: $(jq -r '.unchanged' <<<"$summary")
 In progress: $(jq -r '.in_progress' <<<"$summary")

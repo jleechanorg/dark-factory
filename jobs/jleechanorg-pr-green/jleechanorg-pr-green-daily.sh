@@ -38,20 +38,25 @@ since_date="${since:0:10}"
 # 1,000-result ceiling. Validate every page before trusting it; an incomplete
 # response or a count mismatch falls back to repository-wise PR pagination.
 discover_prs() {
-  local search_json search_total search_items search_complete repos_json repo pulls
-  search_json="$(gh api --paginate --slurp -X GET /search/issues \
-    -f "q=org:jleechanorg is:pr is:open updated:>=${since_date}" -f per_page=100)"
-  search_total="$(jq -r '([.[].total_count? // 0] | max) // 0' <<<"$search_json")"
-  search_items="$(jq -r '[.[].items[]?] | length' <<<"$search_json")"
+  local search_json_file search_total search_items search_complete repos_json_file repo pulls
+  search_json_file="$(mktemp "${TMPDIR:-/tmp}/pr-green-discovery.XXXXXX")"
+  repos_json_file=""
+  trap 'rm -f -- "$search_json_file" "$repos_json_file"' EXIT
+  gh api --paginate --slurp -X GET /search/issues \
+    -f "q=org:jleechanorg is:pr is:open updated:>=${since_date}" -f per_page=100 \
+    >"$search_json_file"
+  search_total="$(jq -r '([.[].total_count? // 0] | max) // 0' "$search_json_file")"
+  search_items="$(jq -r '[.[].items[]?] | length' "$search_json_file")"
   search_complete="$(jq -r '
     ([.[].incomplete_results? // false] | any) as $incomplete
     | ([.[].total_count?] | all(type == "number")) as $counts_numeric
     | ($counts_numeric and ($incomplete | not))
-  ' <<<"$search_json" 2>/dev/null || printf 'false\n')"
+  ' "$search_json_file" 2>/dev/null || printf 'false\n')"
   jq -n --arg cutoff "$since" --arg source search \
-    --argjson pages "$search_json" --argjson total "$search_total" \
+    --argjson total "$search_total" \
     --argjson item_count "$search_items" --argjson complete "$search_complete" \
-    '{cutoff:$cutoff,source:$source,pages:$pages,total_count:$total,item_count:$item_count,incomplete_results:($complete|not)}' \
+    --slurpfile pages "$search_json_file" \
+    '{cutoff:$cutoff,source:$source,pages:$pages[0],total_count:$total,item_count:$item_count,incomplete_results:($complete|not)}' \
     >"$METRICS_DIR/discovery-${run_started}.json"
   if [[ "$search_complete" == true ]] && (( search_total <= 1000 )) && (( search_items == search_total )); then
     jq -r --arg since "$since" '
@@ -59,17 +64,19 @@ discover_prs() {
       | select(.updated_at >= $since and ((.draft // false) | not))
       | [(.repository_url | split("/") | .[-1]), .number, .title, .html_url, .updated_at]
       | @tsv
-    ' <<<"$search_json"
+    ' "$search_json_file"
     return 0
   fi
 
   echo "$LOG_PREFIX search response incomplete, count-mismatched, or above 1000; using repository-wise fallback" >&2
-  repos_json="$(gh api --paginate --slurp -X GET /orgs/jleechanorg/repos \
-    -f type=all -f per_page=100)"
+  repos_json_file="$(mktemp "${TMPDIR:-/tmp}/pr-green-repos.XXXXXX")"
+  gh api --paginate --slurp -X GET /orgs/jleechanorg/repos \
+    -f type=all -f per_page=100 >"$repos_json_file"
   jq -n --arg cutoff "$since" --arg source repo_fallback \
-    --argjson pages "$search_json" --argjson total "$search_total" \
+    --argjson total "$search_total" \
     --argjson item_count "$search_items" --argjson complete "$search_complete" \
-    '{cutoff:$cutoff,source:$source,pages:$pages,total_count:$total,item_count:$item_count,incomplete_results:($complete|not)}' \
+    --slurpfile pages "$search_json_file" \
+    '{cutoff:$cutoff,source:$source,pages:$pages[0],total_count:$total,item_count:$item_count,incomplete_results:($complete|not)}' \
     >"$METRICS_DIR/discovery-${run_started}.json"
   while IFS= read -r repo; do
     [[ -n "$repo" ]] || continue
@@ -82,7 +89,7 @@ discover_prs() {
       | [$repo, .number, .title, .html_url, .updated_at]
       | @tsv
     ' <<<"$pulls"
-  done < <(jq -r '.[][]? | .name // empty' <<<"$repos_json")
+  done < <(jq -r '.[][]? | .name // empty' "$repos_json_file")
 }
 
 prs="$(discover_prs | sort -t $'\t' -k5,5r -k1,1 -k2,2n -k4,4)"
@@ -178,6 +185,29 @@ reconcile_pr() {
   fi
   echo "$LOG_PREFIX outcome $repo#$number $classification ($action)"
 }
+
+# Register only a dedicated, existing git checkout with the Go AO project API.
+# `ao start <URL>` belongs to the interactive project-start workflow and does
+# not register the project identity required by `ao spawn --project`.
+pr_green_register_project() {
+  local repo="$1" project_id="$2" project_path origin expected
+  project_path="$AO_PROJECT_ROOT/$repo"
+  mkdir -p "$AO_PROJECT_ROOT"
+  if [[ ! -d "$project_path/.git" ]]; then
+    [[ ! -e "$project_path" ]] || return 1
+    git clone --quiet --no-checkout \
+      "https://github.com/jleechanorg/${repo}.git" "$project_path" >/dev/null 2>&1 || return 1
+  fi
+  git -C "$project_path" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+  origin="$(git -C "$project_path" remote get-url origin 2>/dev/null || true)"
+  expected="https://github.com/jleechanorg/${repo}"
+  case "${origin%.git}" in
+    "$expected"|"git@github.com:jleechanorg/${repo}") ;;
+    *) return 1 ;;
+  esac
+  ao project add --id "$project_id" --path "$project_path" >/dev/null 2>&1
+}
+
 while IFS=$'\t' read -r repo number title url updated; do
   [[ -n "$repo" && -n "$number" ]] || continue
   : "$updated" # retained from discovery for the audit TSV ordering
@@ -269,10 +299,12 @@ EOF
     # A project may not have been registered yet. Register it into AO's
     # project registry, then apply and verify the complete preserved config
     # before any session is reused, restored, or spawned.
-    mkdir -p "$AO_PROJECT_ROOT"
-    if ! (cd "$AO_PROJECT_ROOT" && ao start "https://github.com/jleechanorg/${repo}" --no-dashboard --no-orchestrator --no-open >/dev/null 2>&1) \
-      || ! pr_green_ensure_codex_scope "$project_id"; then
+    if ! ao project get "$project_id" --json >/dev/null 2>&1; then
+      pr_green_register_project "$repo" "$project_id" || true
+    fi
+    if ! pr_green_ensure_codex_scope "$project_id"; then
       echo "$LOG_PREFIX failed to establish project-scoped Codex account for $repo#$number" >&2
+      record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed project_scope_failed
       continue
     fi
   fi
@@ -352,8 +384,10 @@ EOF
       reconcile_pr "$repo" "$number" "$url" "$live_state" stale_recovery || true
       continue
     fi
-    mkdir -p "$AO_PROJECT_ROOT"
-    if ! (cd "$AO_PROJECT_ROOT" && ao start "https://github.com/jleechanorg/${repo}" --no-dashboard --no-orchestrator --no-open >/dev/null 2>&1); then
+    if ! ao project get "$project_id" --json >/dev/null 2>&1; then
+      pr_green_register_project "$repo" "$project_id" || true
+    fi
+    if ! pr_green_ensure_codex_scope "$project_id"; then
       echo "$LOG_PREFIX failed to register $repo#$number" >&2
       record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed ao_registration_failed
       rm -f "$spawn_err"
