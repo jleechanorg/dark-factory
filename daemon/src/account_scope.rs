@@ -205,6 +205,7 @@ pub fn is_minimax_api_url(url_str: &str) -> bool {
 /// - `codex` -> `AiProvider::Codex`
 /// - `claude`, `claude-sonnet` -> `AiProvider::MiniMax` if explicitly indicated by `extra_env`,
 ///   otherwise `AiProvider::Claude`.
+///
 /// Normal non-AI commands (e.g. `git`, `br`, `gh`, `sh`, `cargo`) return `None`.
 pub fn detect_direct_cli_provider(cmd: &str, extra_env: &[(&str, &str)]) -> Option<AiProvider> {
     let bin = Path::new(cmd)

@@ -3271,9 +3271,7 @@ fn resolve_ao_config_path(operator_home: &str) -> String {
 
 fn ao_controller_env(project: &str) -> Result<Vec<(String, String)>, String> {
     let operator_home = operator_home()?;
-    let bridge_home = if std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go") {
-        operator_home.clone()
-    } else if matches!(
+    let bridge_home = if std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go") || matches!(
         probe_operator_ao_project(project, &operator_home),
         AoReadiness::Ready(_)
     ) {
@@ -9652,8 +9650,6 @@ impl Sessions for CliSessions {
                     return Ok(crate::tools::SessionActivity::Terminal);
                 } else if activity_state == "idle" {
                     return Ok(crate::tools::SessionActivity::Idle);
-                } else if activity_state == "active" {
-                    return Ok(crate::tools::SessionActivity::Running);
                 } else {
                     return Ok(crate::tools::SessionActivity::Running);
                 }
