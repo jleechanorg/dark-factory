@@ -23,7 +23,7 @@ mock_bin="$fixture_dir/bin"
 mkdir -p "$mock_bin"
 cat >"$mock_bin/curl" <<'EOF'
 #!/usr/bin/env bash
-printf 'curl\n' >>"$MOCK_CALLS"
+printf 'curl %s\n' "$*" >>"$MOCK_CALLS"
 printf '%s\n' '{"ok":true}'
 EOF
 chmod +x "$mock_bin/curl"
@@ -40,11 +40,22 @@ PATH="$mock_bin:$PATH" MOCK_CALLS="$calls" HERMES_SLACK_BOT_TOKEN=test-token \
 cat >"$mock_bin/gog" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$MOCK_CALLS"
-exit 0
+exit 1
 EOF
 chmod +x "$mock_bin/gog"
-PATH="$mock_bin:$PATH" MOCK_CALLS="$calls" PR_GREEN_METRICS_DIR="$fixture_dir" \
+PATH="$mock_bin:$PATH" MOCK_CALLS="$calls" EMAIL_USER=test-smtp-user EMAIL_PASS=test-smtp-pass PR_GREEN_METRICS_DIR="$fixture_dir" \
   PR_GREEN_REPORT_NOW=90000 PR_GREEN_REPORT_WINDOW_HOURS=24 "$job_dir/report.sh" email >/dev/null
 rg -q '^gmail send ' "$calls"
+rg -q '^curl --config ' "$calls"
+! rg -q 'test-smtp-(user|pass)' "$calls"
+state="$(jq -r '.email.last_sent_at' "$fixture_dir/report-state.json")"
+[[ "$state" == "90000" ]]
+
+if PATH="$mock_bin:$PATH" MOCK_CALLS="$calls" PR_GREEN_METRICS_DIR="$fixture_dir" \
+  PR_GREEN_REPORT_NOW=180000 PR_GREEN_REPORT_WINDOW_HOURS=24 "$job_dir/report.sh" email >/dev/null 2>&1; then
+  echo 'email unexpectedly succeeded without SMTP credentials' >&2
+  exit 1
+fi
+[[ "$(jq -r '.email.last_sent_at' "$fixture_dir/report-state.json")" == "90000" ]]
 
 echo 'report tests passed'

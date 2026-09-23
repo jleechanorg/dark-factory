@@ -8,4 +8,7 @@ ExecStart=/bin/bash %h/projects/dark-factory/jobs/jleechanorg-pr-green/report.sh
 Environment=PR_GREEN_REPORT_WINDOW_HOURS=24
 Environment=PR_GREEN_GMAIL_ACCOUNT=jleechan@gmail.com
 Environment=PR_GREEN_EMAIL_TO=jleechan@gmail.com
+# Credentials remain only in the user manager environment; never write them
+# into this unit or an EnvironmentFile.
+PassEnvironment=EMAIL_USER EMAIL_PASS
 TimeoutStartSec=120

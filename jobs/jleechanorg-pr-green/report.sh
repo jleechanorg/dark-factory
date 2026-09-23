@@ -82,6 +82,39 @@ mark_sent() {
   mv "$tmp" "$STATE_FILE"
 }
 
+send_smtp_email() {
+  local recipient="$1" subject="$2" smtp_user smtp_pass smtp_config smtp_body
+  smtp_user="${PR_GREEN_SMTP_USER:-${EMAIL_USER:-}}"
+  smtp_pass="${PR_GREEN_SMTP_PASS:-${EMAIL_PASS:-}}"
+  if [[ -z "$smtp_user" || -z "$smtp_pass" ]]; then
+    echo "pr-green SMTP fallback unavailable: no SMTP credentials in service environment" >&2
+    return 1
+  fi
+  if [[ "$smtp_user" == *$'\n'* || "$smtp_pass" == *$'\n'* ]]; then
+    echo "pr-green SMTP fallback unavailable: SMTP credentials contain a newline" >&2
+    return 1
+  fi
+
+  # Keep the app password out of argv and remove the 0600 transport files on
+  # every return path. curl's config is used only because it keeps credentials
+  # out of process listings; it is not persisted with the cadence state.
+  umask 077
+  smtp_config="$(mktemp "$METRICS_DIR/smtp-config.XXXXXX")"
+  smtp_body="$(mktemp "$METRICS_DIR/smtp-body.XXXXXX")"
+  trap 'rm -f "$smtp_config" "$smtp_body"' RETURN
+  printf 'From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s\r\n' \
+    "$smtp_user" "$recipient" "$subject" "$body" >"$smtp_body"
+  {
+    printf 'url = "smtps://smtp.gmail.com:465"\n'
+    printf 'user = "%s:%s"\n' "$smtp_user" "$smtp_pass"
+    printf 'mail-from = "%s"\n' "$smtp_user"
+    printf 'mail-rcpt = "%s"\n' "$recipient"
+    printf 'upload-file = "%s"\n' "$smtp_body"
+    printf 'ssl-reqd\nconnect-timeout = 10\nmax-time = 30\nsilent\nshow-error\nfail\n'
+  } >"$smtp_config"
+  curl --config "$smtp_config"
+}
+
 if [[ "$MODE" == "stdout" ]]; then
   printf '%s\n' "$body"
   exit 0
@@ -111,18 +144,17 @@ case "$MODE" in
     fi
     ;;
   email)
-    if ! command -v gog >/dev/null; then
-      echo "pr-green email report not sent: gog is unavailable" >&2
-      exit 0
-    fi
     account="${PR_GREEN_GMAIL_ACCOUNT:-jleechan@gmail.com}"
     recipient="${PR_GREEN_EMAIL_TO:-jleechan@gmail.com}"
-    if gog gmail send -a "$account" --to "$recipient" \
-      --subject "PR green repair report — $(date -d "@$NOW" '+%Y-%m-%d')" --body "$body" --no-input; then
+    subject="PR green repair report — $(date -d "@$NOW" '+%Y-%m-%d')"
+    if command -v gog >/dev/null && gog gmail send -a "$account" --to "$recipient" \
+      --subject "$subject" --body "$body" --no-input; then
+      mark_sent
+    elif send_smtp_email "$recipient" "$subject"; then
       mark_sent
     else
-      echo "pr-green email report delivery unavailable for $account; configure gog OAuth for this account; cadence state was not advanced" >&2
-      exit 0
+      echo "pr-green email report delivery failed for $account; cadence state was not advanced" >&2
+      exit 1
     fi
     ;;
 esac
