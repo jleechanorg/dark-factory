@@ -22,7 +22,9 @@ printf '%s\n' '{"type":"session_meta","payload":{"session_id":"native-session-de
 export CODEX_HOME="$recovery_home"
 export PR_GREEN_CODEX_HOME_CANDIDATES="$recovery_source:$recovery_home"
 export PR_GREEN_AO_DB_PATH="$recovery_dir/ao.db"
+export PR_GREEN_AO_RUN_FILE="$recovery_dir/running.json"
 : >"$PR_GREEN_AO_DB_PATH"
+printf '%s\n' '{"pid":1234,"port":43123}' >"$PR_GREEN_AO_RUN_FILE"
 recovery_state="$recovery_dir/recovery-state.tsv"
 printf '%s||1\n' "$recovery_workspace" >"$recovery_state"
 export PR_GREEN_RECOVERY_STATE="$recovery_state"
@@ -148,10 +150,9 @@ action="$(<"$action_file")"
 rm -f "$action_file"
 assert_eq "$action" restored
 mapfile -t ao_calls <"$ao_calls_file"
-assert_eq "${#ao_calls[@]}" 4
-assert_eq "${ao_calls[1]}" 'status --json'
-assert_eq "${ao_calls[2]}" 'session restore wa-dead -p worldarchitect.ai'
-assert_eq "${ao_calls[3]}" 'send --session wa-dead --message restore prompt'
+assert_eq "${#ao_calls[@]}" 3
+assert_eq "${ao_calls[1]}" 'session restore wa-dead -p worldarchitect.ai'
+assert_eq "${ao_calls[2]}" 'send --session wa-dead --message restore prompt'
 
 # A successful restore followed by a rejected prompt still identifies the
 # exact existing session. The caller must suppress duplicate spawn rather than

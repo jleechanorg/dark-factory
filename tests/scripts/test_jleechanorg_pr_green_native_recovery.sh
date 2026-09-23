@@ -6,7 +6,8 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT/jobs/jleechanorg-pr-green/session-reuse.sh"
 
 fixture_dir="$(mktemp -d)"
-trap 'rm -rf "$fixture_dir"' EXIT
+live_pid=''
+trap '[[ -z "$live_pid" ]] || kill "$live_pid" 2>/dev/null || true; rm -rf "$fixture_dir"' EXIT
 intended_home="$fixture_dir/codex-dark-factory"
 source_home="$fixture_dir/codex-old"
 workspace="$fixture_dir/worktree"
@@ -16,16 +17,25 @@ printf '%s\n' '{"tokens":{}}' >"$intended_home/auth.json"
 export CODEX_HOME="$intended_home"
 export PR_GREEN_CODEX_HOME_CANDIDATES="$source_home:$intended_home"
 export PR_GREEN_AO_DB_PATH="$fixture_dir/ao.db"
+export PR_GREEN_AO_RUN_FILE="$fixture_dir/running.json"
 : >"$PR_GREEN_AO_DB_PATH"
+printf '%s\n' '{"pid":1234,"port":43123}' >"$PR_GREEN_AO_RUN_FILE"
 db_state="$fixture_dir/db-state.tsv"
 export PR_GREEN_TEST_DB_STATE="$db_state"
 printf '%s||1\n' "$workspace" >"$db_state"
 cat >"$mock_bin/sqlite3" <<'EOF'
 #!/usr/bin/env bash
-cat "$PR_GREEN_TEST_DB_STATE"
+if [[ "$*" == *runtime_handle_id* ]]; then
+  printf '%s\n' "${PR_GREEN_TEST_RUNTIME_HANDLE:?}"
+else
+  cat "$PR_GREEN_TEST_DB_STATE"
+fi
 EOF
 chmod +x "$mock_bin/sqlite3"
 export PATH="$mock_bin:$PATH"
+export PR_GREEN_TEST_RUNTIME_HANDLE='worldarchitect-ai-123-runtime'
+env CODEX_HOME="$intended_home" bash -c 'cd "$1" && exec sleep 60' bash "$workspace" &
+live_pid=$!
 
 native_id='native-session-123'
 rollout_relative='sessions/2026/09/23/rollout-2026-09-23T08-00-00-native-session-123.jsonl'
@@ -61,8 +71,19 @@ curl() {
   done
   printf '%s\t%s\n' "$url" "$body" >>"$curl_calls"
   registered=1
-  printf '%s|%s|1\n' "$workspace" "$native_id" >"$PR_GREEN_TEST_DB_STATE"
+  printf '%s|%s|%s\n' "$workspace" "$native_id" "${PR_GREEN_TEST_TERMINATED:-1}" >"$PR_GREEN_TEST_DB_STATE"
   printf '%s\n' '{"status":"ok"}'
+}
+
+tmux() {
+  case "$1 $2" in
+    "list-panes -t") printf '%s\n' "$live_pid" ;;
+    *) printf 'unexpected tmux call: %s\n' "$*" >&2; return 1 ;;
+  esac
+}
+
+pr_green_is_codex_process() {
+  [[ "$1" == "$live_pid" ]]
 }
 
 pr_green_recover_native_conversation worldarchitect.ai worldarchitect.ai-123
@@ -100,19 +121,70 @@ cmp -s "$rollout_source" "$rollout_target" || {
   exit 1
 }
 
-# Live sessions are not restored or killed, but an already-known native
-# conversation can be copied into the intended profile before ordinary reuse.
+# A terminated rollout may have been copied before its final events arrived.
+# An exact prefix is safe to extend, while divergent content must remain
+# untouched and fail closed.
+printf '%s\n' '{"type":"event_msg","payload":{"type":"task_finished"}}' >>"$rollout_source"
+pr_green_recover_native_conversation worldarchitect.ai worldarchitect.ai-123
+cmp -s "$rollout_source" "$rollout_target" || {
+  echo 'FAIL: terminated native rollout prefix was not extended safely' >&2
+  exit 1
+}
+# If the intended profile has a legitimate continuation while the old profile
+# remains shorter, the longest mutually-prefix source must be preserved.
+cp -p "$rollout_source" "$rollout_target"
+printf '%s\n' '{"type":"event_msg","payload":{"type":"intended_profile_continuation"}}' >>"$rollout_target"
+pr_green_recover_native_conversation worldarchitect.ai worldarchitect.ai-123
+grep -Fq 'intended_profile_continuation' "$rollout_target" || {
+  echo 'FAIL: longer intended-profile rollout was discarded for old shorter copy' >&2
+  exit 1
+}
+printf '%s\n' 'divergent transcript' >"$rollout_target"
+set +e
+pr_green_recover_native_conversation worldarchitect.ai worldarchitect.ai-123
+rc=$?
+set -e
+[[ "$rc" -ne 0 ]] || {
+  echo 'FAIL: divergent terminated rollout was accepted' >&2
+  exit 1
+}
+grep -Fqx 'divergent transcript' "$rollout_target" || {
+  echo 'FAIL: divergent rollout target was overwritten' >&2
+  exit 1
+}
+cp -p "$rollout_source" "$rollout_target"
+
+# Live sessions are not restored, killed, or copied: the source rollout may
+# still be appended by the running Codex process.
 printf '%s|%s|0\n' "$workspace" "$native_id" >"$db_state"
 rm -f "$rollout_target"
 pr_green_preserve_live_native_conversation worldarchitect.ai worldarchitect.ai-123
-[[ -f "$rollout_target" ]] || {
-  echo 'FAIL: live native rollout was not preserved for the intended profile' >&2
+[[ ! -e "$rollout_target" ]] || {
+  echo 'FAIL: live native rollout was copied while its process could append' >&2
   exit 1
 }
 [[ "$(wc -l <"$curl_calls")" == "$curl_calls_before" ]] || {
-  echo 'FAIL: live profile migration unexpectedly posted activity' >&2
+  echo 'FAIL: live registered identity unexpectedly posted activity' >&2
   exit 1
 }
+
+# A live intended-profile process with an empty AO native id can be registered
+# from its exact-cwd rollout without copying or mutating that live transcript.
+cp -p "$rollout_source" "$rollout_target"
+printf '%s||0\n' "$workspace" >"$db_state"
+export PR_GREEN_TEST_TERMINATED=0
+curl_calls_before="$(wc -l <"$curl_calls")"
+pr_green_preserve_live_native_conversation worldarchitect.ai worldarchitect.ai-123
+[[ "$(wc -l <"$curl_calls")" == "$((curl_calls_before + 1))" ]] || {
+  echo 'FAIL: intended-profile live native identity was not registered' >&2
+  exit 1
+}
+grep -Fq '{"agentSessionId":"native-session-123"}' "$curl_calls" || {
+  echo 'FAIL: live registration used the wrong native identity' >&2
+  exit 1
+}
+export PR_GREEN_TEST_TERMINATED=1
+curl_calls_before="$(wc -l <"$curl_calls")"
 
 # Multiple historical conversations are safe when AO creation time and the
 # session_meta timestamp prove one newest identity; the helper must retain all

@@ -142,39 +142,97 @@ pr_green_find_native_rollouts() {
 pr_green_preserve_native_rollouts() {
   local intended_home="$1"
   local native_id="$2"
-  local match source_home relative source target
+  local match source_home relative source target source_size target_size tmp rel candidate_size best_index best_source best_size i j
   local copied=0
+  local -a sources=() relatives=()
+  local -A seen_relatives=()
   while IFS=$'\t' read -r match source_home relative; do
     [[ "$match" == "$native_id" && -n "$source_home" && -n "$relative" ]] || continue
     source="$source_home/$relative"
-    target="$intended_home/$relative"
+    [[ -f "$source" && ! -L "$source" ]] || return 1
+    sources+=("$source")
+    relatives+=("$relative")
+  done
+  ((${#sources[@]} > 0)) || return 1
+
+  # Several Codex homes can contain the same native id. Choose the longest
+  # source only after proving every shorter copy is its exact byte prefix, so
+  # an intended-profile continuation wins over an older shorter copy without
+  # accepting divergent transcript branches.
+  for i in "${!sources[@]}"; do
+    rel="${relatives[$i]}"
+    [[ -n "${seen_relatives[$rel]+yes}" ]] && continue
+    seen_relatives["$rel"]=1
+    best_index="$i"
+    best_source="${sources[$i]}"
+    best_size="$(wc -c <"$best_source")"
+    for j in "${!sources[@]}"; do
+      [[ "${relatives[$j]}" == "$rel" ]] || continue
+      candidate_size="$(wc -c <"${sources[$j]}")"
+      if [[ "$candidate_size" -gt "$best_size" ]]; then
+        best_index="$j"
+        best_source="${sources[$j]}"
+        best_size="$candidate_size"
+      fi
+    done
+    for j in "${!sources[@]}"; do
+      [[ "${relatives[$j]}" == "$rel" ]] || continue
+      candidate_size="$(wc -c <"${sources[$j]}")"
+      cmp -n "$candidate_size" "$best_source" "${sources[$j]}" >/dev/null 2>&1 || return 1
+    done
+
+    target="$intended_home/$rel"
     mkdir -p "$(dirname "$target")" || return 1
     if [[ -e "$target" ]]; then
-      cmp -s "$source" "$target" || return 1
+      [[ -f "$target" && ! -L "$target" ]] || return 1
+      target_size="$(wc -c <"$target")"
+      [[ "$target_size" -le "$best_size" ]] || return 1
+      cmp -n "$target_size" "$best_source" "$target" >/dev/null 2>&1 || return 1
+      if [[ "$target_size" -lt "$best_size" ]]; then
+        tmp="${target}.tmp.$$"
+        cp -p -- "$best_source" "$tmp" || { rm -f -- "$tmp"; return 1; }
+        cmp -s "$best_source" "$tmp" || { rm -f -- "$tmp"; return 1; }
+        mv -- "$tmp" "$target" || { rm -f -- "$tmp"; return 1; }
+      fi
     else
-      cp -p -- "$source" "$target" || return 1
-      cmp -s "$source" "$target" || return 1
+      cp -p -- "$best_source" "$target" || return 1
+      cmp -s "$best_source" "$target" || return 1
     fi
     copied=$((copied + 1))
   done
   ((copied > 0))
 }
 
-# Resolve the active AO daemon endpoint from its supported status response,
-# with an explicit URL override reserved for isolated test/managed deployments.
-# Do not assume the config-file port: the daemon may be running on a generated
-# port after a restart.
+# Resolve the active AO daemon endpoint from the Go daemon's supported
+# running.json handshake, with an explicit URL override reserved for isolated
+# test/managed deployments. Do not use an unscoped status query or assume a
+# fixed port.
 pr_green_ao_api_base() {
-  local override="${PR_GREEN_AO_API_URL:-}" status_json port
+  local override="${PR_GREEN_AO_API_URL:-}" run_file port
   if [[ -n "$override" ]]; then
     [[ "$override" =~ ^https?://[^[:space:]]+$ ]] || return 1
     printf '%s\n' "${override%/}"
     return 0
   fi
-  status_json="$(ao status --json 2>/dev/null || true)"
-  port="$(jq -r '.port // empty' <<<"$status_json" 2>/dev/null || true)"
+  run_file="${PR_GREEN_AO_RUN_FILE:-${AO_RUN_FILE:-$HOME/.ao/running.json}}"
+  [[ -r "$run_file" ]] || return 1
+  port="$(jq -r '.port // empty' <"$run_file" 2>/dev/null || true)"
   [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || return 1
   printf 'http://127.0.0.1:%s\n' "$port"
+}
+
+pr_green_register_native_conversation() {
+  local project_id="$1" session_id="$2" native_id="$3"
+  local api_base body verified
+  [[ "$native_id" =~ ^[[:alnum:]-]{16,}$ ]] || return 1
+  api_base="$(pr_green_ao_api_base || true)"
+  [[ -n "$api_base" ]] || return 1
+  body="$(jq -cn --arg id "$native_id" '{agentSessionId:$id}')"
+  curl --silent --show-error --fail-with-body --max-time "${PR_GREEN_AO_API_TIMEOUT_SECONDS:-10}" \
+    -X POST "$api_base/api/v1/sessions/$session_id/activity" \
+    -H 'Content-Type: application/json' --data-binary "$body" >/dev/null 2>/dev/null || return 1
+  verified="$(pr_green_session_recovery_row "$project_id" "$session_id" | awk -F '|' '{print $2}' || true)"
+  [[ "$verified" == "$native_id" ]]
 }
 
 # Recover a terminated Codex session's native conversation before AO restore.
@@ -208,24 +266,61 @@ pr_green_recover_native_conversation() {
   ((${#native_rollouts[@]} >= 2)) || return 1
   native_id="${native_rollouts[0]}"
   pr_green_preserve_native_rollouts "$intended_home" "$native_id" < <(printf '%s\n' "${native_rollouts[@]:1}") || return 1
-  api_base="$(pr_green_ao_api_base || true)"
-  [[ -n "$api_base" ]] || return 1
-  body="$(jq -cn --arg id "$native_id" '{agentSessionId:$id}')"
-  curl --silent --show-error --fail-with-body --max-time "${PR_GREEN_AO_API_TIMEOUT_SECONDS:-10}" \
-    -X POST "$api_base/api/v1/sessions/$session_id/activity" \
-    -H 'Content-Type: application/json' --data-binary "$body" >/dev/null 2>/dev/null || return 1
-  verified="$(pr_green_session_recovery_row "$project_id" "$session_id" | awk -F '|' '{print $2}' || true)"
-  [[ "$verified" == "$native_id" ]]
+  pr_green_register_native_conversation "$project_id" "$session_id" "$native_id"
 }
 
-# Copy an already-registered native conversation for a live, non-busy session
-# into the repair job's authenticated profile. This is deliberately a local
-# transcript migration only: changing the environment of a running Codex
-# process would require a supported AO handoff, so live workers remain running
-# and are not killed or restored here.
+# Find CODEX_HOME on the exact live Codex process under an AO tmux pane. The
+# pane shell itself may not retain the exported variable, so inspect its child
+# process tree without printing any other environment values.
+pr_green_is_codex_process() {
+  local pid="$1" exe command_line
+  exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+  command_line="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  [[ "$exe" == */codex || "$exe" == */codex-* ]] \
+    || [[ "$exe" == */node && "$command_line" == *codex.js* ]]
+}
+
+pr_green_process_codex_home() {
+  local pid="$1" workspace="$2" home child child_home
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ -r "/proc/$pid/environ" ]] || return 1
+  pr_green_is_codex_process "$pid" || {
+    command -v pgrep >/dev/null 2>&1 || return 1
+    while IFS= read -r child; do
+      [[ -n "$child" ]] || continue
+      child_home="$(pr_green_process_codex_home "$child" "$workspace" || true)"
+      if [[ -n "$child_home" ]]; then
+        printf '%s\n' "$child_home"
+        return 0
+      fi
+    done < <(pgrep -P "$pid" 2>/dev/null || true)
+    return 1
+  }
+  home="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | awk -F= '$1 == "CODEX_HOME" {print $2; exit}')"
+  if [[ -n "$home" && "$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)" == "$workspace" ]]; then
+    printf '%s\n' "$home"
+    return 0
+  fi
+  return 1
+}
+
+pr_green_live_codex_home() {
+  local project_id="$1" session_id="$2" runtime_handle pane_pid
+  runtime_handle="$(pr_green_runtime_handle "$project_id" "$session_id" || true)"
+  [[ -n "$runtime_handle" ]] || return 1
+  pane_pid="$(tmux list-panes -t "$runtime_handle" -F '#{pane_pid}' 2>/dev/null | head -n 1)"
+  [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 1
+  local workspace="$3"
+  pr_green_process_codex_home "$pane_pid" "$workspace"
+}
+
+# Register a live native identity only after proving the current Codex process
+# uses the intended profile. Never copy its mutable rollout while it can append
+# new events; an old-profile or uninspectable worker is deferred so no prompt
+# or duplicate spawn is sent under an unverified account.
 pr_green_preserve_live_native_conversation() {
   local project_id="$1" session_id="$2"
-  local row workspace native_registered terminated intended_home
+  local row workspace native_registered terminated intended_home created_at live_home native_id match source_home
   local -a row_fields=() native_rollouts=()
   row="$(pr_green_session_recovery_row "$project_id" "$session_id" || true)"
   # A public AO session may outlive a transient local DB read failure; leave
@@ -235,12 +330,30 @@ pr_green_preserve_live_native_conversation() {
   workspace="${row_fields[0]:-}"
   native_registered="${row_fields[1]:-}"
   terminated="${row_fields[2]:-}"
-  [[ "$terminated" == "0" && -n "$workspace" && -n "$native_registered" ]] || return 0
+  created_at="${row_fields[3]:-}"
+  [[ "$terminated" == "0" && -n "$workspace" ]] || return 0
   intended_home="${CODEX_HOME:-${PR_GREEN_CODEX_HOME:-$HOME/.codex-dark-factory}}"
   [[ -d "$intended_home" && -s "$intended_home/auth.json" ]] || return 1
-  mapfile -t native_rollouts < <(pr_green_find_native_rollouts "$workspace" '' "$native_registered") || return 1
+  live_home="$(pr_green_live_codex_home "$project_id" "$session_id" "$workspace" || true)"
+  [[ "$live_home" == "$intended_home" ]] || return 1
+  if [[ -n "$native_registered" ]]; then
+    # The native rollout remains in the process's own profile. It is mutable,
+    # so identity proof is sufficient; transcript migration waits for AO
+    # termination and the stable recovery path above.
+    return 0
+  fi
+  mapfile -t native_rollouts < <(pr_green_find_native_rollouts "$workspace" "$created_at") || return 1
   ((${#native_rollouts[@]} >= 2)) || return 1
-  pr_green_preserve_native_rollouts "$intended_home" "$native_registered" < <(printf '%s\n' "${native_rollouts[@]:1}")
+  native_id="${native_rollouts[0]}"
+  source_home=''
+  for match in "${native_rollouts[@]:1}"; do
+    source_home="${match#*$'\t'}"
+    source_home="${source_home%%$'\t'*}"
+    [[ "$source_home" == "$intended_home" ]] && break
+    source_home=''
+  done
+  [[ "$source_home" == "$intended_home" ]] || return 1
+  pr_green_register_native_conversation "$project_id" "$session_id" "$native_id"
 }
 
 # Recognize both legacy and current Go AO spawn acknowledgements. The Go CLI
