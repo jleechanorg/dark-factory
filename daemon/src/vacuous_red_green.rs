@@ -1612,8 +1612,17 @@ fn run_cargo_tests(
                 "spawn {}: {e}; cargo binary not usable from this environment",
                 cargo_bin.display()
             )))?;
+        let listed_stdout = String::from_utf8_lossy(&listed.stdout);
+        let listed_stderr = String::from_utf8_lossy(&listed.stderr);
+        if !listed.status.success() {
+            if listed_stderr.contains("error[E") || listed_stdout.contains("error[E") {
+                compile_errored = true;
+            }
+            failing.push(target.name.clone());
+            continue;
+        }
         let Some(qualified_name) = resolve_cargo_exact_name(
-            &String::from_utf8_lossy(&listed.stdout),
+            &listed_stdout,
             &target.name,
         ) else {
             failing.push(format!("{}:NEVER_RAN", target.name));
