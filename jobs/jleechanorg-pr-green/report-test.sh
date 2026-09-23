@@ -82,6 +82,12 @@ if env -u PR_GREEN_SMTP_USER -u PR_GREEN_SMTP_PASS -u EMAIL_USER -u EMAIL_PASS \
 fi
 [[ "$(jq -r '.email.last_sent_at' "$fixture_dir/report-state.json")" == "90000" ]]
 
+# A manual evening delivery must not suppress the next calendar day's email.
+TZ=UTC PATH="$mock_bin:$PATH" MOCK_CALLS="$calls" EMAIL_USER=test-smtp-user EMAIL_PASS=test-smtp-pass \
+  PR_GREEN_METRICS_DIR="$fixture_dir" PR_GREEN_REPORT_NOW=172801 PR_GREEN_REPORT_WINDOW_HOURS=24 \
+  "$job_dir/report.sh" email >/dev/null
+[[ "$(jq -r '.email.last_sent_at' "$fixture_dir/report-state.json")" == "172801" ]]
+
 if env -u HERMES_SLACK_BOT_TOKEN -u SLACK_BOT_TOKEN \
   PR_GREEN_METRICS_DIR="$fixture_dir" PR_GREEN_REPORT_NOW=180000 \
   "$job_dir/report.sh" slack >/dev/null 2>&1; then

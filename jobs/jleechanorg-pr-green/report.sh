@@ -80,6 +80,10 @@ should_send() {
   [[ -f "$STATE_FILE" ]] || return 0
   last="$(jq -r --arg mode "$MODE" '.[$mode].last_sent_at // 0' "$STATE_FILE" 2>/dev/null || printf '0')"
   [[ "$last" =~ ^[0-9]+$ ]] || return 0
+  if [[ "$MODE" == "email" ]]; then
+    [[ "$last" == 0 || "$(date -d "@$last" +%F)" != "$(date -d "@$NOW" +%F)" ]]
+    return
+  fi
   (( NOW - last >= WINDOW_SECONDS ))
 }
 
