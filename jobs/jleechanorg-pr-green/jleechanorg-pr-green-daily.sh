@@ -119,7 +119,25 @@ while IFS=$'\t' read -r repo number title url updated; do
   fi
   selected=$((selected + 1))
 
-  prompt="Work on ${url} in ${repo}. This is an automated daily repair pass for a PR updated in the last ${WINDOW_HOURS} hours. Inspect the exact current PR head and base first. Fix only easy, clearly scoped test failures or mechanical merge conflicts that you can verify locally. Preserve product intent; do not broaden scope, rewrite history, force-push, merge the PR, or change credentials. Run the narrowest relevant tests, then the repository's required checks, commit with an explicit message, and push normally if and only if the fix is green. If the issue is ambiguous, risky, or not mechanically solvable, leave it untouched and report the blocker. Current signals: mergeable=${mergeable:-unknown}; failing_checks=${failures:-none}."
+  prompt="$(cat <<EOF
+Work on ${url} in ${repo}. This is an automated daily repair pass for a PR updated in the last ${WINDOW_HOURS} hours. Inspect the exact current PR head and base first.
+
+MANDATORY INTEGRATION RULES
+- Distinguish textual Git conflicts, generated-file/checksum conflicts, post-merge test failures, and genuine product-policy disagreements.
+- A post-merge test failure is not automatically product ambiguity. Determine whether it protects user-visible PR behavior or only an implementation/file layout that the current base has superseded.
+- Preserve the PR user-visible behavior while adapting stale implementation and tests to the current base architecture.
+- A bounded integration repair may edit production code and tests together. Keep the scope limited to the PR behavior and the current-base contract.
+- Regenerate derived manifests and checksums last. Do this after source and test integration is complete.
+- Stop only when repository evidence leaves two or more genuinely plausible user-visible behaviors. Stop only if choosing between them would materially change product behavior, and report that exact blocker.
+
+SAFETY AND DELIVERY
+- Do not merge the PR, rebase published history, rewrite history, force-push, change credentials, or weaken tests merely to make them pass.
+- Run the narrowest relevant tests covering both the PR behavior and current-base contract, then the repository's required checks.
+- Commit with an explicit message. Push normally only after the integrated tests and required checks are green.
+
+Current signals: mergeable=${mergeable:-unknown}; failing_checks=${failures:-none}.
+EOF
+)"
 
   if [[ "$DRY_RUN" == "1" ]]; then
     printf '%s would dispatch %s#%s (%s)\n' "$LOG_PREFIX" "$repo" "$number" "$title"
