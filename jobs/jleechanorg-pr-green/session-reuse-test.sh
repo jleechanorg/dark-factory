@@ -7,6 +7,8 @@ source "$job_dir/session-reuse.sh"
 
 fixture='{"data":[{"id":"wa-live","displayName":"pr-123","isTerminated":false,"status":"pr_open","updatedAt":"2026-09-23T00:00:00Z"}]}'
 session_get_fixture=''
+busy_runtime_handle=''
+busy_pane_output=''
 ao_calls_file="$(mktemp)"
 trap 'rm -f "$ao_calls_file"' EXIT
 ao() {
@@ -20,6 +22,23 @@ ao() {
     "session restore") return 0 ;;
     "send --session") return 0 ;;
     *) printf 'unexpected ao call: %s\n' "$*" >&2; return 1 ;;
+  esac
+}
+
+# The production helper reads only the matched AO session's runtime handle and
+# asks tmux for the current pane.  Keep this fake narrow so the regression
+# proves a visibly working pane is deferred before `ao send` is attempted.
+sqlite3() {
+  if [[ -n "$busy_runtime_handle" && "$*" == *"'wa-busy'"* ]]; then
+    printf '%s\n' "$busy_runtime_handle"
+  fi
+}
+
+tmux() {
+  case "$1 $2" in
+    "has-session -t") [[ "$3" == "$busy_runtime_handle" ]] ;;
+    "capture-pane -p") printf '%s\n' "$busy_pane_output" ;;
+    *) printf 'unexpected tmux call: %s\n' "$*" >&2; return 1 ;;
   esac
 }
 
@@ -48,6 +67,23 @@ assert_eq "${#ao_calls[@]}" 2
 assert_eq "${ao_calls[1]}" 'send --session wa-live --message updated prompt'
 if rg -q '^spawn ' "$ao_calls_file"; then
   printf 'live-session reuse must not spawn a second session\n' >&2
+  exit 1
+fi
+
+# Sessions created before the AO hook-path repair can still say idle in AO's
+# database while their actual Codex pane visibly works.  Such a session must
+# be deferred, never sent another prompt and never replaced by a duplicate.
+fixture='{"data":[{"id":"wa-busy","displayName":"pr-777","isTerminated":false,"status":"pr_open","updatedAt":"2026-09-23T00:03:00Z"}]}'
+busy_runtime_handle='worldarchitect-ai-777-deadbeef'
+busy_pane_output='Working (4m 12s)\nWaiting for background terminal'
+: >"$ao_calls_file"
+action_file="$(mktemp)"
+pr_green_reuse_session worldarchitect.ai 777 'must not queue this prompt' >"$action_file"
+action="$(<"$action_file")"
+rm -f "$action_file"
+assert_eq "$action" busy_deferred
+if rg -q '^send ' "$ao_calls_file"; then
+  printf 'busy live session must not receive a queued prompt\n' >&2
   exit 1
 fi
 

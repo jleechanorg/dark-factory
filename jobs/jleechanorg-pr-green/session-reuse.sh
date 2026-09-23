@@ -56,9 +56,48 @@ pr_green_session_record() {
   fi
 }
 
+# Return the tmux runtime handle for exactly one AO session. `ao session get`
+# confirms the session identity, but intentionally omits operational handles
+# from its public JSON read model.  The scheduler may therefore make this
+# narrowly-scoped, read-only SQLite lookup against AO's own state store.
+pr_green_runtime_handle() {
+  local project_id="$1"
+  local session_id="$2"
+  local db escaped_project escaped_session
+
+  # AO ids and project ids are generated identifiers. Refuse anything else so
+  # no value obtained from a daemon response can become SQL syntax.
+  [[ "$project_id" =~ ^[[:alnum:]._-]+$ && "$session_id" =~ ^[[:alnum:]._-]+$ ]] || return 1
+  command -v sqlite3 >/dev/null 2>&1 || return 1
+  db="${PR_GREEN_AO_DB_PATH:-$HOME/.ao/data/ao.db}"
+  [[ -r "$db" ]] || return 1
+  escaped_project="${project_id//\'/\'\'}"
+  escaped_session="${session_id//\'/\'\'}"
+  sqlite3 -noheader "$db" \
+    "SELECT runtime_handle_id FROM sessions WHERE id = '$escaped_session' AND project_id = '$escaped_project' LIMIT 1;" \
+    2>/dev/null | head -n 1
+}
+
+# Return success only when the exact tmux runtime for a live AO session is
+# visibly still working.  This avoids queuing a second Codex turn when legacy
+# sessions have stale AO activity_state=idle because they started before the
+# hook PATH repair.  If the handle/pane cannot be inspected, preserve ordinary
+# AO reuse rather than treating an unknown state as permanently busy.
+pr_green_live_session_is_busy() {
+  local project_id="$1"
+  local session_id="$2"
+  local runtime_handle pane
+
+  runtime_handle="$(pr_green_runtime_handle "$project_id" "$session_id" || true)"
+  [[ -n "$runtime_handle" ]] || return 1
+  tmux has-session -t "$runtime_handle" 2>/dev/null || return 1
+  pane="$(tmux capture-pane -p -t "$runtime_handle" -S -80 2>/dev/null || true)"
+  grep -Eq 'Working \(|Waiting for agents|Waiting for background terminal' <<<"$pane"
+}
+
 # Reuse a live session, or restore a terminated one and then send it the
 # current prompt. Return codes:
-#   0 — prompt sent to an existing session (live or restored)
+#   0 — live/restore prompt sent, or a visibly busy live session was deferred
 #   1 — no matching session, or restoration failed; caller may spawn
 #   2 — matching live session could not accept the prompt; caller must not
 #       spawn a duplicate fleet member during this run
@@ -82,6 +121,10 @@ pr_green_reuse_session() {
     fi
     printf '%s\n' "restored"
   else
+    if pr_green_live_session_is_busy "$project_id" "$session_id"; then
+      printf '%s\n' "busy_deferred"
+      return 0
+    fi
     printf '%s\n' "reused"
   fi
 

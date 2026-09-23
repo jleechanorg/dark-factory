@@ -55,6 +55,7 @@ dispatched=0
 selected=0
 reused=0
 restored=0
+busy_deferred=0
 fixed_confirmed=0
 
 # outcomes.jsonl is the stable reporting contract. `verified` is true only
@@ -125,13 +126,18 @@ while IFS=$'\t' read -r repo number title url updated; do
   session_name="pr-${number}"
   session_action=""
   if session_action="$(pr_green_reuse_session "$project_id" "$number" "$prompt")"; then
-    attempted=$((attempted + 1))
     case "$session_action" in
       restored)
+      attempted=$((attempted + 1))
       restored=$((restored + 1))
       echo "$LOG_PREFIX restored and reused AO session for $repo#$number"
         ;;
+      busy_deferred)
+      busy_deferred=$((busy_deferred + 1))
+      echo "$LOG_PREFIX AO session for $repo#$number is visibly busy; deferred without queuing a prompt"
+        ;;
       *)
+        attempted=$((attempted + 1))
         reused=$((reused + 1))
       echo "$LOG_PREFIX reused AO session for $repo#$number"
       ;;
@@ -212,7 +218,8 @@ jq -n --argjson ts "$run_started" --argjson analyzed "$analyzed" \
   --argjson actionable "$actionable" --argjson selected "$selected" \
   --argjson attempted "$attempted" \
   --argjson dispatched "$dispatched" --argjson reused "$reused" \
-  --argjson restored "$restored" --argjson fixed_confirmed "$fixed_confirmed" \
-  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, fixed_confirmed:$fixed_confirmed}' \
+  --argjson restored "$restored" --argjson busy_deferred "$busy_deferred" \
+  --argjson fixed_confirmed "$fixed_confirmed" \
+  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, busy_deferred:$busy_deferred, fixed_confirmed:$fixed_confirmed}' \
   >> "$METRICS_DIR/runs.jsonl"
-echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored fixed_confirmed=$fixed_confirmed"
+echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored busy_deferred=$busy_deferred fixed_confirmed=$fixed_confirmed"

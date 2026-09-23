@@ -35,6 +35,7 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" --argjson since "$SINCE" 
     actionable: ($runs | map(.actionable // 0) | add // 0),
     selected: ($runs | map(.selected // 0) | add // 0),
     attempts: ($runs | map(.attempted // 0) | add // 0),
+    busy_deferred: ($runs | map(.busy_deferred // 0) | add // 0),
     outcome_records: ($outcomes | length),
     confirmed_fixes: ($outcomes | map(select(.result == "fixed" and (.verified == true))) | length),
     blockers: ($outcomes | map(select(.result == "blocked")) | length),
@@ -52,6 +53,7 @@ PRs analyzed for red CI/conflict: $(jq -r '.analyzed' <<<"$summary")
 Actionable red/conflicting: $(jq -r '.actionable' <<<"$summary")
 Selected for repair: $(jq -r '.selected' <<<"$summary")
 Repair attempts (dispatch or session reuse): $(jq -r '.attempts' <<<"$summary")
+Busy sessions deferred (no prompt queued): $(jq -r '.busy_deferred' <<<"$summary")
 
 Durable PR outcomes: $(jq -r '.outcome_records' <<<"$summary")
 Confirmed fixes (verified): $(jq -r '.confirmed_fixes' <<<"$summary")
