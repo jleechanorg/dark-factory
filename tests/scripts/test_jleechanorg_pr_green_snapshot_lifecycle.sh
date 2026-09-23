@@ -8,7 +8,9 @@ trap 'rm -rf "$fixture_dir"' EXIT
 mock_bin="$fixture_dir/bin"
 metrics_dir="$fixture_dir/metrics"
 state_file="$fixture_dir/state.json"
-mkdir -p "$mock_bin" "$metrics_dir/pr-state"
+lock_dir="$fixture_dir/locks"
+mkdir -p "$mock_bin" "$metrics_dir/pr-state" "$lock_dir"
+export PR_GREEN_AO_SPAWN_LOCK_DIR="$lock_dir"
 
 cat >"$mock_bin/gh" <<'EOF'
 #!/usr/bin/env bash
