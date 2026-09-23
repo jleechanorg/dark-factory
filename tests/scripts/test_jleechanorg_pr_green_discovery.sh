@@ -150,6 +150,10 @@ if [[ "${PR_GREEN_BUSY_FAIRNESS:-0}" == 1 ]]; then
       [[ "${PR_GREEN_SPAWN_FAILURE_OUTPUT:-0}" == 1 ]] && printf '%s\n' 'spawn failed'
       exit 23
     fi
+    if [[ -n "${PR_GREEN_CONCURRENT_MARKER:-}" ]]; then
+      : >"$PR_GREEN_CONCURRENT_MARKER"
+      sleep 0.5
+    fi
     sleep 0.2
     exit 0
   fi
@@ -473,6 +477,35 @@ if rg -q 'session restore|^spawn ' "$fixture_dir/ao-cap-restore.log"; then
   echo 'FAIL: terminated session was restored or replaced under active-session cap' >&2
   exit 1
 fi
+
+# Two scheduler processes share one global admission lock. The second process
+# must defer while the first process is between its count and AO spawn.
+concurrent_root="$fixture_dir/concurrent"
+mkdir -p "$concurrent_root/one" "$concurrent_root/two" "$concurrent_root/codex"
+printf '%s\n' '{"tokens":{}}' >"$concurrent_root/codex/auth.json"
+: >"$concurrent_root/one/ao.db"
+: >"$concurrent_root/two/ao.db"
+marker="$concurrent_root/spawn-started"
+PATH="$mock_bin:$PATH" HOME="$fixture_dir/home-concurrent-one" CODEX_HOME="$concurrent_root/codex" \
+  PR_GREEN_DISCOVERY_CASE=cap PR_GREEN_BUSY_FAIRNESS=1 PR_GREEN_AO_DB_PATH="$concurrent_root/one/ao.db" \
+  PR_GREEN_AO_SPAWN_LOCK_DIR="$concurrent_root/locks" PR_GREEN_CONCURRENT_MARKER="$marker" \
+  PR_GREEN_METRICS_DIR="$concurrent_root/one" PR_GREEN_MAX_PRS=1 PR_GREEN_DRY_RUN=0 \
+  AO_CALLS="$concurrent_root/one/ao.log" GH_CALLS="$concurrent_root/one/gh.log" \
+  bash "$JOB" >"$concurrent_root/one/out" 2>"$concurrent_root/one/err" &
+first_pid=$!
+for _ in {1..50}; do [[ -e "$marker" ]] && break; sleep 0.02; done
+[[ -e "$marker" ]] || { echo 'FAIL: concurrent spawn fixture did not start' >&2; exit 1; }
+PATH="$mock_bin:$PATH" HOME="$fixture_dir/home-concurrent-two" CODEX_HOME="$concurrent_root/codex" \
+  PR_GREEN_DISCOVERY_CASE=cap PR_GREEN_BUSY_FAIRNESS=1 PR_GREEN_AO_DB_PATH="$concurrent_root/two/ao.db" \
+  PR_GREEN_AO_SPAWN_LOCK_DIR="$concurrent_root/locks" PR_GREEN_METRICS_DIR="$concurrent_root/two" \
+  PR_GREEN_MAX_PRS=1 PR_GREEN_DRY_RUN=0 AO_CALLS="$concurrent_root/two/ao.log" GH_CALLS="$concurrent_root/two/gh.log" \
+  bash "$JOB" >"$concurrent_root/two/out" 2>"$concurrent_root/two/err"
+wait "$first_pid"
+[[ "$(jq -sr 'last.admission_deferred' "$concurrent_root/two/runs.jsonl")" == 1 ]] || {
+  cat "$concurrent_root/two/err" >&2
+  echo 'FAIL: concurrent scheduler run bypassed the global admission lock' >&2
+  exit 1
+}
 
 # An exited, empty-output spawn is a failed attempt, not a dispatch. It must
 # still emit durable accounting so attempted and outcome records reconcile.
