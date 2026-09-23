@@ -44,6 +44,205 @@ pr_green_ensure_codex_scope() {
   [[ "$verified_home" == "$codex_home" ]]
 }
 
+# Read the daemon's own session row only to recover the exact workspace binding
+# that is not exposed by `ao session get`. The write path below remains the
+# supported AO activity API; this lookup is deliberately project-scoped and
+# fails closed when the local state store is unavailable or malformed.
+pr_green_session_recovery_row() {
+  local project_id="$1"
+  local session_id="$2"
+  local db
+  [[ "$project_id" =~ ^[[:alnum:]._-]+$ && "$session_id" =~ ^[[:alnum:]._-]+$ ]] || return 1
+  command -v sqlite3 >/dev/null 2>&1 || return 1
+  db="${PR_GREEN_AO_DB_PATH:-$HOME/.ao/data/ao.db}"
+  [[ -r "$db" ]] || return 1
+  sqlite3 -noheader "$db" \
+    "SELECT workspace_path || '|' || agent_session_id || '|' || is_terminated || '|' || created_at FROM sessions WHERE id = '${session_id//\'/\'\'}' AND project_id = '${project_id//\'/\'\'}' LIMIT 1;" \
+    2>/dev/null | head -n 1
+}
+
+# Discover the exact Codex conversation for one AO workspace. A session_meta
+# record is authoritative only when its first record names the exact workspace;
+# the newest timestamp-qualified native id wins, while an exact timestamp tie
+# is rejected. The function prints the selected id and every matching rollout
+# path privately to its caller; no rollout contents or credentials are logged.
+pr_green_find_native_rollouts() {
+  local workspace="$1"
+  local created_at="${2:-}" wanted_id="${3:-}" cutoff_epoch='' created_at_clean='' home file first metadata_id metadata_cwd metadata_timestamp metadata_epoch relative
+  local best_id='' best_timestamp='' candidate_id candidate_timestamp best_ties=0
+  local -a homes=()
+  local -A seen_homes=() seen_ids=() id_timestamps=()
+  local -a matches=()
+  local candidates="${PR_GREEN_CODEX_HOME_CANDIDATES:-${HOME}/.codex:${CODEX_HOME:-${HOME}/.codex-dark-factory}}"
+
+  if [[ -n "$created_at" ]]; then
+    if [[ "$created_at" == *Z ]]; then
+      cutoff_epoch="$(date -u -d "$created_at" +%s 2>/dev/null || true)"
+    else
+      created_at_clean="${created_at%%.*}"
+      created_at_clean="${created_at_clean%% +*}"
+      cutoff_epoch="$(date -u -d "$created_at_clean UTC" +%s 2>/dev/null || true)"
+    fi
+  fi
+  IFS=: read -r -a homes <<<"$candidates"
+  for home in "${homes[@]}"; do
+    [[ -n "$home" && -d "$home/sessions" ]] || continue
+    home="${home%/}"
+    [[ -n "${seen_homes[$home]+yes}" ]] && continue
+    seen_homes["$home"]=1
+    while IFS= read -r -d '' file; do
+      first="$(head -n 1 "$file" 2>/dev/null || true)"
+      metadata_id="$(jq -r 'select(.type == "session_meta") | (.payload.session_id // .payload.id // empty)' <<<"$first" 2>/dev/null || true)"
+      metadata_cwd="$(jq -r 'select(.type == "session_meta") | .payload.cwd // empty' <<<"$first" 2>/dev/null || true)"
+      metadata_timestamp="$(jq -r 'select(.type == "session_meta") | .timestamp // .payload.timestamp // empty' <<<"$first" 2>/dev/null || true)"
+      [[ -n "$metadata_id" && "$metadata_cwd" == "$workspace" ]] || continue
+      [[ "$metadata_id" =~ ^[[:alnum:]-]{16,}$ ]] || continue
+      [[ -z "$wanted_id" || "$metadata_id" == "$wanted_id" ]] || continue
+      if [[ -n "$cutoff_epoch" ]]; then
+        [[ -n "$metadata_timestamp" ]] || continue
+        metadata_epoch="$(date -u -d "$metadata_timestamp" +%s 2>/dev/null || true)"
+        [[ -n "$metadata_epoch" && "$metadata_epoch" -ge "$cutoff_epoch" ]] || continue
+      fi
+      seen_ids["$metadata_id"]=1
+      if [[ -z "${id_timestamps[$metadata_id]+yes}" || "$metadata_timestamp" > "${id_timestamps[$metadata_id]}" ]]; then
+        id_timestamps["$metadata_id"]="$metadata_timestamp"
+      fi
+      relative="${file#"$home/"}"
+      matches+=("$metadata_id"$'\t'"$home"$'\t'"$relative")
+    done < <(find "$home/sessions" -type f -name 'rollout-*.jsonl' -print0 2>/dev/null)
+  done
+
+  if [[ -n "$wanted_id" ]]; then
+    [[ -n "${seen_ids[$wanted_id]+yes}" ]] || return 1
+    best_id="$wanted_id"
+  else
+    for candidate_id in "${!seen_ids[@]}"; do
+      candidate_timestamp="${id_timestamps[$candidate_id]}"
+      if [[ -z "$best_id" || "$candidate_timestamp" > "$best_timestamp" ]]; then
+        best_id="$candidate_id"
+        best_timestamp="$candidate_timestamp"
+        best_ties=0
+      elif [[ "$candidate_timestamp" == "$best_timestamp" ]]; then
+        best_ties=$((best_ties + 1))
+      fi
+    done
+    ((best_ties == 0)) || return 1
+  fi
+  [[ -n "$best_id" ]] || return 1
+  printf '%s\n' "$best_id"
+  for match in "${matches[@]}"; do
+    [[ "${match%%$'\t'*}" == "$best_id" ]] && printf '%s\n' "$match"
+  done
+}
+
+# Copy all exact rollout segments for a unique native conversation into the
+# authenticated project Codex home. Existing destination content is never
+# overwritten: an identical file is accepted, while a differing file fails
+# closed to protect conversation history.
+pr_green_preserve_native_rollouts() {
+  local intended_home="$1"
+  local native_id="$2"
+  local match source_home relative source target
+  local copied=0
+  while IFS=$'\t' read -r match source_home relative; do
+    [[ "$match" == "$native_id" && -n "$source_home" && -n "$relative" ]] || continue
+    source="$source_home/$relative"
+    target="$intended_home/$relative"
+    mkdir -p "$(dirname "$target")" || return 1
+    if [[ -e "$target" ]]; then
+      cmp -s "$source" "$target" || return 1
+    else
+      cp -p -- "$source" "$target" || return 1
+      cmp -s "$source" "$target" || return 1
+    fi
+    copied=$((copied + 1))
+  done
+  ((copied > 0))
+}
+
+# Resolve the active AO daemon endpoint from its supported status response,
+# with an explicit URL override reserved for isolated test/managed deployments.
+# Do not assume the config-file port: the daemon may be running on a generated
+# port after a restart.
+pr_green_ao_api_base() {
+  local override="${PR_GREEN_AO_API_URL:-}" status_json port
+  if [[ -n "$override" ]]; then
+    [[ "$override" =~ ^https?://[^[:space:]]+$ ]] || return 1
+    printf '%s\n' "${override%/}"
+    return 0
+  fi
+  status_json="$(ao status --json 2>/dev/null || true)"
+  port="$(jq -r '.port // empty' <<<"$status_json" 2>/dev/null || true)"
+  [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || return 1
+  printf 'http://127.0.0.1:%s\n' "$port"
+}
+
+# Recover a terminated Codex session's native conversation before AO restore.
+# Return 0 when no recovery is needed or registration is verified; return 1
+# for direct helper failures. The caller maps failures on an existing session
+# to duplicate-suppression (return 2), so an ambiguous history can never cause
+# a fresh replacement session to be spawned.
+pr_green_recover_native_conversation() {
+  local project_id="$1" session_id="$2"
+  local row workspace native_registered terminated intended_home native_id api_base body verified
+  local -a native_rollouts=()
+  local -a row_fields=()
+
+  row="$(pr_green_session_recovery_row "$project_id" "$session_id" || true)"
+  [[ -n "$row" ]] || return 1
+  IFS='|' read -r -a row_fields <<<"$row"
+  workspace="${row_fields[0]:-}"
+  native_registered="${row_fields[1]:-}"
+  terminated="${row_fields[2]:-}"
+  local created_at="${row_fields[3]:-}"
+  [[ -n "$workspace" && "$terminated" == "1" ]] || return 0
+  intended_home="${CODEX_HOME:-${PR_GREEN_CODEX_HOME:-$HOME/.codex-dark-factory}}"
+  [[ -d "$intended_home" && -s "$intended_home/auth.json" ]] || return 1
+  if [[ -n "$native_registered" ]]; then
+    mapfile -t native_rollouts < <(pr_green_find_native_rollouts "$workspace" '' "$native_registered") || return 1
+    ((${#native_rollouts[@]} >= 2)) || return 1
+    pr_green_preserve_native_rollouts "$intended_home" "$native_registered" < <(printf '%s\n' "${native_rollouts[@]:1}") || return 1
+    return 0
+  fi
+  mapfile -t native_rollouts < <(pr_green_find_native_rollouts "$workspace" "$created_at") || return 1
+  ((${#native_rollouts[@]} >= 2)) || return 1
+  native_id="${native_rollouts[0]}"
+  pr_green_preserve_native_rollouts "$intended_home" "$native_id" < <(printf '%s\n' "${native_rollouts[@]:1}") || return 1
+  api_base="$(pr_green_ao_api_base || true)"
+  [[ -n "$api_base" ]] || return 1
+  body="$(jq -cn --arg id "$native_id" '{agentSessionId:$id}')"
+  curl --silent --show-error --fail-with-body --max-time "${PR_GREEN_AO_API_TIMEOUT_SECONDS:-10}" \
+    -X POST "$api_base/api/v1/sessions/$session_id/activity" \
+    -H 'Content-Type: application/json' --data-binary "$body" >/dev/null 2>/dev/null || return 1
+  verified="$(pr_green_session_recovery_row "$project_id" "$session_id" | awk -F '|' '{print $2}' || true)"
+  [[ "$verified" == "$native_id" ]]
+}
+
+# Copy an already-registered native conversation for a live, non-busy session
+# into the repair job's authenticated profile. This is deliberately a local
+# transcript migration only: changing the environment of a running Codex
+# process would require a supported AO handoff, so live workers remain running
+# and are not killed or restored here.
+pr_green_preserve_live_native_conversation() {
+  local project_id="$1" session_id="$2"
+  local row workspace native_registered terminated intended_home
+  local -a row_fields=() native_rollouts=()
+  row="$(pr_green_session_recovery_row "$project_id" "$session_id" || true)"
+  # A public AO session may outlive a transient local DB read failure; leave
+  # that live worker untouched and preserve ordinary reuse semantics.
+  [[ -n "$row" ]] || return 0
+  IFS='|' read -r -a row_fields <<<"$row"
+  workspace="${row_fields[0]:-}"
+  native_registered="${row_fields[1]:-}"
+  terminated="${row_fields[2]:-}"
+  [[ "$terminated" == "0" && -n "$workspace" && -n "$native_registered" ]] || return 0
+  intended_home="${CODEX_HOME:-${PR_GREEN_CODEX_HOME:-$HOME/.codex-dark-factory}}"
+  [[ -d "$intended_home" && -s "$intended_home/auth.json" ]] || return 1
+  mapfile -t native_rollouts < <(pr_green_find_native_rollouts "$workspace" '' "$native_registered") || return 1
+  ((${#native_rollouts[@]} >= 2)) || return 1
+  pr_green_preserve_native_rollouts "$intended_home" "$native_registered" < <(printf '%s\n' "${native_rollouts[@]:1}")
+}
+
 # Recognize both legacy and current Go AO spawn acknowledgements. The Go CLI
 # exits after claiming a PR and reports either a generic "claimed URL" or the
 # actual claimed pull-request URL, rather than the older SESSION= or Worktree
@@ -156,15 +355,26 @@ pr_green_reuse_session() {
   terminated="$(jq -r 'if (.isTerminated // false) then "true" else "false" end' <<<"$record")"
 
   if [[ "$terminated" == "true" ]]; then
+    if ! pr_green_recover_native_conversation "$project_id" "$session_id"; then
+      printf '%s\n' "AO terminated session $session_id has no unambiguous recoverable native conversation; suppressing duplicate spawn" >&2
+      return 2
+    fi
     if ! restore_output="$(ao session restore "$session_id" -p "$project_id" 2>&1)"; then
       printf '%s\n' "AO session $session_id could not be restored: $restore_output" >&2
-      return 1
+      # Restore may have launched the native worker before its CLI observed an
+      # error. Keep the exact existing session reserved until the next scan;
+      # never let the caller create a duplicate from this ambiguous outcome.
+      return 2
     fi
     printf '%s\n' "restored"
   else
     if pr_green_live_session_is_busy "$project_id" "$session_id"; then
       printf '%s\n' "busy_deferred"
       return 0
+    fi
+    if ! pr_green_preserve_live_native_conversation "$project_id" "$session_id"; then
+      printf '%s\n' "AO live session $session_id has no safely migratable native rollout; suppressing duplicate spawn" >&2
+      return 2
     fi
     printf '%s\n' "reused"
   fi
