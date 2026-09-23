@@ -429,8 +429,8 @@ pr_green_delivery_pending_path() {
 }
 
 pr_green_delivery_envelope() {
-  local prompt="$1" request_id="$2"
-  printf '%s [PR_GREEN_DELIVERY_ID:%s]\n' "$prompt" "$request_id"
+  local brief_path="$1" request_id="$2"
+  printf 'Read and execute %s. [PR_GREEN_DELIVERY_ID:%s]\n' "$brief_path" "$request_id"
 }
 
 pr_green_delivery_request_id() {
@@ -441,8 +441,36 @@ pr_green_delivery_request_id() {
   fi
 }
 
+pr_green_delivery_write_brief() {
+  local project_id="$1" pr_number="$2" request_id="$3" prompt="$4"
+  local pending_path brief_path state_dir tmp
+  [[ "$request_id" =~ ^[[:alnum:]_.-]+$ ]] || return 1
+  pending_path="$(pr_green_delivery_pending_path "$project_id" "$pr_number")" || return 1
+  state_dir="$(dirname "$pending_path")"
+  mkdir -p "$state_dir" || return 1
+  brief_path="${pending_path%.json}.${request_id}.brief"
+  if [[ -e "$brief_path" ]]; then
+    # A prior crash may have committed the immutable brief before the ledger.
+    # Reuse it only when it is the exact regular, mode-600 content; never
+    # overwrite a divergent brief for the same request id.
+    [[ -f "$brief_path" && ! -L "$brief_path" ]] || return 1
+    [[ "$(stat -c '%a' "$brief_path" 2>/dev/null || true)" == 600 ]] || return 1
+    cmp -s <(printf '%s' "$prompt") "$brief_path" || return 1
+    printf '%s\n' "$brief_path"
+    return 0
+  fi
+  tmp="$(mktemp "${brief_path}.tmp.XXXXXX")" || return 1
+  if ! printf '%s' "$prompt" >"$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chmod 600 -- "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -- "$tmp" "$brief_path" || { rm -f -- "$tmp"; return 1; }
+  printf '%s\n' "$brief_path"
+}
+
 pr_green_delivery_write_pending() {
-  local project_id="$1" pr_number="$2" session_id="$3" native_id="$4" workspace="$5" prompt="$6" envelope="$7" request_id="$8"
+  local project_id="$1" pr_number="$2" session_id="$3" native_id="$4" workspace="$5" prompt="$6" envelope="$7" request_id="$8" brief_path="$9"
   local path state_dir tmp
   path="$(pr_green_delivery_pending_path "$project_id" "$pr_number")" || return 1
   state_dir="$(dirname "$path")"
@@ -450,9 +478,9 @@ pr_green_delivery_write_pending() {
   tmp="$(mktemp "${path}.tmp.XXXXXX")" || return 1
   if ! jq -cn --arg project_id "$project_id" --argjson pr_number "$pr_number" \
     --arg session_id "$session_id" --arg native_id "$native_id" --arg workspace "$workspace" \
-    --arg prompt "$prompt" --arg envelope "$envelope" --arg request_id "$request_id" \
+    --arg prompt "$prompt" --arg envelope "$envelope" --arg request_id "$request_id" --arg brief_path "$brief_path" \
     --argjson created_at "$(date +%s)" \
-    '{project_id:$project_id,pr_number:$pr_number,session_id:$session_id,native_id:$native_id,workspace:$workspace,prompt:$prompt,envelope:$envelope,request_id:$request_id,created_at:$created_at}' \
+    '{project_id:$project_id,pr_number:$pr_number,session_id:$session_id,native_id:$native_id,workspace:$workspace,prompt:$prompt,envelope:$envelope,brief_path:$brief_path,request_id:$request_id,created_at:$created_at}' \
     >"$tmp"; then
     rm -f -- "$tmp"
     return 1
@@ -487,6 +515,52 @@ pr_green_delivery_pending_status() {
   else
     printf '%s\n' pending
   fi
+}
+
+# Upgrade a pre-pointer ledger entry without appending a prompt.  The old
+# envelope is checked first so a delayed native acknowledgement retires the
+# old request rather than creating a second one.  A non-acknowledged legacy
+# entry is converted to the immutable-brief form, but the caller may deliver
+# that pointer only after a terminated exact session has been restored; live
+# sessions stay fail-closed until their existing composer is known safe.
+pr_green_delivery_upgrade_legacy() {
+  local project_id="$1" pr_number="$2" listing="$3" native_id="$4" workspace="$5"
+  local path pending old_envelope prompt request_id brief_path envelope count tmp
+  path="$(pr_green_delivery_pending_path "$project_id" "$pr_number")" || return 1
+  [[ -s "$path" ]] || { printf '%s\n' none; return 0; }
+  pending="$(cat -- "$path" 2>/dev/null || true)"
+  brief_path="$(jq -r '.brief_path // empty' <<<"$pending" 2>/dev/null || true)"
+  [[ -n "$brief_path" ]] && { printf '%s\n' current; return 0; }
+  old_envelope="$(jq -r '.envelope // empty' <<<"$pending" 2>/dev/null || true)"
+  prompt="$(jq -r '.prompt // empty' <<<"$pending" 2>/dev/null || true)"
+  request_id="$(jq -r '.request_id // empty' <<<"$pending" 2>/dev/null || true)"
+  [[ -n "$old_envelope" && -n "$prompt" && "$native_id" == "$(jq -r '.native_id // empty' <<<"$pending" 2>/dev/null || true)" ]] || {
+    printf '%s\n' pending
+    return 0
+  }
+  [[ "$workspace" == "$(jq -r '.workspace // empty' <<<"$pending" 2>/dev/null || true)" ]] || {
+    printf '%s\n' pending
+    return 0
+  }
+  count="$(pr_green_native_prompt_count "$listing" "$old_envelope" 2>/dev/null || true)"
+  if [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]; then
+    printf '%s\n' acked
+    return 0
+  fi
+  [[ "$request_id" =~ ^[[:alnum:]_.-]+$ ]] || { printf '%s\n' pending; return 0; }
+  brief_path="$(pr_green_delivery_write_brief "$project_id" "$pr_number" "$request_id" "$prompt" 2>/dev/null || true)"
+  [[ -n "$brief_path" ]] || { printf '%s\n' pending; return 0; }
+  envelope="$(pr_green_delivery_envelope "$brief_path" "$request_id")"
+  tmp="$(mktemp "${path}.tmp.XXXXXX")" || { printf '%s\n' pending; return 0; }
+  if ! jq --arg envelope "$envelope" --arg brief_path "$brief_path" --arg legacy_envelope "$old_envelope" \
+    '. + {envelope:$envelope,brief_path:$brief_path,legacy_envelope:$legacy_envelope,transport:"pointer-v1",legacy_pending:true}' \
+    <<<"$pending" >"$tmp"; then
+    rm -f -- "$tmp"
+    printf '%s\n' pending
+    return 0
+  fi
+  mv -- "$tmp" "$path" || { rm -f -- "$tmp"; printf '%s\n' pending; return 0; }
+  printf '%s\n' migrated
 }
 
 
@@ -599,7 +673,7 @@ pr_green_reuse_session() {
   local pr_number="$2"
   local prompt="$3"
   local record session_id terminated restore_output native_row native_workspace native_id native_baseline native_listing
-  local pending_status request_id envelope
+  local pending pending_status legacy_status request_id envelope brief_path recovery_pending=0
   local -a native_row_fields=()
 
   PR_GREEN_NATIVE_ROLLOUT_LISTING=''
@@ -662,25 +736,59 @@ pr_green_reuse_session() {
     printf '%s\n' "AO session $session_id native rollout is unavailable; delivery_unconfirmed" >&2
     return 4
   }
+  legacy_status="$(pr_green_delivery_upgrade_legacy "$project_id" "$pr_number" "$native_listing" "$native_id" "$native_workspace" 2>/dev/null || true)"
+  case "$legacy_status" in
+    acked)
+      pr_green_delivery_clear_pending "$project_id" "$pr_number" || return 4
+      ;;
+    migrated)
+      if [[ "$terminated" == "true" ]]; then
+        # The old worker is gone and this exact native identity was restored;
+        # reuse the persisted request instead of minting a fresh nonce.
+        recovery_pending=1
+      else
+        printf '%s\n' "PR $project_id#$pr_number has a live legacy delivery; deferring pointer recovery" >&2
+        return 4
+      fi
+      ;;
+  esac
   pending_status="$(pr_green_delivery_pending_status "$project_id" "$pr_number" 2>/dev/null || true)"
   case "$pending_status" in
     acked) pr_green_delivery_clear_pending "$project_id" "$pr_number" || return 4 ;;
     pending)
-      printf '%s\n' "PR $project_id#$pr_number has an unresolved native delivery; suppressing duplicate prompt" >&2
-      return 4
+      if [[ "$recovery_pending" -ne 1 ]]; then
+        printf '%s\n' "PR $project_id#$pr_number has an unresolved native delivery; suppressing duplicate prompt" >&2
+        return 4
+      fi
       ;;
   esac
-  request_id="$(pr_green_delivery_request_id)"
-  envelope="$(pr_green_delivery_envelope "$prompt" "$request_id")"
+  if [[ "$recovery_pending" -eq 1 ]]; then
+    pending="$(cat -- "$(pr_green_delivery_pending_path "$project_id" "$pr_number")" 2>/dev/null || true)"
+    prompt="$(jq -r '.prompt // empty' <<<"$pending" 2>/dev/null || true)"
+    request_id="$(jq -r '.request_id // empty' <<<"$pending" 2>/dev/null || true)"
+    brief_path="$(jq -r '.brief_path // empty' <<<"$pending" 2>/dev/null || true)"
+    envelope="$(jq -r '.envelope // empty' <<<"$pending" 2>/dev/null || true)"
+    [[ -n "$prompt" && -n "$request_id" && -n "$brief_path" && -n "$envelope" ]] || return 4
+  else
+    request_id="$(pr_green_delivery_request_id)"
+    brief_path="$(pr_green_delivery_write_brief "$project_id" "$pr_number" "$request_id" "$prompt" 2>/dev/null || true)"
+    [[ -n "$brief_path" ]] || {
+      printf '%s\n' "AO session $session_id could not persist immutable repair brief; suppressing prompt" >&2
+      return 4
+    }
+    envelope="$(pr_green_delivery_envelope "$brief_path" "$request_id")"
+  fi
   native_baseline="$(pr_green_native_prompt_count "$native_listing" "$envelope" 2>/dev/null || true)"
   if [[ ! "$native_baseline" =~ ^[0-9]+$ ]]; then
     printf '%s\n' "AO session $session_id native rollout is unavailable; delivery_unconfirmed" >&2
     return 4
   fi
 
-  if ! pr_green_delivery_write_pending "$project_id" "$pr_number" "$session_id" "$native_id" "$native_workspace" "$prompt" "$envelope" "$request_id"; then
-    printf '%s\n' "AO session $session_id could not persist delivery state; suppressing prompt" >&2
-    return 4
+  if [[ "$recovery_pending" -ne 1 ]]; then
+    if ! pr_green_delivery_write_pending "$project_id" "$pr_number" "$session_id" "$native_id" "$native_workspace" "$prompt" "$envelope" "$request_id" "$brief_path"; then
+      printf '%s\n' "AO session $session_id could not persist delivery state; suppressing prompt" >&2
+      return 4
+    fi
   fi
   if ! ao send --session "$session_id" --message "$envelope" >/dev/null 2>&1; then
     printf '%s\n' "AO session $session_id did not accept the prompt after reuse/restore; suppressing duplicate spawn" >&2

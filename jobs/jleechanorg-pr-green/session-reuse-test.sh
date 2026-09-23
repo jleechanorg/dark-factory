@@ -132,7 +132,7 @@ rm -f "$action_file"
 assert_eq "$action" reused
 mapfile -t ao_calls <"$ao_calls_file"
 assert_eq "${#ao_calls[@]}" 2
-[[ "${ao_calls[1]}" == 'send --session wa-live --message updated prompt [PR_GREEN_DELIVERY_ID:'*']' ]]
+[[ "${ao_calls[1]}" == 'send --session wa-live --message Read and execute '* ]]
 if rg -q '^spawn ' "$ao_calls_file"; then
   printf 'live-session reuse must not spawn a second session\n' >&2
   exit 1
@@ -182,8 +182,34 @@ unset PR_GREEN_TEST_DELIVERY_ID
 assert_eq "$action" reused
 mapfile -t ao_calls <"$ao_calls_file"
 assert_eq "${#ao_calls[@]}" 2
-[[ "${ao_calls[1]}" == 'send --session wa-live --message new prompt after old ack [PR_GREEN_DELIVERY_ID:new-delivery-id]' ]]
+[[ "${ao_calls[1]}" == 'send --session wa-live --message Read and execute '* ]]
 [[ ! -e "$pending_path" ]]
+
+# The short transport envelope must point at an immutable, mode-600 brief that
+# preserves the complete prompt byte-for-byte; the native ack proves only the
+# pointer envelope, while the brief is the semantic instruction source.
+brief_path="$recovery_dir/delivery/worldarchitect.ai-123.new-delivery-id.brief"
+assert_eq "$(<"$brief_path")" 'new prompt after old ack'
+assert_eq "$(stat -c '%a' "$brief_path")" 600
+[[ "${ao_calls[1]}" == *"$brief_path"*PR_GREEN_DELIVERY_ID:new-delivery-id* ]]
+
+# A pending record bound to another native identity is never migrated or sent
+# through the current AO session; the record remains for a later exact match.
+pending_path="$(pr_green_delivery_pending_path worldarchitect.ai 123)"
+jq -cn --arg workspace "$recovery_workspace" \
+  '{project_id:"worldarchitect.ai",pr_number:123,session_id:"wa-live",native_id:"wrong-native-id",workspace:$workspace,prompt:"identity mismatch",envelope:"identity mismatch [PR_GREEN_DELIVERY_ID:wrong-id]",request_id:"wrong-id",created_at:1}' \
+  >"$pending_path"
+: >"$ao_calls_file"
+set +e
+pr_green_reuse_session worldarchitect.ai 123 'must not cross native identity' >/dev/null
+rc=$?
+set -e
+assert_eq "$rc" 4
+if rg -q '^send ' "$ao_calls_file"; then
+  printf 'native identity mismatch must not send through the live session\n' >&2
+  exit 1
+fi
+rm -f -- "$pending_path"
 
 # Sessions created before the AO hook-path repair can still say idle in AO's
 # database while their actual Codex pane visibly works.  Such a session must
@@ -214,7 +240,7 @@ rm -f "$action_file"
 assert_eq "$action" reused
 mapfile -t ao_calls <"$ao_calls_file"
 assert_eq "${ao_calls[1]}" 'session get wa-fallback -p worldarchitect.ai --json'
-[[ "${ao_calls[2]}" == 'send --session wa-fallback --message hydrated prompt [PR_GREEN_DELIVERY_ID:'*']' ]]
+[[ "${ao_calls[2]}" == 'send --session wa-fallback --message Read and execute '* ]]
 
 fixture='{"data":[{"id":"wa-dead-old","displayName":"pr-321","isTerminated":true,"status":"terminated","updatedAt":"2026-09-23T00:01:00Z"},{"id":"wa-live-new","displayName":"pr-321","isTerminated":false,"status":"pr_open","updatedAt":"2026-09-23T00:00:00Z"}]}'
 session_get_fixture=''
@@ -227,7 +253,7 @@ action="$(<"$action_file")"
 rm -f "$action_file"
 assert_eq "$action" reused
 mapfile -t ao_calls <"$ao_calls_file"
-[[ "${ao_calls[1]}" == 'send --session wa-live-new --message prefer live prompt [PR_GREEN_DELIVERY_ID:'*']' ]]
+[[ "${ao_calls[1]}" == 'send --session wa-live-new --message Read and execute '* ]]
 
 fixture='{"data":[{"id":"wa-dead","displayName":"pr-456","isTerminated":true,"status":"terminated","updatedAt":"2026-09-23T00:00:00Z"}]}'
 : >"$ao_calls_file"
@@ -241,7 +267,28 @@ assert_eq "$action" restored
 mapfile -t ao_calls <"$ao_calls_file"
 assert_eq "${#ao_calls[@]}" 3
 assert_eq "${ao_calls[1]}" 'session restore wa-dead -p worldarchitect.ai'
-[[ "${ao_calls[2]}" == 'send --session wa-dead --message restore prompt [PR_GREEN_DELIVERY_ID:'*']' ]]
+[[ "${ao_calls[2]}" == 'send --session wa-dead --message Read and execute '* ]]
+
+# Legacy full-prompt pending state is upgraded only after the exact terminated
+# session is restored. The original prompt is retained in the brief and the
+# resumed native conversation receives one short pointer with the same nonce.
+pending_path="$(pr_green_delivery_pending_path worldarchitect.ai 456)"
+jq -cn --arg workspace "$recovery_workspace" \
+  '{project_id:"worldarchitect.ai",pr_number:456,session_id:"wa-dead",native_id:"native-session-dead",workspace:$workspace,prompt:"legacy prompt",envelope:"legacy prompt [PR_GREEN_DELIVERY_ID:legacy-id]",request_id:"legacy-id",created_at:1}' \
+  >"$pending_path"
+: >"$ao_calls_file"
+action_file="$(mktemp)"
+native_ack_file="$recovery_home/sessions/2026/09/23/rollout-native-session-dead.jsonl"
+pr_green_reuse_session worldarchitect.ai 456 'replacement prompt must not overwrite legacy request' >"$action_file"
+native_ack_file=''
+action="$(<"$action_file")"
+rm -f -- "$action_file"
+assert_eq "$action" restored
+legacy_brief="$recovery_dir/delivery/worldarchitect.ai-456.legacy-id.brief"
+assert_eq "$(<"$legacy_brief")" 'legacy prompt'
+mapfile -t ao_calls <"$ao_calls_file"
+[[ "${ao_calls[2]}" == *"send --session wa-dead --message Read and execute $legacy_brief. [PR_GREEN_DELIVERY_ID:legacy-id]" ]]
+[[ ! -e "$pending_path" ]]
 
 # A successful restore followed by a rejected prompt still identifies the
 # exact existing session. The caller must suppress duplicate spawn rather than
@@ -260,7 +307,7 @@ fi
 mapfile -t ao_calls <"$ao_calls_file"
 assert_eq "${ao_calls[0]}" 'session ls -p worldarchitect.ai --include-terminated --json'
 assert_eq "${ao_calls[1]}" 'session restore wa-dead -p worldarchitect.ai'
-[[ "${ao_calls[2]}" == 'send --session wa-dead --message restore retry prompt [PR_GREEN_DELIVERY_ID:'*']' ]]
+[[ "${ao_calls[2]}" == 'send --session wa-dead --message Read and execute '* ]]
 
 # A restore command can fail after partially launching the existing worker;
 # never fall through to a duplicate spawn.
