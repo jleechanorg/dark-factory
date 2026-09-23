@@ -89,14 +89,24 @@ assert_eq "$(jq -r '.pending_checks' <<<"$state")" false
 # A newer pending retry retires an older failure but must keep verification
 # pending until that retry reaches a terminal conclusion.
 pending_retry='{"headRefOid":"after","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[
-  {"name":"unit","workflowName":"CI","conclusion":"","status":"QUEUED","startedAt":"2026-09-23T08:05:00Z","completedAt":"0001-01-01T00:00:00Z","detailsUrl":"https://github.com/example/runs/2"},
-  {"name":"unit","workflowName":"CI","conclusion":"FAILURE","status":"COMPLETED","startedAt":"2026-09-23T08:00:00Z","completedAt":"2026-09-23T08:01:00Z","detailsUrl":"https://github.com/example/runs/1"}
+  {"name":"unit","workflowName":"CI","conclusion":"","status":"QUEUED","startedAt":"2026-09-23T08:10:00Z","completedAt":"0001-01-01T00:00:00Z","detailsUrl":"https://github.com/example/runs/2"},
+  {"name":"unit","workflowName":"CI","conclusion":"FAILURE","status":"COMPLETED","startedAt":"2026-09-23T08:00:00Z","completedAt":"2026-09-23T08:20:00Z","detailsUrl":"https://github.com/example/runs/1"}
 ]}'
 state="$(pr_green_state_from_pr_json <<<"$pending_retry")"
 assert_eq "$(jq -r '.failed_checks | length' <<<"$state")" 0
 assert_eq "$(jq -r '.check_count' <<<"$state")" 1
 assert_eq "$(jq -r '.successful_completed_checks' <<<"$state")" 0
 assert_eq "$(jq -r '.pending_checks' <<<"$state")" true
+
+# When attempt timestamps tie, prefer the provider's exact numeric identity,
+# not lexical detailsUrl ordering (for example run/9 versus run/10).
+numeric_identity_tie='{"headRefOid":"after","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[
+  {"name":"unit","workflowName":"CI","id":10,"conclusion":"SUCCESS","status":"COMPLETED","startedAt":"2026-09-23T08:10:00Z","completedAt":"2026-09-23T08:11:00Z","detailsUrl":"https://github.com/example/runs/10"},
+  {"name":"unit","workflowName":"CI","id":9,"conclusion":"FAILURE","status":"COMPLETED","startedAt":"2026-09-23T08:10:00Z","completedAt":"2026-09-23T08:11:00Z","detailsUrl":"https://github.com/example/runs/9"}
+]}'
+state="$(pr_green_state_from_pr_json <<<"$numeric_identity_tie")"
+assert_eq "$(jq -r '.failed_checks | length' <<<"$state")" 0
+assert_eq "$(jq -r '.successful_completed_checks' <<<"$state")" 1
 
 # GitHub retains cancelled check-runs from superseded duplicate workflows in
 # statusCheckRollup. A completed successful replacement for the same check on

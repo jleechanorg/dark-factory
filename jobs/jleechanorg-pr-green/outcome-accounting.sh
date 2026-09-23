@@ -104,8 +104,13 @@ pr_green_state_from_pr_json() {
     def status: ((.status // "") | ascii_upcase);
     def completed: (status == "" or status == "COMPLETED");
     def logical_context: ([.context, .name, .workflowName] | first_nonempty);
-    def attempt_timestamp: ([.completedAt, .startedAt, .updatedAt] | first_nonempty);
-    def attempt_identity: ([.detailsUrl, .externalId, .databaseId, .id] | first_nonempty);
+    def attempt_timestamp: ([.startedAt, .createdAt, .updatedAt, .completedAt] | first_nonempty);
+    def attempt_identity:
+      ([.databaseId, .id, .externalId, .detailsUrl] | first_nonempty) as $identity
+      | if ($identity | type) == "number" then $identity
+        elif (($identity | type) == "string" and ($identity | test("^[0-9]+$"))) then ($identity | tonumber)
+        else $identity
+        end;
     def attempt_rank: [attempt_timestamp, attempt_identity];
     def latest_checks:
       reduce ((.statusCheckRollup // [])[]?) as $check ({};
