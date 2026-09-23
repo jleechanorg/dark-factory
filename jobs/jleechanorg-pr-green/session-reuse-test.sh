@@ -34,6 +34,8 @@ if [[ "$*" == *"'wa-busy'"* ]]; then
   printf '%s\n' 'worldarchitect-ai-777-deadbeef'
 elif [[ "$*" == *"'wa-dead'"* ]]; then
   cat "$PR_GREEN_RECOVERY_STATE"
+elif [[ "$*" == *"'wa-dead-missing'"* ]]; then
+  printf '%s\n' "$PR_GREEN_RECOVERY_WORKSPACE/missing||1"
 fi
 EOF
 chmod +x "$recovery_bin/sqlite3"
@@ -184,6 +186,23 @@ set -e
 restore_fail=0
 if [[ "$rc" -ne 2 ]]; then
   printf 'restore failure must return duplicate-suppression code 2 (got %s)\n' "$rc" >&2
+  exit 1
+fi
+
+# Missing/ambiguous native history is a recovery block, not a send failure.
+# It must suppress duplicates without counting an inference attempt.
+fixture='{"data":[{"id":"wa-dead-missing","displayName":"pr-457","isTerminated":true,"status":"terminated","updatedAt":"2026-09-23T00:00:00Z"}]}'
+: >"$ao_calls_file"
+set +e
+pr_green_reuse_session worldarchitect.ai 457 'must not send without history' >/dev/null
+rc=$?
+set -e
+if [[ "$rc" -ne 3 ]]; then
+  printf 'missing native history must return recovery-blocked code 3 (got %s)\n' "$rc" >&2
+  exit 1
+fi
+if rg -q 'session restore|^send ' "$ao_calls_file"; then
+  printf 'recovery-blocked session must not restore or send\n' >&2
   exit 1
 fi
 

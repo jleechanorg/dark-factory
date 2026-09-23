@@ -9,9 +9,18 @@
 # registered project environment and silently fall back to the operator's
 # default account. `set-config` replaces the complete config, so preserve all
 # existing fields and verify the resulting project before proceeding.
+pr_green_extract_codex_home() {
+  jq -r '
+    if ((.env // {}) | type) == "object" then (.env.CODEX_HOME // "")
+    elif ((.env // []) | type) == "array" then
+      ((.env // [])[] | select(startswith("CODEX_HOME=")) | sub("^CODEX_HOME="; "")) // ""
+    else "" end
+  ' <<<"$1" 2>/dev/null || true
+}
+
 pr_green_ensure_codex_scope() {
   local project_id="$1" codex_home="${CODEX_HOME:-}"
-  local project_json config_json existing_home updated_config verified_home
+  local project_json config_json existing_home updated_config verified_config verified_home
   [[ -n "$codex_home" && -d "$codex_home" && -s "$codex_home/auth.json" ]] || {
     echo "PR_GREEN CODEX_HOME is not an existing authenticated scope: $codex_home" >&2
     return 1
@@ -20,12 +29,7 @@ pr_green_ensure_codex_scope() {
   [[ -n "$project_json" ]] || return 1
   config_json="$(jq -c '.project.config // {}' <<<"$project_json" 2>/dev/null || true)"
   [[ -n "$config_json" && "$config_json" != "null" ]] || return 1
-  existing_home="$(jq -r '
-    if ((.env // {}) | type) == "object" then (.env.CODEX_HOME // "")
-    elif ((.env // []) | type) == "array" then
-      ((.env // [])[] | select(startswith("CODEX_HOME=")) | sub("^CODEX_HOME="; "")) // ""
-    else "" end
-  ' <<<"$config_json" 2>/dev/null || true)"
+  existing_home="$(pr_green_extract_codex_home "$config_json")"
   if [[ "$existing_home" == "$codex_home" ]]; then
     return 0
   fi
@@ -40,7 +44,8 @@ pr_green_ensure_codex_scope() {
   ' <<<"$config_json" 2>/dev/null || true)"
   [[ -n "$updated_config" ]] || return 1
   ao project set-config "$project_id" --config-json "$updated_config" --json >/dev/null 2>&1 || return 1
-  verified_home="$(ao project get "$project_id" --json 2>/dev/null | jq -r '.project.config.env.CODEX_HOME // ""' 2>/dev/null || true)"
+  verified_config="$(ao project get "$project_id" --json 2>/dev/null | jq -c '.project.config // {}' 2>/dev/null || true)"
+  verified_home="$(pr_green_extract_codex_home "$verified_config")"
   [[ "$verified_home" == "$codex_home" ]]
 }
 
@@ -237,8 +242,8 @@ pr_green_register_native_conversation() {
 
 # Recover a terminated Codex session's native conversation before AO restore.
 # Return 0 when no recovery is needed or registration is verified; return 1
-# for direct helper failures. The caller maps failures on an existing session
-# to duplicate-suppression (return 2), so an ambiguous history can never cause
+# for direct helper failures. The caller maps recovery failures to explicit
+# recovery-blocked status (return 3), so an ambiguous history can never cause
 # a fresh replacement session to be spawned.
 pr_green_recover_native_conversation() {
   local project_id="$1" session_id="$2"
@@ -451,9 +456,12 @@ pr_green_live_session_is_busy() {
 # Reuse a live session, or restore a terminated one and then send it the
 # current prompt. Return codes:
 #   0 — live/restore prompt sent, or a visibly busy live session was deferred
-#   1 — no matching session, or restoration failed; caller may spawn
-#   2 — matching live session could not accept the prompt; caller must not
-#       spawn a duplicate fleet member during this run
+#   1 — no matching session; caller may spawn
+#   2 — existing session accepted recovery/restore but did not accept the
+#       prompt (including an ambiguous restore failure); caller must not spawn
+#       a duplicate fleet member
+#   3 — native recovery/identity could not be proven; caller must suppress
+#       duplicate spawn without counting an inference attempt
 pr_green_reuse_session() {
   local project_id="$1"
   local pr_number="$2"
@@ -470,7 +478,7 @@ pr_green_reuse_session() {
   if [[ "$terminated" == "true" ]]; then
     if ! pr_green_recover_native_conversation "$project_id" "$session_id"; then
       printf '%s\n' "AO terminated session $session_id has no unambiguous recoverable native conversation; suppressing duplicate spawn" >&2
-      return 2
+      return 3
     fi
     if ! restore_output="$(ao session restore "$session_id" -p "$project_id" 2>&1)"; then
       printf '%s\n' "AO session $session_id could not be restored: $restore_output" >&2
@@ -487,7 +495,7 @@ pr_green_reuse_session() {
     fi
     if ! pr_green_preserve_live_native_conversation "$project_id" "$session_id"; then
       printf '%s\n' "AO live session $session_id has no safely migratable native rollout; suppressing duplicate spawn" >&2
-      return 2
+      return 3
     fi
     printf '%s\n' "reused"
   fi

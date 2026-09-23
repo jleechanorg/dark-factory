@@ -21,7 +21,7 @@ STATE_DIR="$METRICS_DIR/pr-state"
 AO_SPAWN_LOCK_DIR="${PR_GREEN_AO_SPAWN_LOCK_DIR:-/run/user/${UID}}"
 export AO_CONFIG_PATH="${PR_GREEN_AO_CONFIG_PATH:-$HOME/agent-orchestrator.yaml}"
 mkdir -p "$METRICS_DIR"
-run_started="$(date +%s)"
+run_started="${PR_GREEN_RUN_STARTED:-$(date +%s)}"
 analyzed=0
 actionable=0
 attempted=0
@@ -38,58 +38,91 @@ since_date="${since:0:10}"
 # 1,000-result ceiling. Validate every page before trusting it; an incomplete
 # response or a count mismatch falls back to repository-wise PR pagination.
 discover_prs() {
-  local search_json_file search_total search_items search_complete repos_json_file repo pulls
+  local search_json_file search_total search_items search_complete repos_json_file repo pulls repo_names_file
   search_json_file="$(mktemp "${TMPDIR:-/tmp}/pr-green-discovery.XXXXXX")"
   repos_json_file=""
-  trap 'rm -f -- "$search_json_file" "$repos_json_file"' EXIT
-  gh api --paginate --slurp -X GET /search/issues \
+  if ! gh api --paginate --slurp -X GET /search/issues \
     -f "q=org:jleechanorg is:pr is:open updated:>=${since_date}" -f per_page=100 \
-    >"$search_json_file"
-  search_total="$(jq -r '([.[].total_count? // 0] | max) // 0' "$search_json_file")"
-  search_items="$(jq -r '[.[].items[]?] | length' "$search_json_file")"
+    >"$search_json_file"; then
+    rm -f -- "$search_json_file"
+    return 1
+  fi
+  search_total="$(jq -r '([.[].total_count? // 0] | max) // 0' "$search_json_file")" || {
+    rm -f -- "$search_json_file"
+    return 1
+  }
+  search_items="$(jq -r '[.[].items[]?] | length' "$search_json_file")" || {
+    rm -f -- "$search_json_file"
+    return 1
+  }
   search_complete="$(jq -r '
     ([.[].incomplete_results? // false] | any) as $incomplete
     | ([.[].total_count?] | all(type == "number")) as $counts_numeric
     | ($counts_numeric and ($incomplete | not))
-  ' "$search_json_file" 2>/dev/null || printf 'false\n')"
-  jq -n --arg cutoff "$since" --arg source search \
+  ' "$search_json_file" 2>/dev/null || true)"
+  if ! jq -n --arg cutoff "$since" --arg source search \
     --argjson total "$search_total" \
     --argjson item_count "$search_items" --argjson complete "$search_complete" \
     --slurpfile pages "$search_json_file" \
     '{cutoff:$cutoff,source:$source,pages:$pages[0],total_count:$total,item_count:$item_count,incomplete_results:($complete|not)}' \
-    >"$METRICS_DIR/discovery-${run_started}.json"
+    >"$METRICS_DIR/discovery-${run_started}.json"; then
+    rm -f -- "$search_json_file"
+    return 1
+  fi
   if [[ "$search_complete" == true ]] && (( search_total <= 1000 )) && (( search_items == search_total )); then
-    jq -r --arg since "$since" '
+    if ! jq -r --arg since "$since" '
       .[] | .items[]?
       | select(.updated_at >= $since and ((.draft // false) | not))
       | [(.repository_url | split("/") | .[-1]), .number, .title, .html_url, .updated_at]
       | @tsv
-    ' "$search_json_file"
+    ' "$search_json_file"; then
+      rm -f -- "$search_json_file"
+      return 1
+    fi
+    rm -f -- "$search_json_file"
     return 0
   fi
 
   echo "$LOG_PREFIX search response incomplete, count-mismatched, or above 1000; using repository-wise fallback" >&2
   repos_json_file="$(mktemp "${TMPDIR:-/tmp}/pr-green-repos.XXXXXX")"
-  gh api --paginate --slurp -X GET /orgs/jleechanorg/repos \
-    -f type=all -f per_page=100 >"$repos_json_file"
-  jq -n --arg cutoff "$since" --arg source repo_fallback \
+  repo_names_file="$(mktemp "${TMPDIR:-/tmp}/pr-green-repo-names.XXXXXX")"
+  if ! gh api --paginate --slurp -X GET /orgs/jleechanorg/repos \
+    -f type=all -f per_page=100 >"$repos_json_file"; then
+    rm -f -- "$search_json_file" "$repos_json_file" "$repo_names_file"
+    return 1
+  fi
+  if ! jq -n --arg cutoff "$since" --arg source repo_fallback \
     --argjson total "$search_total" \
     --argjson item_count "$search_items" --argjson complete "$search_complete" \
     --slurpfile pages "$search_json_file" \
     '{cutoff:$cutoff,source:$source,pages:$pages[0],total_count:$total,item_count:$item_count,incomplete_results:($complete|not)}' \
-    >"$METRICS_DIR/discovery-${run_started}.json"
+    >"$METRICS_DIR/discovery-${run_started}.json"; then
+    rm -f -- "$search_json_file" "$repos_json_file" "$repo_names_file"
+    return 1
+  fi
+  if ! jq -r '.[][]? | .name // empty' "$repos_json_file" >"$repo_names_file"; then
+    rm -f -- "$search_json_file" "$repos_json_file" "$repo_names_file"
+    return 1
+  fi
   while IFS= read -r repo; do
     [[ -n "$repo" ]] || continue
-    pulls="$(gh api --paginate --slurp -X GET "/repos/jleechanorg/${repo}/pulls" \
-      -f state=open -f per_page=100)"
-    jq -r --arg repo "$repo" --arg since "$since" '
+    if ! pulls="$(gh api --paginate --slurp -X GET "/repos/jleechanorg/${repo}/pulls" \
+      -f state=open -f per_page=100)"; then
+      rm -f -- "$search_json_file" "$repos_json_file" "$repo_names_file"
+      return 1
+    fi
+    if ! jq -r --arg repo "$repo" --arg since "$since" '
       .[][]?
       | select(((.state // "open") | ascii_downcase) == "open")
       | select(.updated_at >= $since and ((.draft // false) | not))
       | [$repo, .number, .title, .html_url, .updated_at]
       | @tsv
-    ' <<<"$pulls"
-  done < <(jq -r '.[][]? | .name // empty' "$repos_json_file")
+    ' <<<"$pulls"; then
+      rm -f -- "$search_json_file" "$repos_json_file" "$repo_names_file"
+      return 1
+    fi
+  done <"$repo_names_file"
+  rm -f -- "$search_json_file" "$repos_json_file" "$repo_names_file"
 }
 
 prs="$(discover_prs | sort -t $'\t' -k5,5r -k1,1 -k2,2n -k4,4)"
@@ -144,6 +177,7 @@ reused=0
 restored=0
 busy_deferred=0
 cooldown_deferred=0
+recovery_blocked=0
 fixed_confirmed=0
 
 # outcomes.jsonl is the stable reporting contract. `verified` is true only
@@ -329,6 +363,12 @@ EOF
     continue
   else
     session_reuse_rc=$?
+    if [[ "$session_reuse_rc" -eq 3 ]]; then
+      recovery_blocked=$((recovery_blocked + 1))
+      record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed recovery_blocked || true
+      echo "$LOG_PREFIX native recovery blocked for $repo#$number; duplicate spawn suppressed" >&2
+      continue
+    fi
     if [[ "$session_reuse_rc" -eq 2 ]]; then
       attempted=$((attempted + 1))
       echo "$LOG_PREFIX existing AO session for $repo#$number rejected update; skipping duplicate spawn" >&2
@@ -368,20 +408,6 @@ EOF
       dispatched=$((dispatched + 1))
       rm -f "$spawn_err"
       reconcile_pr "$repo" "$number" "$url" "$live_state" dispatched || true
-      continue
-    fi
-    # AO can retain a reservation for a terminated session whose worktree was
-    # removed outside AO. Reap only the exact stale session named by AO, then
-    # retry so old worktrees do not require operator intervention.
-    stale_session="$(sed -nE 's/.*(wa-[0-9]+).*/\1/p' "$spawn_err" | tail -1)"
-    if grep -q 'outside AO-managed worktree directories' "$spawn_err" && [[ -n "$stale_session" ]]; then
-      echo "$LOG_PREFIX reaping stale AO session $stale_session and retrying $repo#$number" >&2
-      ao session kill "$stale_session" --keep-session >/dev/null 2>&1 || true
-      "${spawn_cmd[@]}" >/dev/null 2>&1 &
-      echo "$LOG_PREFIX dispatched $repo#$number after stale-session recovery"
-      dispatched=$((dispatched + 1))
-      rm -f "$spawn_err"
-      reconcile_pr "$repo" "$number" "$url" "$live_state" stale_recovery || true
       continue
     fi
     if ! ao project get "$project_id" --json >/dev/null 2>&1; then
@@ -431,7 +457,8 @@ jq -n --argjson ts "$run_started" --argjson analyzed "$analyzed" \
   --argjson dispatched "$dispatched" --argjson reused "$reused" \
   --argjson restored "$restored" --argjson busy_deferred "$busy_deferred" \
   --argjson cooldown_deferred "$cooldown_deferred" \
+  --argjson recovery_blocked "$recovery_blocked" \
   --argjson fixed_confirmed "$fixed_confirmed" \
-  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, busy_deferred:$busy_deferred, cooldown_deferred:$cooldown_deferred, fixed_confirmed:$fixed_confirmed}' \
+  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, busy_deferred:$busy_deferred, cooldown_deferred:$cooldown_deferred, recovery_blocked:$recovery_blocked, fixed_confirmed:$fixed_confirmed}' \
   >> "$METRICS_DIR/runs.jsonl"
-echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored busy_deferred=$busy_deferred cooldown_deferred=$cooldown_deferred fixed_confirmed=$fixed_confirmed"
+echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored busy_deferred=$busy_deferred cooldown_deferred=$cooldown_deferred recovery_blocked=$recovery_blocked fixed_confirmed=$fixed_confirmed"

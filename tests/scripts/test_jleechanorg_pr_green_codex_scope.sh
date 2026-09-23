@@ -14,11 +14,16 @@ export CODEX_HOME="$codex_home"
 
 project_config_json='{"defaultBranch":"main","sessionPrefix":"wa","env":{"OTHER":"preserve"},"worker":{"agent":"codex"}}'
 set_config_json=''
+verify_array=0
 
 ao() {
   case "$1 $2" in
     "project get")
-      printf '{"status":"ok","project":{"id":"worldarchitect.ai","config":%s}}\n' "$project_config_json"
+      if [[ "$verify_array" == 1 && -n "$set_config_json" ]]; then
+        printf '%s\n' "{\"status\":\"ok\",\"project\":{\"id\":\"worldarchitect.ai\",\"config\":{\"defaultBranch\":\"main\",\"sessionPrefix\":\"wa\",\"env\":[\"CODEX_HOME=$CODEX_HOME\",\"OTHER=preserve\"],\"worker\":{\"agent\":\"codex\"}}}}"
+      else
+        printf '{"status":"ok","project":{"id":"worldarchitect.ai","config":%s}}\n' "$project_config_json"
+      fi
       ;;
     "project set-config")
       [[ -n "$5" ]] || {
@@ -26,7 +31,7 @@ ao() {
         return 1
       }
       set_config_json="$5"
-      project_config_json="$5"
+      project_config_json="{\"defaultBranch\":\"main\",\"sessionPrefix\":\"wa\",\"env\":[\"CODEX_HOME=$CODEX_HOME\",\"OTHER=preserve\"],\"worker\":{\"agent\":\"codex\"}}"
       printf '%s\n' '{"status":"ok"}'
       ;;
     *)
@@ -53,5 +58,8 @@ pr_green_ensure_codex_scope worldarchitect.ai
   echo 'FAIL: set-config did not preserve unrelated project config' >&2
   exit 1
 }
+
+verify_array=1
+pr_green_ensure_codex_scope worldarchitect.ai
 
 echo 'jleechanorg-pr-green Codex scope: PASS'

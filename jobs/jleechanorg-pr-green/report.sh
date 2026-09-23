@@ -43,16 +43,19 @@ summary="$(jq -s --slurpfile outcomes "$OUTCOMES_FILE" --argjson since "$SINCE" 
     busy_deferred: ($runs | map(.busy_deferred // 0) | add // 0),
     cooldown_deferred: ($runs | map(.cooldown_deferred // 0) | add // 0),
     outcome_records: ($outcomes | length),
-    verified_new_head_green_outcomes: ($outcomes
+    green_new_head_outcomes: ($outcomes
       | map(select(.result == "fixed" and (.verified == true)
-        and ((.head_before // "") != (.head_after // ""))
-        and ((.session_action // "") != "reconciled")))
+        and ((.head_before // "") != (.head_after // ""))))
       | unique_by([.repo, .number, .head_after])
       | length),
-    reconciled_green_observations: ($outcomes
+    explicit_push_receipt_green_outcomes: ($outcomes
       | map(select(.result == "fixed" and (.verified == true)
         and ((.head_before // "") != (.head_after // ""))
-        and ((.session_action // "") == "reconciled")))
+        and ((.push_receipt // null) != null)))
+      | unique_by([.repo, .number, .head_after])
+      | length),
+    recovery_blocked: ($outcomes
+      | map(select(.session_action == "recovery_blocked"))
       | unique_by([.repo, .number, .head_after])
       | length),
     blockers: ($outcomes | map(select(.result == "blocked")) | length),
@@ -74,8 +77,9 @@ Busy sessions deferred (no prompt queued): $(jq -r '.busy_deferred' <<<"$summary
 Unchanged blockers deferred by cooldown (no inference): $(jq -r '.cooldown_deferred' <<<"$summary")
 
 Durable PR outcomes: $(jq -r '.outcome_records' <<<"$summary")
-Verified new-head green outcomes (job-attributed, unique PR/head): $(jq -r '.verified_new_head_green_outcomes' <<<"$summary")
-Observed green outcomes from reconciliation (attribution not independently verified, unique PR/head): $(jq -r '.reconciled_green_observations' <<<"$summary")
+Green new-head outcomes (verified state; push attribution unverified, unique PR/head): $(jq -r '.green_new_head_outcomes' <<<"$summary")
+Explicit push-receipt green outcomes (unique PR/head): $(jq -r '.explicit_push_receipt_green_outcomes' <<<"$summary")
+Recovery-blocked sessions (no prompt sent; duplicate suppressed): $(jq -r '.recovery_blocked' <<<"$summary")
 Blocked: $(jq -r '.blockers' <<<"$summary")
 No change: $(jq -r '.unchanged' <<<"$summary")
 In progress: $(jq -r '.in_progress' <<<"$summary")

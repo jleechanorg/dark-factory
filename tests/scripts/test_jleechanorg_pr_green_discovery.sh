@@ -252,6 +252,34 @@ large_audit="$(find "$large_metrics" -name 'discovery-*.json' -print -quit)"
   exit 1
 }
 
+# A discovery result is not usable unless its audit metadata is durable. The
+# command-substitution/pipeline caller must propagate this write failure rather
+# than continuing into PR analysis with an unrecorded snapshot.
+metadata_metrics="$fixture_dir/metrics-metadata-write-failure"
+mkdir -p "$metadata_metrics/discovery-123.json"
+set +e
+PATH="$mock_bin:$PATH" \
+  HOME="$fixture_dir/home-metadata-write-failure" \
+  PR_GREEN_DISCOVERY_CASE=multipage \
+  PR_GREEN_RUN_STARTED=123 \
+  PR_GREEN_METRICS_DIR="$metadata_metrics" \
+  PR_GREEN_MAX_PRS=1 \
+  PR_GREEN_DRY_RUN=1 \
+  AO_CALLS="$fixture_dir/ao-metadata-write-failure.log" \
+  GH_CALLS="$fixture_dir/gh-metadata-write-failure.log" \
+  bash "$JOB" >"$fixture_dir/metadata-write-failure.out" 2>"$fixture_dir/metadata-write-failure.err"
+metadata_rc=$?
+set -e
+[[ "$metadata_rc" -ne 0 ]] || {
+  cat "$fixture_dir/metadata-write-failure.err" >&2
+  echo 'FAIL: discovery metadata write failure did not fail the run' >&2
+  exit 1
+}
+[[ ! -f "$metadata_metrics/runs.jsonl" ]] || {
+  echo 'FAIL: run continued after discovery metadata write failure' >&2
+  exit 1
+}
+
 fallback_metrics="$(run_case fallback 3)"
 grep -Fq '/orgs/jleechanorg/repos' "$fixture_dir/gh-fallback.log" || {
   echo 'FAIL: >1000 search result did not use repository fallback' >&2
@@ -417,5 +445,10 @@ retry_run="$(jq -s 'last' "$retry_metrics/runs.jsonl")"
   echo 'FAIL: failed registration retry was counted as dispatched' >&2
   exit 1
 }
+
+if rg -q 'session kill|stale_recovery|outside AO-managed worktree directories' "$JOB"; then
+  echo 'FAIL: Go AO job retained unsupported stale-session kill/retry path' >&2
+  exit 1
+fi
 
 echo 'jleechanorg-pr-green discovery: PASS'
