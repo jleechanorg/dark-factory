@@ -29,7 +29,10 @@ use daemon::dispatch::{dispatch_ready_with_vcs, DriveBranchDecision};
 use daemon::er_runner;
 use daemon::errors::DaemonError;
 use daemon::router::RoutingVerdict;
-use daemon::state::{BeadOverlay, OverlayState, StateStore, CIRCUIT_BREAKER_PARK_REASON};
+use daemon::state::{
+    BeadOverlay, OverlayState, SqliteStateStore, StateStore,
+    CIRCUIT_BREAKER_PARK_REASON,
+};
 use daemon::tick::{combine_dual_verdict, run_tick, TickDeps, TickSummary};
 use daemon::tools::{
     Bead, Issue, LabeledPr, Llm, Permission, PrComment, PrHeadBranch, PrSnapshot, Scm,
@@ -12239,6 +12242,280 @@ fn adopted_branch_history_rewrite_park_kills_associated_ao_session() {
          spawns of this bead. Calls: {:?}",
         sessions.calls.borrow()
     );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+fn register_branch_test_bead(id: &str) -> Bead {
+    Bead {
+        id: id.into(),
+        title: "register branch failure fixture".into(),
+        description: "target_repo: owner/repo".into(),
+        notes: String::new(),
+        file_tree_summary: String::new(),
+        external_ref: None,
+    }
+}
+
+fn register_branch_test_llm() -> FakeLlm {
+    let llm = FakeLlm::new();
+    *llm.response.borrow_mut() = Some(Ok(
+        r#"{"routingVerdict":"SMALL_PATH","justification":"branch failure fixture"}"#
+            .into(),
+    ));
+    llm
+}
+
+fn register_branch_test_deps<'a>(
+    scm: &'a FakeScm,
+    tracker: &'a FakeTracker,
+    sessions: &'a FakeSessions,
+    llm: &'a FakeLlm,
+    store: &'a dyn StateStore,
+    vcs: &'a FakeVcs,
+    cfg: &'a Config,
+    telemetry_log: &'a std::path::Path,
+) -> TickDeps<'a> {
+    TickDeps {
+        scm,
+        tracker,
+        sessions,
+        llm,
+        store,
+        vcs,
+        cfg,
+        telemetry_log,
+        vendor_health: None,
+    }
+}
+
+fn register_branch_test_events(path: &std::path::Path) -> Vec<serde_json::Value> {
+    let body = std::fs::read_to_string(path).expect("tick telemetry must exist");
+    body.lines()
+        .map(|line| serde_json::from_str(line).expect("telemetry must be JSONL"))
+        .collect()
+}
+
+#[test]
+fn register_branch_non_transient_collision_emits_parked_human_held_after_durable_save() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let bead_id = "register-branch-sqlite-collision";
+    tracker
+        .candidates
+        .borrow_mut()
+        .push(register_branch_test_bead(bead_id));
+    let sessions = FakeSessions::new();
+    let llm = register_branch_test_llm();
+    let store = SqliteStateStore::open_in_memory_with_schema(include_str!(
+        "../contracts/schema.sql"
+    ))
+    .expect("in-memory SqliteStateStore must open");
+    let branch = format!("factory/{bead_id}-r1");
+    store
+        .register_branch("existing-branch-owner", &branch)
+        .expect("the collision owner must be durable before the tick");
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_register_branch_sqlite_collision_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = register_branch_test_deps(
+        &scm,
+        &tracker,
+        &sessions,
+        &llm,
+        &store,
+        &vcs,
+        &cfg,
+        &telemetry_log,
+    );
+    let summary = run_tick(&deps, 0, 0).expect("collision must be isolated to this bead");
+    let calls = sessions.calls.borrow().clone();
+    assert!(
+        !calls.iter().any(|call| call == &format!("spawn({bead_id})")),
+        "a rejected branch registration must never spawn a worker; calls={:?}",
+        calls
+    );
+    let events = register_branch_test_events(&telemetry_log);
+    let parked = events.iter().find(|event| {
+        event["eventType"] == "PARKED_HUMAN_HELD" && event["beadId"] == bead_id
+    });
+    assert!(
+        parked.is_some(),
+        "C4_EXPECT_DURABLE_PARK_TELEMETRY: non-transient register_branch collision must emit PARKED_HUMAN_HELD; events={events:?}"
+    );
+
+    let overlay = store
+        .load(bead_id)
+        .expect("durable overlay load must succeed")
+        .expect("dispatch must have persisted the candidate overlay");
+    assert_eq!(
+        store.bead_id_for_branch(&branch).unwrap().as_deref(),
+        Some("existing-branch-owner"),
+        "the existing branch owner must remain registered after the rejection"
+    );
+    assert_eq!(
+        overlay.branch, None,
+        "the rejected candidate overlay must not claim the collided branch"
+    );
+    assert_eq!(
+        overlay.state,
+        OverlayState::HumanHeld,
+        "the collision must remain durably HUMAN_HELD"
+    );
+    assert_eq!(
+        overlay.park_reason.as_deref(),
+        Some("branch_registration_conflict"),
+        "the durable reason must be BranchRegistrationConflict"
+    );
+    assert_eq!(summary.beads_parked_human_held, 1);
+    assert_eq!(summary.beads_dispatched, 0);
+
+    let parked = parked.expect("the marker assertion above must retain the event");
+    assert_eq!(parked["lifecycleState"], "HUMAN_HELD");
+    assert_eq!(parked["context"]["reason"], "branch_registration_conflict");
+    assert_eq!(parked["context"]["branch"], branch);
+    assert!(
+        parked["context"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("already registered")),
+        "telemetry must retain the durable collision error: {parked:?}"
+    );
+    assert!(!events.iter().any(|event| {
+        event["eventType"] == "BEAD_DISPATCH_TRANSIENT_ERROR" && event["beadId"] == bead_id
+    }));
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn register_branch_transient_failure_remains_retryable_without_parking() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let bead_id = "register-branch-transient";
+    tracker
+        .candidates
+        .borrow_mut()
+        .push(register_branch_test_bead(bead_id));
+    let sessions = FakeSessions::new();
+    let llm = register_branch_test_llm();
+    let store = FakeStateStore::new();
+    *store.register_branch_error.borrow_mut() = Some(DaemonError::Tool {
+        tool: "sqlite".into(),
+        rc: 1,
+        stderr: "scripted transient register_branch failure".into(),
+    });
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_register_branch_transient_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = register_branch_test_deps(
+        &scm,
+        &tracker,
+        &sessions,
+        &llm,
+        &store,
+        &vcs,
+        &cfg,
+        &telemetry_log,
+    );
+    let summary = run_tick(&deps, 0, 0).expect("transient registration failure is retryable");
+    let calls = sessions.calls.borrow().clone();
+    assert!(
+        !calls.iter().any(|call| call == &format!("spawn({bead_id})")),
+        "a transient registration failure must not spawn a worker; calls={:?}",
+        calls
+    );
+    let overlay = store
+        .load(bead_id)
+        .expect("overlay load must succeed")
+        .expect("intake must have persisted the candidate");
+    assert_eq!(overlay.state, OverlayState::Queued);
+    assert_eq!(overlay.park_reason, None);
+    assert_eq!(summary.beads_parked_human_held, 0);
+    assert_eq!(summary.beads_dispatched, 0);
+
+    let events = register_branch_test_events(&telemetry_log);
+    assert!(events.iter().any(|event| {
+        event["eventType"] == "BEAD_DISPATCH_TRANSIENT_ERROR"
+            && event["beadId"] == bead_id
+            && event["context"]["phase"] == "register_branch"
+            && event["context"]["transient"] == true
+    }));
+    assert!(!events.iter().any(|event| {
+        event["eventType"] == "PARKED_HUMAN_HELD" && event["beadId"] == bead_id
+    }));
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn register_branch_park_save_failure_suppresses_park_telemetry() {
+    let scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let bead_id = "register-branch-park-save";
+    tracker
+        .candidates
+        .borrow_mut()
+        .push(register_branch_test_bead(bead_id));
+    let sessions = FakeSessions::new();
+    let llm = register_branch_test_llm();
+    let store = FakeStateStore::new();
+    *store.register_branch_error.borrow_mut() = Some(DaemonError::Config(
+        "scripted permanent branch registration collision".into(),
+    ));
+    store.fail_save_for(bead_id, OverlayState::HumanHeld);
+    let cfg = test_cfg();
+    let vcs = test_vcs();
+    let telemetry_log = std::env::temp_dir().join(format!(
+        "afd_register_branch_park_save_{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    let deps = register_branch_test_deps(
+        &scm,
+        &tracker,
+        &sessions,
+        &llm,
+        &store,
+        &vcs,
+        &cfg,
+        &telemetry_log,
+    );
+    let summary = run_tick(&deps, 0, 0).expect("transient park-save failure is retryable");
+    let calls = sessions.calls.borrow().clone();
+    assert!(
+        !calls.iter().any(|call| call == &format!("spawn({bead_id})")),
+        "a failed park save must not spawn a worker; calls={:?}",
+        calls
+    );
+    let overlay = store
+        .load(bead_id)
+        .expect("overlay load must succeed")
+        .expect("intake must have persisted the candidate");
+    assert_eq!(overlay.state, OverlayState::Queued);
+    assert_eq!(overlay.park_reason, None);
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let events = register_branch_test_events(&telemetry_log);
+    assert!(events.iter().any(|event| {
+        event["eventType"] == "BEAD_DISPATCH_TRANSIENT_ERROR"
+            && event["beadId"] == bead_id
+            && event["context"]["phase"] == "register_branch_park_save"
+            && event["context"]["transient"] == true
+    }));
+    assert!(!events.iter().any(|event| {
+        event["eventType"] == "PARKED_HUMAN_HELD" && event["beadId"] == bead_id
+    }));
 
     let _ = std::fs::remove_file(&telemetry_log);
 }
