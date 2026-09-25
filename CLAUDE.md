@@ -93,6 +93,14 @@ When the operator explicitly authorizes a factory repair mission (a natural-lang
 - Infrastructure changes never count as autonomous pilot evidence.
 - Safety invariants remain absolute: existing repository-specific merge authorization gates remain unchanged, and AO code writes still require verbatim `AO CODE APPROVED`.
 
+**Interactive Developer Override**: This zero-direct-work constraint applies strictly
+to hands-off autonomous `/af` goal runs. When the operator directly commands you
+to code, repair, unpark beads, re-run gates, drive verifications, or finish tasks
+(e.g., "you are coding", "keep going and finish 1-4", "repair this"), you are in
+active engineering mode. Act with full authority to diagnose, unpark, fix, run
+evidence commands, and drive the task to completion. Never refuse a direct
+interactive coding instruction by misclassifying it as a hands-off `/af` run.
+
 **Outside /af** (ad hoc repo work, audits, reviews), follow
 `~/.claude/skills/parallelize-to-ceiling/SKILL.md`: fan out independent
 read-only and audit work concurrently, and route actual coding to subagents or

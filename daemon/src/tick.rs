@@ -3888,11 +3888,17 @@ pub(crate) fn dispatch_reviewer(vendor: &str, prompt: &str) -> Result<String, Da
             REVIEWER_TIMEOUT_SECS,
         ),
         // Default fallback reviewer (Cursor CLI, bashrc `agentf`). Invoked as
-        // `cursor-agent -f <prompt>` (headless). Distinct family from
-        // claudem/agy (see `verifier::vendor_model_family`).
+        // `cursor-agent -p -f <prompt>` (headless print mode). `-f`/`--force`
+        // alone does NOT make the CLI non-interactive — `-p`/`--print` is the
+        // flag that does ("for scripts or non-interactive use", `--help`);
+        // without it the daemon subprocess has no TTY and blocks until
+        // `REVIEWER_TIMEOUT_SECS`, surfacing as a skeptic-reviewer timeout
+        // rather than a verdict (observed on PR #844/`dark-factory-c4zhq`,
+        // 2026-09-17). Distinct family from claudem/agy (see
+        // `verifier::vendor_model_family`).
         "cursor-agent" | "cursor" | "agentf" => run_tool(
             "cursor-agent",
-            &["-f", prompt],
+            &["-p", "-f", prompt],
             REVIEWER_TIMEOUT_SECS,
         ),
         other => Err(DaemonError::Tool {
