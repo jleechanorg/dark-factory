@@ -52,6 +52,7 @@ fn test_vcs() -> FakeVcs {
 
 fn test_cfg() -> Config {
     Config {
+        task_bead_id: None,
         target_repo: "owner/repo".into(),
         ao_project: None,
         base_branch: "main".into(),
@@ -8440,6 +8441,42 @@ fn write_fake_target_worktree_git(dir: &std::path::Path, head_sha: &str) {
     std::fs::set_permissions(&path, perms).unwrap();
 }
 
+/// Sets up process-wide environment variables and synthetic scoped home directories
+/// for tests that exercise reviewer CLI dispatch with fake scripts.
+///
+/// Creates private, clean synthetic directories for `CODEX_HOME`,
+/// `DARK_FACTORY_CLAUDE_CONFIG_DIR`, and `DARK_FACTORY_AGY_HOME` (with
+/// `.gemini/antigravity-cli/settings.json` containing `{}`) within `fake_bin_dir`,
+/// prepends `fake_bin_dir` to `PATH`, sets `DARK_FACTORY_CODER_DEFAULT`,
+/// and configures a synthetic `MINIMAX_API_KEY`.
+/// All variables are safely restored when the returned `EnvVarGuard` is dropped.
+#[cfg(unix)]
+fn setup_fake_reviewer_env(fake_bin_dir: &std::path::Path, coder_default: &str) -> EnvVarGuard {
+    let fake_codex_home = fake_bin_dir.join("fake_codex_home");
+    std::fs::create_dir_all(&fake_codex_home).unwrap();
+    let fake_claude_home = fake_bin_dir.join("fake_claude_home");
+    std::fs::create_dir_all(&fake_claude_home).unwrap();
+    let fake_agy_home = fake_bin_dir.join("fake_agy_home");
+    let fake_agy_cli = fake_agy_home.join(".gemini").join("antigravity-cli");
+    std::fs::create_dir_all(&fake_agy_cli).unwrap();
+    std::fs::write(fake_agy_cli.join("settings.json"), "{}").unwrap();
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
+    let codex_home_str = fake_codex_home.to_string_lossy().to_string();
+    let claude_home_str = fake_claude_home.to_string_lossy().to_string();
+    let agy_home_str = fake_agy_home.to_string_lossy().to_string();
+
+    EnvVarGuard::set(&[
+        ("PATH", &new_path),
+        ("DARK_FACTORY_CODER_DEFAULT", coder_default),
+        ("CODEX_HOME", &codex_home_str),
+        ("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_home_str),
+        ("DARK_FACTORY_AGY_HOME", &agy_home_str),
+        ("MINIMAX_API_KEY", "test-synthetic-minimax-key-fixture"),
+    ])
+}
+
 #[test]
 #[cfg(unix)]
 fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff() {
@@ -8467,14 +8504,11 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_without_gha_or_signoff()
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef555");
 
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-
     // Fix the coder vendor so the reviewer priority list (and therefore
     // which two fake binaries get dispatched) is deterministic regardless
-    // of the ambient environment.
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
+    // of the ambient environment. Provide synthetic scoped directories
+    // for direct CLI execution.
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "agy");
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -8663,14 +8697,7 @@ fn real_target_repo_skeptic_gate_resolves_from_dual_llm_with_signoff_but_no_gha(
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef556");
 
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-
-    // Fix the coder vendor so the reviewer priority list (and therefore
-    // which two fake binaries get dispatched) is deterministic regardless
-    // of the ambient environment.
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "agy");
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -8872,13 +8899,9 @@ fn real_target_repo_skeptic_gate_falls_back_to_third_vendor_when_first_two_fail(
     write_fake_reviewer(&fake_bin_dir, "agy", "still not a verdict");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
 
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-
     // coder=codex is not in [claudem, agy, cursor-agent], so priority stays
     // the full default list and the third-vendor fallback is reachable.
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "codex")]);
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "codex");
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -9068,11 +9091,7 @@ fn gate_assessment_telemetry_reports_full_gate_report_and_skeptic_vendor() {
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef558");
 
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "agy");
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -9563,11 +9582,7 @@ fn bkru_skeptic_gate_falls_back_to_fourth_vendor_when_first_three_fail() {
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef558");
 
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "codex")]);
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "codex");
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -9747,14 +9762,10 @@ fn cross_model_reviewer_cursor_agent_falls_back_and_emits_review_degraded() {
     write_fake_reviewer(&fake_bin_dir, "gemini", "fail should-not-dispatch-gemini");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
 
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-
     // coder=codex is not in the reviewer queue, so priority stays
     // [claudem, agy, cursor-agent] and the third-vendor fallback is
     // reachable.
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "codex")]);
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "codex");
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -9988,11 +9999,7 @@ fn cross_model_reviewer_two_distinct_families_is_not_degraded() {
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
     write_fake_target_worktree_git(&fake_bin_dir, "deadbeef560");
 
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-
-    let _env_guard =
-        EnvVarGuard::set(&[("PATH", &new_path), ("DARK_FACTORY_CODER_DEFAULT", "agy")]);
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "agy");
 
     let mut scm = FakeScm::new();
     let tracker = FakeTracker::new();
@@ -15665,12 +15672,7 @@ fn test_non_default_repository_labeled_pr_tick_telemetry_attribution() {
     .to_string();
     write_fake_reviewer(&fake_bin_dir, "claude", "pass");
     write_fake_reviewer(&fake_bin_dir, "cursor-agent", "pass");
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    let reviewer_path = format!("{}:{}", fake_bin_dir.display(), original_path);
-    let _env_guard = EnvVarGuard::set(&[
-        ("PATH", &reviewer_path),
-        ("DARK_FACTORY_CODER_DEFAULT", "agy"),
-    ]);
+    let _env_guard = setup_fake_reviewer_env(&fake_bin_dir, "agy");
 
     let mut scm = FakeScm::new();
     scm.prs.push(LabeledPr {
@@ -15906,6 +15908,123 @@ fn test_non_default_repository_branch_collision_telemetry_attribution() {
     let _ = std::fs::remove_file(&telemetry_log);
 }
 
+/// Regression test for Linux reproduction (incident bead c4zhq):
+/// Upstream Go runtime seeds ActivityIdle on fresh worker spawn before prompt
+/// execution begins. When a remediation session is idle but the branch HEAD is
+/// unchanged from `pre_session_head_sha`, the daemon must preserve the worker
+/// session in DISPATCHED, not reap it or promote premature ATTESTED state.
+#[test]
+fn test_dispatched_adopted_idle_session_preserved_at_unchanged_head() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    // Upstream Go seeds ActivityIdle on fresh spawn
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Idle);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    let branch = "factory/dark-factory-c4zhq-r2";
+    let baseline_sha = "696c810a8e8db5e46059336664b8387b63b618fb";
+    vcs.heads.insert(branch.into(), baseline_sha.into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_c4zhq_idle_preserved.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-c4zhq".into(),
+        BeadOverlay {
+            bead_id: "bead-c4zhq".into(),
+            state: OverlayState::Dispatched,
+            attempt: 3,
+            reroll_count: 2,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(844),
+            branch: Some(branch.into()),
+            session_id: Some("dark-factory-4".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(baseline_sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-c4zhq", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(844));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 844),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        844,
+        PrSnapshot {
+            pr_number: 844,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: baseline_sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-c4zhq").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "idle adopted session with unchanged head must remain DISPATCHED"
+    );
+    assert_eq!(
+        o.session_id,
+        Some("dark-factory-4".into()),
+        "session handle must be preserved for live idle worker"
+    );
+    assert!(
+        !sessions.stop_succeeded.get(),
+        "sessions.stop() must not be called while head is unchanged"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !telemetry.contains("REROLL_ADOPTED_SESSION_QUIESCED"),
+        "must not emit REROLL_ADOPTED_SESSION_QUIESCED when head is unchanged"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
 /// The `RefusedMismatch` arm used to call `comment_external` BEFORE consulting
 /// `escalation_dedup_should_emit`, so the dedup ledger suppressed only the
 /// telemetry event while the GitHub comment re-posted on every tick. A branch
@@ -15976,7 +16095,6 @@ fn adoption_branch_collision_comments_once_across_repeated_ticks() {
     let vcs = test_vcs();
     let telemetry_log = std::env::temp_dir().join("afd_collision_comment_dedup.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
-
     let deps = TickDeps {
         scm: &scm,
         tracker: &tracker,
@@ -15988,7 +16106,6 @@ fn adoption_branch_collision_comments_once_across_repeated_ticks() {
         telemetry_log: &telemetry_log,
         vendor_health: None,
     };
-
     run_tick(&deps, 0, 0).expect("first tick must escalate without failing");
     run_tick(&deps, 0, 0).expect("second tick must not fail");
 
@@ -16163,7 +16280,11 @@ fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
     let llm = FakeLlm::new();
     let store = FakeStateStore::new();
     let cfg = test_cfg();
-    let vcs = FakeVcs::new();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-w0r4";
+    let pre_sha = "sha-pre-w0r4";
+    let post_sha = "head-999";
+    vcs.heads.insert(branch.into(), post_sha.into());
     let telemetry_log = std::env::temp_dir().join("afd_test_w0r4.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -16177,13 +16298,13 @@ fn test_dispatched_adopted_idle_session_reaped_and_promoted() {
             autonomy_secs: 100,
             spend_usd: 0.0,
             pr_number: Some(999),
-            branch: Some("fix/test-w0r4".into()),
+            branch: Some(branch.into()),
             session_id: Some("wa-9999".into()),
             session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             transient_error_count: 0,
-            pre_session_head_sha: None,
+            pre_session_head_sha: Some(pre_sha.into()),
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
@@ -16281,7 +16402,11 @@ fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
         agent_worktree_root: Some(worktree_root.display().to_string()),
         ..test_cfg()
     };
-    let vcs = FakeVcs::new();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-rev3lm8k";
+    let pre_sha = "head-pre";
+    let post_sha = "head-998";
+    vcs.heads.insert(branch.into(), post_sha.into());
     let telemetry_log = std::env::temp_dir().join("afd_test_rev3lm8k.jsonl");
     let _ = std::fs::remove_file(&telemetry_log);
 
@@ -16307,13 +16432,13 @@ fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
             autonomy_secs: 100,
             spend_usd: 0.0,
             pr_number: Some(998),
-            branch: Some("fix/test-rev3lm8k".into()),
+            branch: Some(branch.into()),
             session_id: Some("wa-3538".into()),
             session_ao_project: None,
             is_adopted: true,
             spawn_failure_count: 0,
             transient_error_count: 0,
-            pre_session_head_sha: None,
+            pre_session_head_sha: Some(pre_sha.into()),
             park_reason: None,
             target_repo: None,
             attempt_started_at: None,
@@ -16391,6 +16516,1353 @@ fn test_worktree_cleaned_up_on_coder_session_exit_promotion() {
     );
 
     let _ = std::fs::remove_dir_all(&worktree_root);
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_dispatched_adopted_running_session_never_reaped_or_promoted() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Running);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-running";
+    let pre_sha = "sha-pre-run";
+    let post_sha = "sha-post-run";
+    vcs.heads.insert(branch.into(), post_sha.into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_running.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-running".into(),
+        BeadOverlay {
+            bead_id: "bead-running".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(997),
+            branch: Some(branch.into()),
+            session_id: Some("wa-running-1".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(pre_sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-running", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(997));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 997),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        997,
+        PrSnapshot {
+            pr_number: 997,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: post_sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-running").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "active running session must remain DISPATCHED even if head changed"
+    );
+    assert_eq!(
+        o.session_id,
+        Some("wa-running-1".into()),
+        "active running session handle must not be cleared"
+    );
+    assert!(
+        !sessions.stop_succeeded.get(),
+        "sessions.stop() must not be called while worker is running"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_dispatched_adopted_idle_missing_or_error_head_probe_preserved() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Idle);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    // Simulate VCS remote_head_sha error by not scripting any head
+    let branch = "fix/test-vcs-err";
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_vcs_err.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-vcs-err".into(),
+        BeadOverlay {
+            bead_id: "bead-vcs-err".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(996),
+            branch: Some(branch.into()),
+            session_id: Some("wa-vcs-err".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-vcs-err", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(996));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 996),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        996,
+        PrSnapshot {
+            pr_number: 996,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-996".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-vcs-err").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "idle session with indeterminate VCS head must remain DISPATCHED"
+    );
+    assert_eq!(
+        o.session_id,
+        Some("wa-vcs-err".into()),
+        "live worker handle must not be cleared on transient VCS failure"
+    );
+    assert!(
+        !sessions.stop_succeeded.get(),
+        "live worker must not be reaped on transient VCS failure"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_dispatched_adopted_terminal_session_unchanged_head_parks_human_held() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Terminal);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-term-unchanged";
+    let sha = "sha-pre-term";
+    vcs.heads.insert(branch.into(), sha.into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_term_unchanged.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-term-unchanged".into(),
+        BeadOverlay {
+            bead_id: "bead-term-unchanged".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(995),
+            branch: Some(branch.into()),
+            session_id: Some("wa-term-1".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-term-unchanged", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(995));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 995),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        995,
+        PrSnapshot {
+            pr_number: 995,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 1);
+
+    let o = store.load("bead-term-unchanged").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::HumanHeld,
+        "terminal session with unchanged head must park HUMAN_HELD"
+    );
+    assert_eq!(
+        o.park_reason,
+        Some("adopted_remediation_unfinished".into()),
+        "park reason must be adopted_remediation_unfinished"
+    );
+    assert_eq!(
+        o.session_id, None,
+        "session handle must be cleared on park"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("PARKED_HUMAN_HELD"),
+        "telemetry must record PARKED_HUMAN_HELD"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// CodeRabbit finding on PR #842 (tick.rs ~5570): a terminal/unhealthy
+/// adopted session whose `remote_head_sha` VCS probe errors (transient GH
+/// API failure, not a confirmed no-advance) must NOT be conflated with
+/// `AdoptedHeadAdvance::Unchanged` — the old wildcard match arm killed the
+/// session and parked the bead HUMAN_HELD with the NON-recoverable
+/// `adopted_remediation_unfinished` reason on a merely-indeterminate signal.
+/// The fix distinguishes `Indeterminate` and defers instead.
+#[test]
+fn test_dispatched_adopted_terminal_session_vcs_probe_error_defers_no_park() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Terminal);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    // Deliberately do NOT script a head for this branch: FakeVcs::remote_head_sha
+    // returns Err("no scripted remote head for ..."), modeling a transient
+    // VCS probe failure (e.g. GH API timeout) — NOT a confirmed unchanged head.
+    let vcs = FakeVcs::new();
+    let branch = "fix/test-term-vcs-error";
+    let sha = "sha-pre-term-vcs-error";
+    // Positive LOCAL ancestry proof lets the earlier per-tick wedge-detection
+    // sweep (tick.rs ~1093, a distinct check from the one under test) pass
+    // via its documented remote-unavailable fallback instead of parking
+    // `adopted_branch_append_only_check_failed` — isolating this test to the
+    // later promotion-check `check_adopted_head_advance` call under test.
+    sessions.set_worktree_ancestor("wa-term-vcs-error", branch, sha, true);
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_term_vcs_probe_error.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-term-vcs-error".into(),
+        BeadOverlay {
+            bead_id: "bead-term-vcs-error".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(994),
+            branch: Some(branch.into()),
+            session_id: Some("wa-term-vcs-error".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store
+        .register_branch("bead-term-vcs-error", branch)
+        .unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(994));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 994),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        994,
+        PrSnapshot {
+            pr_number: 994,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "a transient VCS probe error must NOT park HUMAN_HELD"
+    );
+
+    let o = store.load("bead-term-vcs-error").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "terminal session with an indeterminate (VCS-probe-error) head check must remain DISPATCHED, not park"
+    );
+    assert_eq!(
+        o.session_id,
+        Some("wa-term-vcs-error".into()),
+        "session handle must be preserved — an indeterminate probe must not kill the session"
+    );
+    assert!(
+        !sessions.stop_succeeded.get(),
+        "session must not be reaped on a transient VCS probe error"
+    );
+    assert_ne!(
+        o.park_reason,
+        Some("adopted_remediation_unfinished".into()),
+        "must not misreport a transient probe failure as confirmed-unfinished remediation"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("ADOPTED_HEAD_ADVANCE_INDETERMINATE"),
+        "telemetry must record the indeterminate probe outcome; telemetry:\n{telemetry}"
+    );
+    assert!(
+        !telemetry.contains("PARKED_HUMAN_HELD"),
+        "telemetry must not record a park on an indeterminate probe; telemetry:\n{telemetry}"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+/// CodeRabbit finding on PR #842 (tick.rs ~5595): the adopted-session
+/// promotion-check path bypassed the ordinary quota-watchdog arming that
+/// `run_fast_tier`'s non-adopted branch already applies (tick.rs ~5248).
+/// A Gemini quota exhaustion with a parseable "Resets in Xh Ym" reason and
+/// non-Running activity fell straight into `is_terminal_or_unhealthy`,
+/// which — if the head hadn't (yet) advanced — killed the session and
+/// parked the bead HUMAN_HELD with the NON-recoverable
+/// `adopted_remediation_unfinished` reason instead of arming the watchdog
+/// to resume the SAME paused pane after the reset window.
+#[test]
+fn test_dispatched_adopted_quota_health_failure_arms_watchdog_no_park() {
+    daemon::health::quota_watchdog::clear("bead-adopted-quota-arm");
+
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Idle);
+    sessions.set_session_health_failure(
+        "wa-adopted-quota-paused",
+        "terminal session error in tmux pane: individual quota reached (resets in 1h 23m.)",
+    );
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-adopted-quota-arm";
+    let sha = "sha-pre-adopted-quota";
+    // Head unchanged: without the fix, this is exactly the case that falls
+    // through to the destructive kill+park path.
+    vcs.heads.insert(branch.into(), sha.into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_adopted_quota_arm.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-adopted-quota-arm".into(),
+        BeadOverlay {
+            bead_id: "bead-adopted-quota-arm".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(993),
+            branch: Some(branch.into()),
+            session_id: Some("wa-adopted-quota-paused".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store
+        .register_branch("bead-adopted-quota-arm", branch)
+        .unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(993));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 993),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        993,
+        PrSnapshot {
+            pr_number: 993,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(
+        summary.beads_parked_human_held, 0,
+        "a recoverable quota exhaustion must NOT park HUMAN_HELD"
+    );
+
+    let o = store.load("bead-adopted-quota-arm").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "quota-armed adopted bead must stay DISPATCHED — no kill+park cycle"
+    );
+    assert_eq!(
+        o.session_id,
+        Some("wa-adopted-quota-paused".into()),
+        "the paused session handle must be preserved for the watchdog to wake later"
+    );
+    assert!(
+        !sessions
+            .calls
+            .borrow()
+            .iter()
+            .any(|c| c.starts_with("stop(")),
+        "quota-armed adopted session must NOT be stopped; calls={:?}",
+        sessions.calls.borrow()
+    );
+    assert!(
+        daemon::health::quota_watchdog::recorded_reset_at("bead-adopted-quota-arm").is_some(),
+        "quota watchdog ledger must record the reset time for the adopted bead"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("QUOTA_WATCHDOG_ARMED"),
+        "QUOTA_WATCHDOG_ARMED event must be emitted; telemetry:\n{telemetry}"
+    );
+    assert!(
+        !telemetry.contains("PARKED_HUMAN_HELD"),
+        "telemetry must not record a park on a recoverable quota exhaustion; telemetry:\n{telemetry}"
+    );
+
+    daemon::health::quota_watchdog::clear("bead-adopted-quota-arm");
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_dispatched_adopted_terminal_session_advanced_head_promoted() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Terminal);
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-term-adv";
+    let pre_sha = "sha-pre-term-adv";
+    let post_sha = "sha-post-term-adv";
+    vcs.heads.insert(branch.into(), post_sha.into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_term_adv.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-term-adv".into(),
+        BeadOverlay {
+            bead_id: "bead-term-adv".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(994),
+            branch: Some(branch.into()),
+            session_id: Some("wa-term-adv".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(pre_sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-term-adv", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(994));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 994),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        994,
+        PrSnapshot {
+            pr_number: 994,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: post_sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-term-adv").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Attested,
+        "terminal session with advanced head must promote to ATTESTED"
+    );
+    assert_eq!(
+        o.session_id, None,
+        "session handle must be cleared on promotion"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_dispatched_adopted_health_failed_session_unchanged_head_parks_human_held() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Terminal);
+    sessions.set_session_health_failure("wa-hf-unchanged", "terminal session error: auth expired");
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-hf-unchanged";
+    let sha = "sha-pre-hf";
+    vcs.heads.insert(branch.into(), sha.into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_hf_unchanged.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-hf-unchanged".into(),
+        BeadOverlay {
+            bead_id: "bead-hf-unchanged".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(993),
+            branch: Some(branch.into()),
+            session_id: Some("wa-hf-unchanged".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-hf-unchanged", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(993));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 993),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        993,
+        PrSnapshot {
+            pr_number: 993,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 1);
+
+    let o = store.load("bead-hf-unchanged").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::HumanHeld,
+        "health-failed session with unchanged head must park HUMAN_HELD"
+    );
+    assert_eq!(
+        o.park_reason,
+        Some("adopted_remediation_unfinished".into()),
+        "park reason must be adopted_remediation_unfinished"
+    );
+    assert_eq!(
+        o.session_id, None,
+        "session handle must be cleared on park"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_dispatched_adopted_health_failed_session_advanced_head_promoted() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    sessions.set_activity(daemon::tools::SessionActivity::Terminal);
+    sessions.set_session_health_failure("wa-hf-adv", "pane exited after push");
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-hf-adv";
+    let pre_sha = "sha-pre-hf-adv";
+    let post_sha = "sha-post-hf-adv";
+    vcs.heads.insert(branch.into(), post_sha.into());
+
+    let telemetry_log = std::env::temp_dir().join("afd_test_hf_adv.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-hf-adv".into(),
+        BeadOverlay {
+            bead_id: "bead-hf-adv".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(992),
+            branch: Some(branch.into()),
+            session_id: Some("wa-hf-adv".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(pre_sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-hf-adv", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(992));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 992),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        992,
+        PrSnapshot {
+            pr_number: 992,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: post_sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-hf-adv").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Attested,
+        "health-failed session with advanced head must promote to ATTESTED"
+    );
+    assert_eq!(
+        o.session_id, None,
+        "session handle must be cleared on promotion"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_dispatched_adopted_no_session_missing_baseline_stays_dispatched() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let vcs = FakeVcs::new();
+    let branch = "fix/test-no-session-nobase";
+    let telemetry_log = std::env::temp_dir().join("afd_test_no_session_nobase.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-no-session-nobase".into(),
+        BeadOverlay {
+            bead_id: "bead-no-session-nobase".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(991),
+            branch: Some(branch.into()),
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-no-session-nobase", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(991));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 991),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        991,
+        PrSnapshot {
+            pr_number: 991,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: "head-991".into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-no-session-nobase").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "adopted bead with no session and missing baseline must fail closed (stay DISPATCHED)"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !telemetry.contains("REROLL_ADOPTED_SESSION_QUIESCED"),
+        "must not emit REROLL_ADOPTED_SESSION_QUIESCED without proved head advance"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_dispatched_adopted_no_session_unchanged_head_stays_dispatched() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-no-session-same";
+    let sha = "sha-same-no-session";
+    vcs.heads.insert(branch.into(), sha.into());
+    let telemetry_log = std::env::temp_dir().join("afd_test_no_session_same.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-no-session-same".into(),
+        BeadOverlay {
+            bead_id: "bead-no-session-same".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(990),
+            branch: Some(branch.into()),
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-no-session-same", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(990));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 990),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        990,
+        PrSnapshot {
+            pr_number: 990,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-no-session-same").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "adopted bead with no session and unchanged head must fail closed (stay DISPATCHED)"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !telemetry.contains("REROLL_ADOPTED_SESSION_QUIESCED"),
+        "must not emit REROLL_ADOPTED_SESSION_QUIESCED without proved head advance"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_dispatched_adopted_no_session_advanced_head_promotes() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let sessions = FakeSessions::new();
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-no-session-adv";
+    let pre_sha = "sha-pre-no-session";
+    let post_sha = "sha-post-no-session";
+    vcs.heads.insert(branch.into(), post_sha.into());
+    let telemetry_log = std::env::temp_dir().join("afd_test_no_session_adv.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-no-session-adv".into(),
+        BeadOverlay {
+            bead_id: "bead-no-session-adv".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(989),
+            branch: Some(branch.into()),
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(pre_sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-no-session-adv", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(989));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 989),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        989,
+        PrSnapshot {
+            pr_number: 989,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: post_sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-no-session-adv").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Attested,
+        "adopted bead with no session and distinct descendant head advance promotes to ATTESTED"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        telemetry.contains("REROLL_ADOPTED_SESSION_QUIESCED"),
+        "must emit REROLL_ADOPTED_SESSION_QUIESCED on proved head advance"
+    );
+
+    let _ = std::fs::remove_file(&telemetry_log);
+}
+
+#[test]
+fn test_dispatched_adopted_running_health_failed_with_descendant_stays_dispatched() {
+    let mut scm = FakeScm::new();
+    let tracker = FakeTracker::new();
+    let mut sessions = FakeSessions::new();
+    sessions.quiescent = false;
+    // Explicit Running activity must win before health classification
+    sessions.set_activity(daemon::tools::SessionActivity::Running);
+    sessions.set_session_health_failure("wa-run-hf", "temporary health failure");
+
+    let llm = FakeLlm::new();
+    let store = FakeStateStore::new();
+    let cfg = test_cfg();
+    let mut vcs = FakeVcs::new();
+    let branch = "fix/test-run-hf";
+    let pre_sha = "sha-pre-run-hf";
+    let post_sha = "sha-post-run-hf";
+    vcs.heads.insert(branch.into(), post_sha.into());
+    let telemetry_log = std::env::temp_dir().join("afd_test_run_hf.jsonl");
+    let _ = std::fs::remove_file(&telemetry_log);
+
+    store.overlays.borrow_mut().insert(
+        "bead-run-hf".into(),
+        BeadOverlay {
+            bead_id: "bead-run-hf".into(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 100,
+            spend_usd: 0.0,
+            pr_number: Some(988),
+            branch: Some(branch.into()),
+            session_id: Some("wa-run-hf".into()),
+            session_ao_project: None,
+            is_adopted: true,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: Some(pre_sha.into()),
+            park_reason: None,
+            target_repo: None,
+            attempt_started_at: None,
+        },
+    );
+
+    store.register_branch("bead-run-hf", branch).unwrap();
+
+    scm.pr_numbers_for_branch
+        .insert(("owner/repo".into(), branch.into()), Some(988));
+    scm.open_pr_head_refs.insert(
+        ("owner/repo".into(), 988),
+        daemon::tools::PrHeadBranch::SameRepo(branch.into()),
+    );
+    scm.pr_snapshots.insert(
+        988,
+        PrSnapshot {
+            pr_number: 988,
+            ci_success: true,
+            mergeable: true,
+            merge_state_unknown: false,
+            coderabbit_approved: true,
+            bugbot_error_count: 0,
+            unresolved_thread_count: Some(0),
+            head_sha: post_sha.into(),
+            body: "".into(),
+            comments: vec![],
+            files: vec![],
+            updated_at_epoch: 100,
+            ci_status: "green".to_string(),
+            coderabbit_status: "green".to_string(),
+            ci_pending: false,
+            bugbot_pending: false,
+            head_committed_epoch: 0,
+        },
+    );
+
+    let deps = TickDeps {
+        scm: &scm,
+        tracker: &tracker,
+        sessions: &sessions,
+        llm: &llm,
+        store: &store,
+        vcs: &vcs,
+        cfg: &cfg,
+        telemetry_log: &telemetry_log,
+        vendor_health: None,
+    };
+
+    let summary = run_tick(&deps, 0, 10).unwrap();
+    assert_eq!(summary.beads_parked_human_held, 0);
+
+    let o = store.load("bead-run-hf").unwrap().unwrap();
+    assert_eq!(
+        o.state,
+        OverlayState::Dispatched,
+        "running session with health failure must remain DISPATCHED even with descendant head"
+    );
+    assert_eq!(
+        o.session_id,
+        Some("wa-run-hf".into()),
+        "running worker handle must not be cleared"
+    );
+    assert!(
+        !sessions.stop_succeeded.get(),
+        "running worker must not be reaped while reported running"
+    );
+
+    let telemetry = std::fs::read_to_string(&telemetry_log).unwrap_or_default();
+    assert!(
+        !telemetry.contains("REROLL_ADOPTED_SESSION_QUIESCED"),
+        "must not emit REROLL_ADOPTED_SESSION_QUIESCED while worker is running"
+    );
+
     let _ = std::fs::remove_file(&telemetry_log);
 }
 

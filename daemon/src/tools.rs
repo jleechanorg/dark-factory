@@ -1236,7 +1236,41 @@ pub fn resolve_beads_db() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Explicit AI-provider-scoped variant of `run_tool`.
+pub fn run_scoped_tool(
+    provider: crate::account_scope::AiProvider,
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&str>,
+    timeout_secs: u64,
+) -> Result<String, DaemonError> {
+    run_tool_with_cwd_scoped(Some(provider), cmd, args, cwd, &[], timeout_secs)
+}
+
+/// Explicit AI-provider-scoped variant of `run_tool_with_env`.
+pub fn run_scoped_tool_with_env(
+    provider: crate::account_scope::AiProvider,
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&str>,
+    extra_env: &[(&str, &str)],
+    timeout_secs: u64,
+) -> Result<String, DaemonError> {
+    run_tool_with_cwd_scoped(Some(provider), cmd, args, cwd, extra_env, timeout_secs)
+}
+
 fn run_tool_with_cwd(
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&str>,
+    extra_env: &[(&str, &str)],
+    timeout_secs: u64,
+) -> Result<String, DaemonError> {
+    run_tool_with_cwd_scoped(None, cmd, args, cwd, extra_env, timeout_secs)
+}
+
+fn run_tool_with_cwd_scoped(
+    provider: Option<crate::account_scope::AiProvider>,
     cmd: &str,
     args: &[&str],
     cwd: Option<&str>,
@@ -1271,6 +1305,36 @@ fn run_tool_with_cwd(
         }
         for (key, value) in extra_env {
             command.env(key, value);
+        }
+        // Centralized AI account scoping: runs after extra_env overrides so
+        // caller-passed extra_env cannot bypass safety. Fails closed before spawn.
+        // Preserve DaemonError::Config as-is: account-scope validators return
+        // it for permanent host misconfiguration, and is_transient() treats
+        // Config as non-transient (park immediately) vs Tool (retry until
+        // MAX_TRANSIENT_SPAWN_RETRY exhausts). Downcasting Config to Tool here
+        // made dispatch requeue an unchanged misconfiguration until the retry
+        // cap burned, then park with a generic transient-spawn reason instead
+        // of the real config error.
+        if let Some(p) = provider {
+            crate::account_scope::apply_provider_scope(p, &mut command).map_err(|e| match e {
+                config @ DaemonError::Config(_) => config,
+                other => DaemonError::Tool {
+                    tool: cmd.to_string(),
+                    rc: -1,
+                    stderr: format!("account scope validation failed: {other}"),
+                },
+            })?;
+        } else {
+            crate::account_scope::apply_direct_cli_scope(cmd, extra_env, &mut command).map_err(
+                |e| match e {
+                    config @ DaemonError::Config(_) => config,
+                    other => DaemonError::Tool {
+                        tool: cmd.to_string(),
+                        rc: -1,
+                        stderr: format!("account scope validation failed: {other}"),
+                    },
+                },
+            )?;
         }
         let mut child = command.spawn().map_err(|e| DaemonError::Tool {
             tool: cmd.to_string(),

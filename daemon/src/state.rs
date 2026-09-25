@@ -803,6 +803,11 @@ pub enum HumanHoldReason {
     /// bare requeue would replay the same leak. Excluded from
     /// `recoverable_exact_values()`.
     WorktreeCwdMismatch,
+    /// A remediation coder session on an adopted branch terminated, was not
+    /// found, or failed health check without publishing any descendant
+    /// commits beyond the pre-session baseline. Permanent — a bare requeue
+    /// would replay the same silent exit or crash without human diagnosis.
+    AdoptedRemediationUnfinished,
 }
 
 impl HumanHoldReason {
@@ -856,6 +861,7 @@ impl HumanHoldReason {
                 return format!("escalation_local_fallback:{reason}");
             }
             Self::WorktreeCwdMismatch => "worktree_cwd_mismatch",
+            Self::AdoptedRemediationUnfinished => "adopted_remediation_unfinished",
         }
         .to_string()
     }

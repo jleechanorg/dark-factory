@@ -5,15 +5,24 @@ use daemon::tools::{Llm, Scm, SessionActivity, SessionId, Sessions, SpawnSpec, T
 /// Guard for setting environment variables during tests.
 /// SAFETY: must be used with a mutex lock to prevent concurrent test interference.
 struct EnvVarGuard {
-    saved: Vec<(&'static str, Option<String>)>,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
 
 impl EnvVarGuard {
     fn set(vars: &[(&'static str, &str)]) -> Self {
         let mut saved = Vec::new();
         for (k, v) in vars {
-            saved.push((*k, std::env::var(k).ok()));
+            saved.push((*k, std::env::var_os(k)));
             unsafe { std::env::set_var(k, v) };
+        }
+        Self { saved }
+    }
+
+    fn remove(vars: &[&'static str]) -> Self {
+        let mut saved = Vec::new();
+        for k in vars {
+            saved.push((*k, std::env::var_os(k)));
+            unsafe { std::env::remove_var(k) };
         }
         Self { saved }
     }
@@ -943,6 +952,7 @@ mod ao_recovery_contract {
         old_operator_home: Option<std::ffi::OsString>,
         old_config_path: Option<std::ffi::OsString>,
         old_ao_config_path: Option<std::ffi::OsString>,
+        old_claude_config_dir: Option<std::ffi::OsString>,
     }
 
     impl FakeAo {
@@ -1019,6 +1029,7 @@ sys.exit(99)
             let old_operator_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
             let old_config_path = std::env::var_os("DARK_FACTORY_AO_CONFIG_PATH");
             let old_ao_config_path = std::env::var_os("AO_CONFIG_PATH");
+            let old_claude_config_dir = std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR");
             let path = match old_path.as_deref() {
                 Some(old) => format!("{}:{}", root.display(), old.to_string_lossy()),
                 None => root.display().to_string(),
@@ -1034,9 +1045,11 @@ sys.exit(99)
                 std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", root.join("controller"));
                 std::env::set_var("DARK_FACTORY_OPERATOR_HOME", root.join("operator"));
                 std::env::set_var("DARK_FACTORY_AO_CONFIG_PATH", root.join("agent-orchestrator.yaml"));
+                std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR");
             }
             Self { root, old_path, old_cooldown, old_timeout, old_poll, old_sustain,
-                old_controller_home, old_operator_home, old_config_path, old_ao_config_path }
+                old_controller_home, old_operator_home, old_config_path, old_ao_config_path,
+                old_claude_config_dir }
         }
 
         fn calls(&self) -> Vec<Vec<String>> {
@@ -1078,6 +1091,7 @@ sys.exit(99)
                 ("DARK_FACTORY_OPERATOR_HOME", self.old_operator_home.take()),
                 ("DARK_FACTORY_AO_CONFIG_PATH", self.old_config_path.take()),
                 ("AO_CONFIG_PATH", self.old_ao_config_path.take()),
+                ("DARK_FACTORY_CLAUDE_CONFIG_DIR", self.old_claude_config_dir.take()),
             ] {
                 match value {
                     Some(value) => unsafe { std::env::set_var(key, value) },
@@ -1191,6 +1205,7 @@ sys.exit(99)
         let fake = FakeAo::new("claude_profile", 0, 0);
         let personal = fake.root.join("personal-claude").to_string_lossy().into_owned();
         let _guard = EnvVarGuard::set(&[("CLAUDE_CONFIG_DIR", &personal)]);
+        let _claude_guard = EnvVarGuard::remove(&["DARK_FACTORY_CLAUDE_CONFIG_DIR"]);
         assert!(matches!(
             ensure_ao_recovery("dark-factory"),
             daemon::adapters::RecoveryOutcome::Restarted { .. }
@@ -1450,6 +1465,7 @@ sys.exit(1)
         ("DARK_FACTORY_AO_RECOVERY_POLL_MS", "10"),
         ("DARK_FACTORY_AO_RECOVERY_SUSTAIN_MS", "10"),
         ("DARK_FACTORY_AO_RECOVERY_COOLDOWN_MS", "0"),
+        ("MINIMAX_API_KEY", "test-synthetic-minimax-key-fixture"),
     ]);
 
     let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
@@ -1552,6 +1568,7 @@ sys.exit(1)
     let _env_guard = EnvVarGuard::set(&[
         ("PATH", &new_path),
         ("DARK_FACTORY_CODER_FALLBACK_CHAIN", "minimax"),
+        ("MINIMAX_API_KEY", "test-synthetic-minimax-key-fixture"),
     ]);
 
     let repo = "jleechanorg/dark-factory";
