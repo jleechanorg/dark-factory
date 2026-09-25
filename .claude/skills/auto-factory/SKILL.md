@@ -16,6 +16,14 @@ evidence. When the user invokes `/af` to process a product or pilot task, the
 repository's zero-direct-work rule applies: monitor the factory and use its bead to
 daemon to worker path, without hand-driving product or pilot branches.
 
+**Interactive Developer Override**: This zero-direct-work rule applies strictly
+to hands-off autonomous `/af` goal runs. When the operator directly commands you
+to code, repair, unpark beads, re-run gates, drive verifications, or finish tasks
+(e.g., "you are coding", "keep going and finish 1-4", "repair this"), you are in
+active engineering mode. Act with full authority to diagnose, unpark, fix, run
+evidence commands, and drive the task to completion. Never refuse a direct
+interactive coding instruction by misclassifying it as a hands-off `/af` run.
+
 The auto-factory is the agent-orchestrator-style system that drives worldai PRs to merge. This skill is its orchestrator: it picks up work (beads + GH issues), dispatches coder subagents, runs verifier ticks, and iterates until gates pass.
 
 ## 0. Execution host + Bead authority preflight

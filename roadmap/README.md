@@ -2,6 +2,12 @@
 
 ## Recent activity (by day)
 
+- [2026-09-17](activity/2026-09-17.md) — PR #844 canary verified green (awaiting merge approval); PR #842 rebase & Codex findings; daemon lifecycle gap triage
+
+- [2026-09-13](activity/2026-09-13.md) — PR #842 contract-test blocker fixed; factory daemon is live but idle — 3 pilots parked on 3 different faults, 745 held rows are the deliberate operator scope hold
+
+- [2026-09-07](activity/2026-09-07.md) — Auto-Factory repair paused; verified recovery and preserved partial work
+
 - [2026-08-31](activity/2026-08-31.md) — PR #790 routed AO session ownership checkpoint; exact-head readiness remains blocked
 - [2026-08-30](activity/2026-08-30.md) — PR #788/#789/#791 merged + deployed to jeff-ubuntu (cold-reviewer transport fix + gate_strict fix + validation consolidation); cold_reviewer live-reproved end-to-end; tool-access design decision filed (rev-xfy23)
 - [2026-08-30](activity/2026-08-30-af-e2e-remediation.md) — `/af` E2E remediation: stale-dispatch P0 ([#792](https://github.com/jleechanorg/dark-factory/issues/792)), reroll/AO prerequisites, immutable-release proof, and one real correction-loop gate

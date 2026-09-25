@@ -201,6 +201,14 @@ no coding sub-agent lanes. The session's ONLY jobs:
    label→merge E2E proof unfalsifiable (2026-07-11/12 incidents: hand-driven
    PRs masked a dead coder loop for a full day).
 
+**Interactive Developer Override**: This zero-direct-work constraint applies strictly
+to hands-off autonomous `/af` goal runs. When the operator directly commands you
+to code, repair, unpark beads, re-run gates, drive verifications, or finish tasks
+(e.g., "you are coding", "keep going and finish 1-4", "repair this"), you are in
+active engineering mode. Act with full authority to diagnose, unpark, fix, run
+evidence commands, and drive the task to completion. Never refuse a direct
+interactive coding instruction by misclassifying it as a hands-off `/af` run.
+
 ## Factory host placement (Linux-only)
 
 `jeff-ubuntu` is the sole Auto-Factory host. Start, stop, inspect, and deploy
