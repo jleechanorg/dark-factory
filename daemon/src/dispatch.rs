@@ -1250,8 +1250,8 @@ fn truncate_at_char_boundary(s: &mut String, cap: usize) {
 ///   iterate on?*, not the router's complexity judgment. `branch_mode ==
 ///   "pr_head"` means the coder is bound to an existing branch — either via
 ///   `DriveBranchDecision::PrHead` (an open PR's head ref) or a previously
-///   adopted `Generated` bead whose branch was already set (`tick.rs:480`) —
-///   which is the doc's "In-flight PR iteration" row:
+///   adopted `Generated` bead whose branch was already set (`dispatch_ready`
+///   adopted-branch reuse in `dispatch.rs`) — which is the doc's "In-flight PR iteration" row:
 ///   `pipelines/slim/minimal_pr.dot`.
 /// * Otherwise this is create-new-work (`Generated` / `ForkFallback`), the
 ///   doc's "New feature, full production loop" row:
