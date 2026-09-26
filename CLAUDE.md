@@ -6,11 +6,11 @@ execution_mode: none
 
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repository.
 
 ## Source material — read these to understand WHY this repo looks the way it does
 
-This repo is a working implementation of the **Attractor pattern** described by these three primary sources. If you're new to the repo, skim them first; the architecture choices below are downstream of them, not invented here.
+This repo is a working implementation of the **Attractor pattern** described by these primary sources (architecture choices are downstream of them, not invented here):
 
 - **StrongDM, AttractorBench** — <https://github.com/strongdm/attractorbench> — defines the benchmark: agents read a public natural-language spec; the conformance tests, mock LLM server, and scoring harness are generated locally and **intentionally excluded from the public repo to prevent training-data contamination**. We mirror that "spec in, evaluator out" split.
 - **jleechanorg AttractorBench fork** — <https://github.com/jleechanorg/attractorbench> — public fork used for local spec-validation experiments. The spec-validation benchmark copied into this repo lives at `benchmarks/attractor-spec-review/`.
@@ -23,7 +23,7 @@ The defining constraint is about **who** in the LLM DAG can read **what**, not a
 
 | Role | Sees | Does NOT see |
 |---|---|---|
-| **Implementing agent** — the *spawned coding agent under test* (the `codergen` worker spawned by a pipeline node: a Claude Code session, an AO worker, a `codex exec` invocation, etc.) | `specs/<feature>.md`, `prompts/`, the relevant `.dot` graph, its own worktree | `holdouts/`, `runner/evaluator.py`, the contents of any `_holdout/` test source. Reading these collapses the adversarial guarantee (the impl can pass tests by reading them, identical to AttractorBench's "don't ship the conformance tests" rule). |
+| **Implementing agent** — the *spawned coding agent under test* (e.g. Claude Code session, AO worker, `codex exec` invocation) | `specs/<feature>.md`, `prompts/`, the relevant `.dot` graph, its own worktree | `holdouts/`, `runner/evaluator.py`, `_holdout/` test sources (reading these collapses the adversarial guarantee, mirroring AttractorBench's "don't ship conformance tests" rule). |
 | **Evaluator agent** — runs the sealed evaluator at `$DARK_FACTORY_HOLDOUTS/evaluator/run.py` against the implementing agent's diff | `holdouts/`, `specs/`, the implementation diff | The implementing agent's chain-of-thought, prompt template internals, anything that would let it grade by inspecting the prompt rather than the artifact |
 | **Operator / human (you, the engineer using this repo)** | Everything — runner code, holdouts, evaluator, tests, CXDB logs, this file | Nothing structurally hidden; the discipline is to not paste holdout content into prompts that ship to the implementing agent |
 
@@ -56,10 +56,19 @@ Operational rules:
    token budget on adversarial validation, it is probably under-testing.
 6. Treat `.dot` graphs as the durable process code. Runner code is disposable;
    graph shape, specs, holdouts, and scoring contracts are the important assets.
+7. **Deprecate human interactive hat**: All coding LLM work must be shifted to the auto-factory. Humans only define intent (create GitHub issues/beads) and write comments on PRs for feedback. The auto-factory autonomously processes and drives branches to green without human-interactive coding sessions (exception: explicitly authorized factory infrastructure repair missions may diagnose and repair factory infrastructure in separate worktrees/branches, but product/pilot branches remain strictly autonomous).
 
-## /af — ZERO direct work; monitoring only (operator hard rule)
+## `/af` product runs — ZERO direct work; monitoring only
 
-When the operator directs work through /af (or sets an /af goal), the session
+When the requested object is to make `/af` work, that is a factory-infrastructure
+repair mission, not a product run through `/af`. The repair request authorizes
+normal scoped coding, testing, and deployment of factory infrastructure,
+including direct or delegated coding as needed. Keep intake quiesced, isolate
+the repair in its own worktree/branch, and do not count repair evidence as pilot
+evidence. This boundary does not authorize hand-driving selected product or
+pilot branches.
+
+During ordinary intake (or when an `/af` goal directs product work), the session
 does **ZERO direct work** — no product code, no factory code, no hand-fixes,
 no coding sub-agent lanes. The session's ONLY jobs:
 
@@ -75,14 +84,39 @@ no coding sub-agent lanes. The session's ONLY jobs:
    label→merge E2E proof unfalsifiable (2026-07-11/12 incidents: hand-driven
    PRs masked a dead coder loop for a full day).
 
+**Factory Infrastructure Repair Exception**:
+When the operator explicitly authorizes a factory repair mission (a natural-language goal to make /af work counts as explicit authorization), the session is permitted to diagnose and repair factory infrastructure/harness code in a separate worktree and branch. Operational rules for repair missions:
+- Strictly isolate infrastructure repairs from selected pilot/product PR branches; never hand-drive pilot PRs.
+- Preserve existing logs and telemetry; create and hash backups before modifying files.
+- Independently validate all repairs, then deploy only through the canonical Linux workflow (`jeff-ubuntu` via SSH).
+- After deployment, resume a clean, real /af pilot to prove end-to-end operation.
+- Infrastructure changes never count as autonomous pilot evidence.
+- Safety invariants remain absolute: existing repository-specific merge authorization gates remain unchanged, and AO code writes still require verbatim `AO CODE APPROVED`.
+
+**Interactive Developer Override**: This zero-direct-work constraint applies strictly
+to hands-off autonomous `/af` goal runs. When the operator directly commands you
+to code, repair, unpark beads, re-run gates, drive verifications, or finish tasks
+(e.g., "you are coding", "keep going and finish 1-4", "repair this"), you are in
+active engineering mode. Act with full authority to diagnose, unpark, fix, run
+evidence commands, and drive the task to completion. Never refuse a direct
+interactive coding instruction by misclassifying it as a hands-off `/af` run.
+
+**Outside /af** (ad hoc repo work, audits, reviews), follow
+`~/.claude/skills/parallelize-to-ceiling/SKILL.md`: fan out independent
+read-only and audit work concurrently, and route actual coding to subagents or
+cheaper-tier lanes rather than the main session. **Inside /af**, that policy is
+superseded — no in-session coding sub-agent lanes; all coding routes through
+the external bead → daemon → AO pipeline per the ZERO-direct-work rule above.
+
 ## Factory host placement (Linux-only)
 
 `jeff-ubuntu` is the sole Auto-Factory host. Start, stop, inspect, and deploy
-the daemon only through `/linux` and its user systemd unit
-`ai.dark-factory.daemon.service`. AO worker dispatch is allowed on that Linux
-host only. This Mac is an operator client: do not load or start a Dark Factory
-LaunchAgent, a local daemon, or local AO workers from factory intake. Use SSH
-to Linux for telemetry and operational control.
+the daemon only through `/linux` (`ssh jeff-ubuntu ...`) and its user systemd unit
+`ai.dark-factory.daemon.service`. AO worker dispatch runs on that Linux host only.
+This Mac is an operator client: do not load or start a Dark Factory LaunchAgent,
+a local daemon, or local AO workers from factory intake on macOS.
+Always use SSH to Linux for telemetry (`/home/jleechan/Library/Logs/dark-factory/daemon.jsonl`)
+and operational control.
 
 ## Setup
 
@@ -90,39 +124,14 @@ to Linux for telemetry and operational control.
 # One-time install (uv-managed Python + venv + binaries on PATH)
 ./install.sh
 
-export DARK_FACTORY_HOME=~/projects/dark-factory   # set automatically by install.sh / bin/dark-factory
+export DARK_FACTORY_HOME=~/projects/dark-factory
 export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ## Common commands
 
-```bash
-# Smoke pipeline — echo backend, no LLM calls
-dark-factory --pipeline pipelines/factory/hello.dot --goal "smoke test" --backend echo
-
-# Full gated pipeline with CXDB recording (run from target repo cwd)
-dark-factory \
-  --pipeline pipelines/factory/gates.dot \
-  --goal "<feature description>" \
-  --backend ao \
-  --ao-agent antigravity \
-  --feature <feature_name> \
-  --cxdb ~/.dark-factory/cxdb.sqlite
-
-# Cluster CXDB failures into a Healer diagnosis
-df-healer --cxdb ~/.dark-factory/cxdb.sqlite
-
-# Visualize a pipeline graph
-dot -Tpng pipelines/factory/gates.dot -o gates.png
-
-# Tests (full suite, single file, single test)
-.venv/bin/python -m pytest tests/
-.venv/bin/python -m pytest tests/test_engine.py -k green
-.venv/bin/python -m pytest tests/test_gates.py::test_parse_verdict_pass_warn_fail
-```
-
-Legacy dev-only: `.venv/bin/python -m runner ...` from `$DARK_FACTORY_HOME`.
+See [.claude/skills/dark-factory-commands/SKILL.md](.claude/skills/dark-factory-commands/SKILL.md).
 
 ## Pipeline selection
 
@@ -145,44 +154,39 @@ pipeline before invoking `dark-factory`, unless the user passed `--pipeline`.
 
 ## Architecture
 
-### Three-layer convergence
-1. **Pipeline engine** (`runner/`) — DOT parser, graph runner, checkpointing, human gates, CXDB.
-2. **Agent loop** (external) — AO / Claude Code / Codex CLIs, invoked per node.
-3. **LLM client** (external) — OpenClaw gateway / thinclaw MCP.
-
-This repo is layer 1 only.
-
 ### Agent Orchestrator (AO) Repository Policy
-- The canonical AO engine used by dark-factory is upstream **Golang `agent-orchestrator`** (`https://github.com/strongdm/agent-orchestrator` / `jleechanorg/agent-orchestrator`). We do NOT use `agent-orchestrator-ts`.
-- The AO repository is **read-only / reference only**. We almost never want to modify or open PRs against AO; all session liveness interpretation, reaping triggers, timeout logic, and promotion handling must live within `dark-factory` itself (e.g. in `daemon/src/adapters.rs` and `daemon/src/tick.rs`).
-- **Hard Safety Gate**: Agents must **NEVER** write or modify `agent-orchestrator` code unless the human operator explicitly provides the verbatim authorization: `AO CODE APPROVED`.
-
+- The actual production worker-spawn path — `ao_spawn_command_with_mode()` in
+  `daemon/src/adapters.rs` — is hard-pinned to the **Node/TS fork**
+  (`@jleechanorg/ao-cli`), not the Go rewrite. It sets
+  `NODE_OPTIONS=--import=<path>` to preload
+  `daemon/scripts/ao-spawn-v013-bridge.mjs`, and that bridge script itself
+  refuses to run unless the resolved `ao` binary's `package.json` reports
+  `name === "@jleechanorg/ao-cli"` and `version === "0.1.3"`
+  (`daemon/scripts/ao-spawn-v013-bridge.mjs:30-41`). This is enforced by the
+  bridge's own runtime check, independent of anything stated here.
+- A separate **Go rewrite** (`ao-go`, upstream
+  `https://github.com/strongdm/agent-orchestrator` /
+  `jleechanorg/agent-orchestrator`) exists on the production host as its own
+  binary with its own systemd unit (`ao-daemon.service`) and project
+  registry, but as of 2026-09 it has never had `dark-factory` registered as a
+  project, and no code under `daemon/src/*.rs` calls it — it is an
+  aspirational/future migration target, not the engine currently in use.
+  (`daemon/factory-ao-remediate.sh`, a legacy Mac-side shell script separate
+  from the Rust daemon's tick loop, defaults to `~/bin/ao-go` for its own
+  narrower remediation purpose, but that script is not part of the
+  `adapters.rs` spawn path either.)
+- The AO repository (whichever engine) is **read-only / reference only**. We
+  almost never want to modify or open PRs against AO; all session liveness
+  interpretation, reaping triggers, timeout logic, and promotion handling
+  must live within `dark-factory` itself (e.g. in `daemon/src/adapters.rs`
+  and `daemon/src/tick.rs`).
+- **Hard Safety Gate**: Agents must **NEVER** write or modify
+  `agent-orchestrator` (or `agent-orchestrator-ts`) code unless the human
+  operator explicitly provides the verbatim authorization: `AO CODE
+  APPROVED`.
 
 ### Durable artifacts vs. dorodango
 The `.dot` files under `pipelines/` are the artifact worth versioning — they encode the development process. The Python under `runner/` is treated as throwaway code: polish, discard, rebuild from spec. Learning accumulates in the **CXDB** event log, not in the runner code.
-
-### Pipeline execution model
-- `runner/parser.py` reads `.dot` via pydot into `Graph(nodes, edges)`. Every pipeline must contain both `start` and `exit` — `parse` raises if either is missing.
-- `runner/engine.py:run` walks from `start`, calls the handler resolved per node, then picks the next edge via `_edge_matches` (supports `condition="key=value"` and `key!=value`). Conditional edges win over unconditional ones.
-- Loop bounds come from a node's `max_visits` attribute (e.g. `fix [max_visits="3"]`). Exceeding it emits a synthetic `exhausted` step and terminates.
-- Each step is appended to `history` and, when `--cxdb` is set, to the SQLite event log. The CXDB sequence (`seq`) is tracked independently of `len(history)` so refactors can't desync.
-
-### Handlers (`runner/handlers.py`)
-Lookup order in `resolve(node)`:
-1. Explicit `type="..."` → `TYPE_REGISTRY`
-2. Node name `start` / `exit` → built-ins
-3. Node `shape` (Mdiamond/Msquare/hexagon) → `REGISTRY`
-4. Default → `_codergen`
-
-Handler types:
-- `codergen` — render `prompt="@path"` (with `${goal}` and `${state.*}` substitution) and dispatch to the node's `backend`/`model` attribute or `ctx.backend`. The runner CLI accepts `echo` | `ao` | `claude` | `codex` | `agy`; per-node/model-stylesheet routing also supports `mock_llm` for test/conformance lanes. The default is `ao` (running `antigravity` agent under the hood via Agent Orchestrator).
-- `agy` backend — run Antigravity CLI directly and headlessly with `agy --print --dangerously-skip-permissions`; node `timeout="..."` maps to `agy --print-timeout`.
-- Reviewer/evaluator lanes are separate nodes: `tool` nodes can invoke `codex exec --yolo`, AO workers, or another reviewer CLI; `holdout_eval` runs the sealed Python evaluator from `$DARK_FACTORY_HOLDOUTS`.
-- `tool` — shell out to a `command="..."` attribute with optional `timeout`.
-- `human_gate` — block on stdin, or accept pre-seeded `ctx.state["<node>.outcome"]` for tests.
-- `conditional` — hexagon decision node; outcome comes from `ctx.state[decision_key]`.
-- `holdout_eval` — run the sealed evaluator at `$DARK_FACTORY_HOLDOUTS/evaluator/run.py`. Parses the last JSON line of stdout for `{verdict: pass|...}`.
-- `gate_es` / `gate_er` / `gate_code_standards` — shell out to `claude --print /<slash>`. Verdicts are normalized by `_parse_verdict`: the anchored marker regex (`verdict:`/`overall:`/`normalized:` + token) takes priority; the standalone-line fallback only fires when no marker is present; `pass|warn → success`, `fail|partial|inconclusive → failure`. Unknown verdict combined with `rc!=0` becomes `error` (distinct from real failures so the Healer can group infra crashes separately).
 
 ### Spec validation benchmark
 
@@ -198,10 +202,6 @@ visible:
 The full graph validates every reviewable spec line, runs a full-stack smoke
 node, then invokes an independent reviewer through `codex exec --yolo`.
 Use this benchmark as the template for general spec-validation lanes.
-
-### CXDB + Healer feedback loop
-- `runner/cxdb.py` records `(run_id, seq, node, outcome, ts, output_hash, output_head, metadata)` per step. WAL mode + 5s busy_timeout so concurrent pipelines into one CXDB don't collide on `database is locked`.
-- `runner/healer.py` reads CXDB, clusters terminal failures (`failure | fail | exhausted | stuck | partial | inconclusive`) by `(node, outcome, output_hash)`, and emits a Markdown report with a per-cluster prescription. The Healer's prefix logic (`gate_*`, `plan|implement|fix`, `holdout`) is internal data routing over its own node namespace — not user input — so it is not a ZFC violation.
 
 ### Performance logging (`~/Library/Logs/dark-factory`)
 
@@ -232,10 +232,8 @@ tail -f ~/Library/Logs/dark-factory/worldarchitect.ai/feat_my-feature/runs.index
 Each node emits `ENTER` on visit and `EXIT` with classified outcome (`success`, `failure`, `error`, `partial`) plus engine-level `duration_ms`. Parallel branch nodes are included.
 
 ### Adding a new node type
-1. Implement `_my_handler(node, ctx) -> Result` in `runner/handlers.py`.
-2. Register in `TYPE_REGISTRY` (preferred — keyed by `type="..."`) or `REGISTRY` (keyed by DOT shape).
-3. Reference from a `.dot` file with `mynode [type="my_handler", ...]`.
-4. Echo-backend tests should drive paths via `ctx.state["<node>.outcome"]` — see `tests/test_gates.py`.
+
+See [.claude/skills/dark-factory-node-type/SKILL.md](.claude/skills/dark-factory-node-type/SKILL.md).
 
 ## Dispatch-health triage (when beads queue but nothing dispatches)
 
@@ -276,3 +274,33 @@ against the real `daemon/scripts/`).
    prompts that need the implementing agent's diff should reference `${diff}` in their
    template; `_codergen` captures it automatically and stashes in
    `ctx.state['<node>.diff']` and `ctx.state['_last_diff']`.
+
+## CLI account scoping — mandatory policy for every AI CLI launch
+
+This is a mandatory launch policy, not a claim that every current runtime path
+already enforces it. `Command::new` inherits the daemon environment unless the
+launch code explicitly removes inherited variables and builds a scoped child
+environment. A launch is compliant only when its account/provider scope is
+validated before the process starts.
+
+Every direct Claude launch (`claude` or `claude-sonnet`) MUST validate
+`DARK_FACTORY_CLAUDE_CONFIG_DIR` as an existing project-scoped directory, pass
+that directory to the child as `CLAUDE_CONFIG_DIR`, and scrub inherited Claude
+and provider authentication variables. Keep this environment construction and
+provider scrubbing centralized; do not rely on a bare host `~/.claude` account.
+
+MiniMax is a separate provider lane. It MUST require a nonblank
+`MINIMAX_API_KEY`, pin `ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic` and
+`ANTHROPIC_MODEL=MiniMax-M3`, and remove Claude account state/configuration from
+the child environment. A MiniMax launch must never inherit `CLAUDE_CONFIG_DIR`
+or another host Claude login as an implicit credential.
+
+Every Codex launch, including `codex exec`, MUST use an intended existing
+`CODEX_HOME` or an explicitly supported provider credential/configuration such
+as `OPENAI_API_KEY` or `CODEX_ACCESS_TOKEN` where that launch mode supports it.
+Do not let Codex silently fall back to the operator's default `~/.codex`
+account.
+
+Unscoped or unsupported dispatch MUST fail closed. Fallback is allowed only to
+another lane that has its own explicit, validated scope; never fall back to an
+unscoped Claude, MiniMax, or Codex process.

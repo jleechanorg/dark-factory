@@ -1,13 +1,17 @@
 use crate::errors::{DaemonError, SpawnBatchCleanupFailure};
-use crate::tools::{run_tool, run_tool_in_dir, Bead, Issue, LabeledPr, Llm, Permission, PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs, WorktreeHeadAncestry};
+use crate::tools::{
+    run_tool, run_tool_in_dir, run_tool_with_env, Bead, Issue, LabeledPr, Llm, Permission,
+    PrHeadBranch, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs,
+    WorktreeHeadAncestry,
+};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 
-/// jleechan-9sl1 test-isolation fix: a single process-wide lock shared by
-/// EVERY `#[cfg(test)]` module in this file that mutates the global `PATH`
+/// jleechan-9sl1 test-isolation fix: the crate-wide process-global lock shared
+/// by EVERY `#[cfg(test)]` module in this file that mutates the global `PATH`
 /// (and related) env vars to inject a fake `gh`/`codex` binary for hermetic
 /// subprocess testing (`chain_llm_fallback_argv_tests`,
 /// `pr_snapshot_checks_fetch_failure_tests`, `cli_vcs_gh_tests`). Those
@@ -22,14 +26,49 @@ use std::time::{Duration, Instant};
 /// intermittently fail with "No such file or directory" pointing at a
 /// DIFFERENT module's already-cleaned-up temp shim dir once a third
 /// PATH-mutating module (`cli_vcs_gh_tests`) was added. Every module below
-/// must call `gh_env_test_lock()` (directly or via a thin per-module
-/// `env_lock()` wrapper) instead of defining its own `ENV_LOCK` -- do not
-/// reintroduce a module-local lock for PATH/env mutation in this file.
+/// must call `crate::test_env_lock()` (directly or via a thin per-module
+/// `env_lock()` wrapper) instead of defining its own `ENV_LOCK`.
+/// Point the shared GitHub circuit breaker's state file and telemetry log at
+/// a private temp dir for the duration of a test. Every test that can trip the
+/// breaker must hold the process-wide environment lock while creating one.
 #[cfg(test)]
-static GH_ENV_TEST_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+pub(crate) struct BreakerSandbox<'a> {
+    dir: std::path::PathBuf,
+    _env_guard: std::sync::MutexGuard<'a, ()>,
+}
+
 #[cfg(test)]
-fn gh_env_test_lock() -> &'static Mutex<()> {
-    GH_ENV_TEST_LOCK.get_or_init(|| Mutex::new(()))
+impl<'a> BreakerSandbox<'a> {
+    pub(crate) fn new(
+        tag: &str,
+        env_guard: std::sync::MutexGuard<'a, ()>,
+    ) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "df_cb_{tag}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::gh_circuit_breaker::set_state_file_path(Some(dir.join("state.json")));
+        crate::gh_circuit_breaker::set_telemetry_log_path(Some(dir.join("daemon.jsonl")));
+        Self {
+            dir,
+            _env_guard: env_guard,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BreakerSandbox<'_> {
+    fn drop(&mut self) {
+        crate::gh_circuit_breaker::reset();
+        crate::gh_circuit_breaker::set_state_file_path(None);
+        crate::gh_circuit_breaker::set_telemetry_log_path(None);
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
 }
 
 
@@ -155,6 +194,22 @@ impl Tracker for CliTracker {
         Ok(beads)
     }
 
+    fn fetch_ready_ids(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
+        let out = run_tool(
+            "br",
+            &["ready", "--label", "factory", "--json", "--limit", "0"],
+            30,
+        )?;
+        let json_start = out.find('[').unwrap_or(0);
+        #[derive(serde::Deserialize)]
+        struct ReadyBead {
+            id: String,
+        }
+        let rows: Vec<ReadyBead> = serde_json::from_str(&out[json_start..])
+            .map_err(|error| DaemonError::Parse(format!("failed to parse br ready JSON: {error}")))?;
+        Ok(rows.into_iter().map(|bead| bead.id).collect())
+    }
+
     fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
         // `br list --status all` returns zero rows; merge open + closed so closed beads
         // (e.g. jleechan-9byt.5 → worldarchitect.ai#8171) block duplicate create_bead.
@@ -245,13 +300,13 @@ impl Tracker for CliTracker {
 
 #[cfg(test)]
 mod cli_tracker_br_db_tests {
-    use super::{gh_env_test_lock, CliTracker};
+    use super::CliTracker;
     use crate::tools::Tracker;
 
     #[test]
     #[cfg(unix)]
     fn cli_tracker_passes_configured_db_to_br_read_and_write_calls() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = std::time::SystemTime::now()
@@ -275,6 +330,13 @@ printf '%s\n' "$*" >> "$DARK_FACTORY_BR_LOG"
 if [ "$1" = "--db" ]; then shift 2; fi
 case "${1:-}" in
   list) printf '{"issues":[],"has_more":false}\n' ;;
+  ready)
+    if [ "${DARK_FACTORY_BR_READY_MALFORMED:-}" = "1" ]; then
+      printf 'not-json\n'
+    else
+      printf '[{"id":"ready-bead"},{"id":"ready-bead-2"}]\n'
+    fi
+    ;;
   create) printf 'bead-from-fake-br\n' ;;
   show)
     if [ -f "$DARK_FACTORY_BR_LABEL_STATE" ]; then
@@ -296,6 +358,7 @@ esac
         let prior_db = std::env::var_os("DARK_FACTORY_BR_DB");
         let prior_log = std::env::var_os("DARK_FACTORY_BR_LOG");
         let prior_label_state = std::env::var_os("DARK_FACTORY_BR_LABEL_STATE");
+        let prior_ready_malformed = std::env::var_os("DARK_FACTORY_BR_READY_MALFORMED");
         let label_state = root.join("factory-labelled");
         unsafe {
             std::env::set_var(
@@ -309,6 +372,11 @@ esac
 
         let tracker = CliTracker;
         let reads = tracker.fetch_candidates();
+        let ready = tracker.fetch_ready_ids();
+        unsafe {
+            std::env::set_var("DARK_FACTORY_BR_READY_MALFORMED", "1");
+        }
+        let malformed_ready = tracker.fetch_ready_ids();
         let created = tracker.create_bead("test", "body", "owner/repo#1");
 
         unsafe {
@@ -328,14 +396,27 @@ esac
                 Some(value) => std::env::set_var("DARK_FACTORY_BR_LABEL_STATE", value),
                 None => std::env::remove_var("DARK_FACTORY_BR_LABEL_STATE"),
             }
+            match prior_ready_malformed {
+                Some(value) => std::env::set_var("DARK_FACTORY_BR_READY_MALFORMED", value),
+                None => std::env::remove_var("DARK_FACTORY_BR_READY_MALFORMED"),
+            }
         }
 
         assert!(reads.unwrap().is_empty());
+        assert_eq!(
+            ready.unwrap(),
+            ["ready-bead".to_string(), "ready-bead-2".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert!(malformed_ready.is_err(), "malformed br ready JSON must fail closed");
         assert_eq!(created.unwrap(), "bead-from-fake-br");
         assert_eq!(
             std::fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(),
             vec![
                 format!("--db {} list --status open --label factory --json --limit 0", db.display()),
+                format!("--db {} ready --label factory --json --limit 0", db.display()),
+                format!("--db {} ready --label factory --json --limit 0", db.display()),
                 format!("--db {} create --title test --description body --external-ref owner/repo#1 --silent", db.display()),
                 format!("--db {} show bead-from-fake-br --json", db.display()),
                 format!("--db {} update bead-from-fake-br --add-label factory --json", db.display()),
@@ -347,8 +428,93 @@ esac
 
     #[test]
     #[cfg(unix)]
+    fn cli_tracker_targets_xdg_state_db_when_env_unset() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dark_factory_cli_tracker_xdg_db_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("br.log");
+        let xdg_state = root.join("xdg_state");
+        let db = xdg_state.join("dark-factory/.beads/beads.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, "").unwrap();
+
+        let br = root.join("br");
+        std::fs::write(
+            &br,
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$DARK_FACTORY_BR_LOG"
+if [ "$1" = "--db" ]; then shift 2; fi
+case "${1:-}" in
+  list) printf '{"issues":[],"has_more":false}\n' ;;
+  *) exit 64 ;;
+esac
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&br, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prior_path = std::env::var_os("PATH");
+        let prior_db = std::env::var_os("DARK_FACTORY_BR_DB");
+        let prior_log = std::env::var_os("DARK_FACTORY_BR_LOG");
+        let prior_xdg = std::env::var_os("XDG_STATE_HOME");
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", root.display(), prior_path.as_deref().unwrap_or_default().to_string_lossy()),
+            );
+            std::env::remove_var("DARK_FACTORY_BR_DB");
+            std::env::set_var("XDG_STATE_HOME", &xdg_state);
+            std::env::set_var("DARK_FACTORY_BR_LOG", &log);
+        }
+
+        let tracker = CliTracker;
+        let reads = tracker.fetch_candidates();
+
+        unsafe {
+            match prior_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            match prior_db {
+                Some(value) => std::env::set_var("DARK_FACTORY_BR_DB", value),
+                None => std::env::remove_var("DARK_FACTORY_BR_DB"),
+            }
+            match prior_log {
+                Some(value) => std::env::set_var("DARK_FACTORY_BR_LOG", value),
+                None => std::env::remove_var("DARK_FACTORY_BR_LOG"),
+            }
+            match prior_xdg {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+
+        assert!(reads.unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(),
+            vec![
+                format!("--db {} list --status open --label factory --json --limit 0", db.display()),
+            ]
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn cli_tracker_resumes_each_partial_two_phase_failure() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = std::time::SystemTime::now()
@@ -468,7 +634,7 @@ esac
     #[test]
     #[cfg(unix)]
     fn cli_tracker_rejects_wrong_id_object_and_array_without_label_update() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = std::time::SystemTime::now()
@@ -800,9 +966,61 @@ struct GhPrView {
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
-struct GhReview {
+pub(crate) struct GhReview {
     author: GhAuthor,
     state: String,
+    /// Commit reviewed by this review. `gh pr view --json reviews` exposes
+    /// this as `commit.oid`; the REST fallback maps its `commit_id` field to
+    /// the same representation. A missing oid is intentionally preserved as
+    /// `None` so an approval cannot be treated as current by accident.
+    #[serde(default)]
+    commit: Option<GhReviewCommit>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+pub(crate) struct GhReviewCommit {
+    #[serde(default)]
+    /// Keep malformed/non-string payloads representable so one bad review
+    /// cannot make the entire PR snapshot fail to parse. Classification below
+    /// accepts only a string that exactly matches the current head.
+    oid: Option<serde_json::Value>,
+}
+
+/// Classify the latest non-comment CodeRabbit review for a PR head.
+///
+/// An `APPROVED` review is green only when GitHub reports the exact current
+/// head commit as its reviewed commit. Older reviews (or payloads that omit
+/// the commit oid) are non-actionable and skipped while looking for the last
+/// substantive review. This keeps stale approvals from silently satisfying
+/// the gate after a push while preserving the existing red treatment for an
+/// explicit changes-requested review.
+pub(crate) fn coderabbit_status_for_head(reviews: &[GhReview], head_ref_oid: &str) -> &'static str {
+    for review in reviews.iter().rev() {
+        if !review.author.login.contains("coderabbit") || review.state == "COMMENTED" {
+            continue;
+        }
+        match review.state.as_str() {
+            "APPROVED" => {
+                let reviewed_oid = review
+                    .commit
+                    .as_ref()
+                    .and_then(|commit| commit.oid.as_ref())
+                    .and_then(serde_json::Value::as_str);
+                if reviewed_oid == Some(head_ref_oid) {
+                    return "green";
+                }
+                // Stale/malformed approvals do not supersede an earlier
+                // substantive rejection (or exact-head approval).
+            }
+            "CHANGES_REQUESTED" => return "red",
+            // A newer non-comment review state is substantive but not an
+            // approval/rejection we understand. Do not fall through to an
+            // older approval and accidentally report green; only stale or
+            // malformed APPROVED entries are intentionally fail-soft.
+            _ => return "unknown",
+        }
+    }
+    "unknown"
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
@@ -895,6 +1113,11 @@ impl CliScm {
         struct RestReview {
             user: Option<RestUser>,
             state: String,
+            #[serde(default)]
+            // Preserve non-string/null values so one malformed review cannot
+            // make the whole REST review list fail to parse. Classification
+            // accepts only a string matching the current head.
+            commit_id: Option<serde_json::Value>,
         }
         #[derive(serde::Deserialize)]
         struct RestUser {
@@ -936,6 +1159,7 @@ impl CliScm {
                         login: r.user.map(|u| u.login).unwrap_or_default(),
                     },
                     state: r.state,
+                    commit: r.commit_id.map(|oid| GhReviewCommit { oid: Some(oid) }),
                 })
                 .collect(),
             head_ref_oid: rest_pr.head.sha,
@@ -1603,7 +1827,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
 
     #[test]
     fn circuit_breaker_state_and_timeout() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("state_timeout", _guard);
         clear_graphql_rate_limited();
         assert!(!is_graphql_rate_limited(), "initially not rate limited");
 
@@ -1621,7 +1846,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
     /// exceeded") must trip the shared circuit breaker and report `true`.
     #[test]
     fn detect_and_mark_rate_limit_error_trips_breaker() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("detect_trips", _guard);
         clear_graphql_rate_limited();
         let err = DaemonError::Tool {
             tool: "gh".to_string(),
@@ -1641,7 +1867,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
     /// leave the circuit breaker untouched and report `false`.
     #[test]
     fn detect_and_mark_non_rate_limit_error_does_not_trip_breaker() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("detect_no_trip", _guard);
         clear_graphql_rate_limited();
         let err = DaemonError::Tool {
             tool: "gh".to_string(),
@@ -1661,7 +1888,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
     /// `if let DaemonError::Tool { stderr, .. } = err` guard.
     #[test]
     fn detect_and_mark_non_tool_error_does_not_trip_breaker() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("detect_non_tool", _guard);
         clear_graphql_rate_limited();
         let err = DaemonError::Parse("rate limit mentioned but not a Tool error".to_string());
 
@@ -1690,7 +1918,8 @@ mod graphql_rate_limit_circuit_breaker_tests {
             }
         }
 
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("sixth_site", _guard);
 
         clear_graphql_rate_limited();
         let rate_limited_err = DaemonError::Tool {
@@ -2021,21 +2250,7 @@ impl Scm for CliScm {
         // `GateResult::Unknown` (transient) rather than `Red` (conflict).
         let merge_state_unknown = view.mergeable == "UNKNOWN";
 
-        let last_coderabbit_review = view.reviews.iter()
-            .rfind(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED");
-
-        let coderabbit_status = match last_coderabbit_review {
-            Some(r) => {
-                if r.state == "APPROVED" {
-                    "green".to_string()
-                } else if r.state == "CHANGES_REQUESTED" {
-                    "red".to_string()
-                } else {
-                    "unknown".to_string()
-                }
-            }
-            None => "unknown".to_string(),
-        };
+        let coderabbit_status = coderabbit_status_for_head(&view.reviews, &view.head_ref_oid).to_string();
         let coderabbit_approved = coderabbit_status == "green";
 
         let checks_out = if gql_limited || is_graphql_rate_limited() {
@@ -2840,11 +3055,11 @@ fn resolve_holdouts_path_or_fail() -> Result<String, DaemonError> {
 
 #[cfg(test)]
 mod resolve_holdouts_path_tests {
-    use super::{gh_env_test_lock, resolve_holdouts_path_or_fail};
+    use super::resolve_holdouts_path_or_fail;
 
     #[test]
     fn fails_loud_when_no_env_and_default_missing() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev_holdouts = std::env::var("DARK_FACTORY_HOLDOUTS").ok();
@@ -2870,7 +3085,7 @@ mod resolve_holdouts_path_tests {
 
     #[test]
     fn fails_loud_when_env_set_but_missing() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::var("DARK_FACTORY_HOLDOUTS").ok();
@@ -2892,7 +3107,7 @@ mod resolve_holdouts_path_tests {
 
     #[test]
     fn succeeds_when_env_points_at_real_dir() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = std::env::temp_dir().join("resolve_holdouts_path_tests_real_dir");
@@ -2924,26 +3139,1869 @@ fn ao_spawn_bridge_path() -> std::path::PathBuf {
         .join("ao-spawn-v013-bridge.mjs")
 }
 
+/// Result of the bounded, project-scoped AO controller readiness check.
+///
+/// `Healthy` means the factory manifest's PID/start-time/project binding
+/// matches AO's private `running.json`. `Restarted` means this process elected
+/// and started a dedicated controller, then observed that binding survive the
+/// configured sustain interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryOutcome {
+    Healthy { evidence: String },
+    Restarted { evidence: String },
+    FailClosed { error: String },
+    Unknown { error: String },
+}
+
+#[derive(Debug)]
+enum AoReadiness {
+    Ready(String),
+    Unavailable,
+    Unknown(String),
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct AoControllerManifest {
+    pid: u32,
+    process_start_ticks: u64,
+    project: String,
+    target: String,
+}
+
+struct AoRecoveryFileLock {
+    _file: std::fs::File,
+}
+
+#[derive(Default)]
+struct AoRecoverySlot {
+    last_failed_attempt: Option<Instant>,
+}
+
+static AO_RECOVERY_SLOTS: std::sync::OnceLock<
+    Mutex<HashMap<String, Arc<Mutex<AoRecoverySlot>>>>,
+> = std::sync::OnceLock::new();
+
+fn ao_recovery_slot(project: &str) -> Arc<Mutex<AoRecoverySlot>> {
+    let slots = AO_RECOVERY_SLOTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut slots = slots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    slots
+        .entry(project.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(AoRecoverySlot::default())))
+        .clone()
+}
+
+fn recovery_duration_ms(name: &str, default_ms: u64) -> Duration {
+    Duration::from_millis(
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(default_ms),
+    )
+}
+
+fn safe_project_component(project: &str) -> String {
+    if !project.is_empty()
+        && !matches!(project, "." | "..")
+        && project
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return project.to_string();
+    }
+    // Keep legacy paths unchanged for already-safe project IDs, while giving
+    // every unsafe byte string an injective, disjoint namespace. A safe ID
+    // can never start with '~' under the predicate above, and hexadecimal
+    // encoding is reversible, so `a/b` cannot collide with `a_b` (or any
+    // other project) as the old underscore substitution did.
+    let mut encoded = String::with_capacity(1 + project.len() * 2);
+    encoded.push('~');
+    for byte in project.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn operator_home() -> Result<String, String> {
+    std::env::var("DARK_FACTORY_OPERATOR_HOME")
+        .or_else(|_| std::env::var("AO_ORIGINAL_HOME"))
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "HOME/AO_ORIGINAL_HOME is unavailable".to_string())
+}
+
+fn ao_controller_home(project: &str) -> Result<std::path::PathBuf, String> {
+    let operator_home = operator_home()?;
+    Ok(std::env::var("DARK_FACTORY_AO_CONTROLLER_HOME")
+        .map(|base| std::path::PathBuf::from(base).join(safe_project_component(project)))
+        .unwrap_or_else(|_| {
+            std::path::Path::new(&operator_home)
+                .join(".local/state/dark-factory/ao-controller")
+                .join(safe_project_component(project))
+        }))
+}
+
+/// Give the factory-owned AO controller a private running-state namespace.
+/// AO 0.1.3 stores `running.json` under `os.homedir()` and cannot attach a
+/// configured project to a different already-running process. A private HOME
+/// therefore avoids disrupting an operator/shared AO instance while the
+/// explicit config and original-home variables preserve the real project,
+/// credentials, and agent configuration.
+///
+/// EXCEPT when an operator-run shared AO instance is ALREADY polling this
+/// project under the real `$HOME` (see `probe_operator_ao_project`): AO's own
+/// `ao start` detects that live session, prints "reused existing session",
+/// and exits immediately without ever becoming a persistent child or writing
+/// `running.json` under the private controller HOME. Pointing `HOME` at the
+/// private sandbox in that case makes every subsequent `getRunning()` lookup
+/// (in `ao-spawn-v013-bridge.mjs`) see nothing, so real spawns fail with
+/// "AO is not running" forever even though AO is healthy -- confirmed live on
+/// jeff-ubuntu 2026-09-06 (private `.agent-orchestrator/running.json` never
+/// existed; manual repro of the recovery `ao start` printed "Orchestrator:
+/// reused existing session (df-orchestrator)" and exited 0 in under a
+/// second). In that case, hand the bridge the operator's real `HOME` instead,
+/// so it observes the same `running.json` the shared instance actually wrote.
+fn resolve_ao_config_path(operator_home: &str) -> String {
+    std::env::var("DARK_FACTORY_AO_CONFIG_PATH")
+        .or_else(|_| std::env::var("AO_CONFIG_PATH"))
+        .unwrap_or_else(|_| format!("{operator_home}/agent-orchestrator.yaml"))
+}
+
+fn ao_controller_env(project: &str) -> Result<Vec<(String, String)>, String> {
+    let operator_home = operator_home()?;
+    let bridge_home = if std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go")
+        || matches!(probe_operator_ao_project(project, &operator_home), AoReadiness::Ready(_))
+    {
+        operator_home.clone()
+    } else {
+        let controller_home = ao_controller_home(project)?;
+        std::fs::create_dir_all(&controller_home).map_err(|error| {
+            format!(
+                "failed to create AO controller state home {}: {error}",
+                controller_home.display()
+            )
+        })?;
+        controller_home.to_string_lossy().into_owned()
+    };
+    let config_path = resolve_ao_config_path(&operator_home);
+
+    Ok(vec![
+        ("HOME".to_string(), bridge_home),
+        ("AO_ORIGINAL_HOME".to_string(), operator_home.clone()),
+        ("AO_CONFIG_PATH".to_string(), config_path),
+        (
+            "GH_CONFIG_DIR".to_string(),
+            std::env::var("GH_CONFIG_DIR")
+                .unwrap_or_else(|_| format!("{operator_home}/.config/gh")),
+        ),
+        (
+            "GIT_CONFIG_GLOBAL".to_string(),
+            std::env::var("GIT_CONFIG_GLOBAL")
+                .unwrap_or_else(|_| format!("{operator_home}/.gitconfig")),
+        ),
+        // Never let a factory-owned fallback silently select the personal
+        // default Claude profile. Explicit service configuration still wins.
+        (
+            "CLAUDE_CONFIG_DIR".to_string(),
+            std::env::var("DARK_FACTORY_CLAUDE_CONFIG_DIR")
+                .unwrap_or_else(|_| format!("{operator_home}/.claude-wa")),
+        ),
+    ])
+}
+
+fn apply_ao_controller_env(command: &mut Command, project: &str) -> Result<(), String> {
+    for (key, value) in ao_controller_env(project)? {
+        command.env(key, value);
+    }
+    Ok(())
+}
+
+fn run_ao_tool(project: &str, args: &[&str], timeout_secs: u64) -> Result<String, DaemonError> {
+    let values = ao_controller_env(project).map_err(DaemonError::Config)?;
+    let refs: Vec<(&str, &str)> = values
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    run_tool_with_env("ao", args, &refs, timeout_secs)
+}
+
+fn is_go_ao() -> bool {
+    std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go")
+}
+
+fn go_ao_db_path() -> Result<std::path::PathBuf, DaemonError> {
+    let data_dir = std::env::var("AO_DATA_DIR").map_err(|_| {
+        DaemonError::Config(
+            "AO_DATA_DIR is required for Go AO runtime database lookups; refusing HOME fallback"
+                .to_string(),
+        )
+    })?;
+    let data_dir = std::path::PathBuf::from(data_dir.trim());
+    if data_dir.as_os_str().is_empty() || !data_dir.is_absolute() || !data_dir.is_dir() {
+        return Err(DaemonError::Config(
+            "AO_DATA_DIR must be an existing absolute directory for Go AO runtime database lookups"
+                .to_string(),
+        ));
+    }
+    Ok(data_dir.join("ao.db"))
+}
+
+fn open_go_ao_db() -> Result<rusqlite::Connection, DaemonError> {
+    let db_path = go_ao_db_path()?;
+    rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| {
+        DaemonError::Config(format!(
+            "failed to open go ao db at {}: {e}",
+            db_path.display()
+        ))
+    })
+}
+
+fn go_ao_session_workspace_and_branch(
+    session_id: &str,
+) -> (Option<std::path::PathBuf>, Option<String>) {
+    let db_path = match go_ao_db_path() {
+        Ok(path) => path,
+        Err(_) => return (None, None),
+    };
+    let conn = match rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    ) {
+        Ok(c) => c,
+        Err(_) => return (None, None),
+    };
+    let mut stmt = match conn.prepare("SELECT workspace_path, branch FROM sessions WHERE id = ?1") {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    let mut rows = match stmt.query([session_id]) {
+        Ok(r) => r,
+        Err(_) => return (None, None),
+    };
+    if let Ok(Some(row)) = rows.next() {
+        let ws: Option<String> = row.get::<_, Option<String>>(0).ok().flatten();
+        let branch: Option<String> = row.get::<_, Option<String>>(1).ok().flatten();
+        (ws.map(std::path::PathBuf::from), branch)
+    } else {
+        (None, None)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GoAoScope {
+    server_start_ticks: u64,
+}
+
+fn required_go_scope() -> Result<(std::path::PathBuf, std::path::PathBuf, u16), DaemonError> {
+    let run_file = std::env::var("AO_RUN_FILE").map_err(|_| {
+        DaemonError::Config("AO_RUN_FILE is required for Go AO scope preflight".to_string())
+    })?;
+    let data_dir = std::env::var("AO_DATA_DIR").map_err(|_| {
+        DaemonError::Config("AO_DATA_DIR is required for Go AO scope preflight".to_string())
+    })?;
+    let port = std::env::var("AO_PORT").map_err(|_| {
+        DaemonError::Config("AO_PORT is required for Go AO scope preflight".to_string())
+    })?;
+    let run_file = std::path::PathBuf::from(run_file.trim());
+    let data_dir = std::path::PathBuf::from(data_dir.trim());
+    if !run_file.is_absolute() || !run_file.is_file() {
+        return Err(DaemonError::Config(
+            "AO_RUN_FILE must be an existing absolute file for Go AO scope preflight".to_string(),
+        ));
+    }
+    if !data_dir.is_absolute() || !data_dir.is_dir() {
+        return Err(DaemonError::Config(
+            "AO_DATA_DIR must be an existing absolute directory for Go AO scope preflight"
+                .to_string(),
+        ));
+    }
+    let port = port.trim().parse::<u16>().map_err(|_| {
+        DaemonError::Config("AO_PORT must be a valid port for Go AO scope preflight".to_string())
+    })?;
+    if port == 0 {
+        return Err(DaemonError::Config(
+            "AO_PORT must be in the range 1-65535 for Go AO scope preflight".to_string(),
+        ));
+    }
+    let run_file = run_file.canonicalize().map_err(|_| {
+        DaemonError::Config("AO_RUN_FILE could not be canonicalized for Go AO scope preflight".to_string())
+    })?;
+    let data_dir = data_dir.canonicalize().map_err(|_| {
+        DaemonError::Config("AO_DATA_DIR could not be canonicalized for Go AO scope preflight".to_string())
+    })?;
+    Ok((run_file, data_dir, port))
+}
+
+#[cfg(target_os = "linux")]
+fn process_environ(pid: u32) -> Result<HashMap<String, String>, DaemonError> {
+    let bytes = std::fs::read(format!("/proc/{pid}/environ")).map_err(|_| {
+        DaemonError::Config("could not read AO server process environment".to_string())
+    })?;
+    let mut env = HashMap::new();
+    for item in bytes.split(|byte| *byte == 0).filter(|item| !item.is_empty()) {
+        let Some(separator) = item.iter().position(|byte| *byte == b'=') else {
+            return Err(DaemonError::Config(
+                "AO server process environment was malformed".to_string(),
+            ));
+        };
+        let (key, value) = item.split_at(separator);
+        let value = &value[1..];
+        let key = std::str::from_utf8(key).map_err(|_| {
+            DaemonError::Config("AO server process environment was not UTF-8".to_string())
+        })?;
+        let value = std::str::from_utf8(value).map_err(|_| {
+            DaemonError::Config("AO server process environment was not UTF-8".to_string())
+        })?;
+        env.insert(key.to_string(), value.to_string());
+    }
+    Ok(env)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_go_server_listener(pid: u32, port: u16) -> Result<(), DaemonError> {
+    let fd_dir = std::fs::read_dir(format!("/proc/{pid}/fd")).map_err(|_| {
+        DaemonError::Config("could not inspect AO server file descriptors".to_string())
+    })?;
+    let mut owned_inodes = std::collections::HashSet::new();
+    for entry in fd_dir {
+        let entry = entry.map_err(|_| {
+            DaemonError::Config("could not inspect AO server file descriptors".to_string())
+        })?;
+        let target = std::fs::read_link(entry.path()).map_err(|_| {
+            DaemonError::Config("could not inspect AO server file descriptors".to_string())
+        })?;
+        let target = target.to_string_lossy();
+        if let Some(inode) = target.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']')) {
+            owned_inodes.insert(inode.to_string());
+        }
+    }
+    if owned_inodes.is_empty() {
+        return Err(DaemonError::Config(
+            "AO server PID owns no socket descriptors".to_string(),
+        ));
+    }
+    let tcp = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")).map_err(|_| {
+        DaemonError::Config("could not inspect AO server IPv4 listeners".to_string())
+    })?;
+    let expected_port = format!("{port:04X}");
+    for line in tcp.lines().skip(1) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() <= 9 || fields[3] != "0A" || fields[1].rsplit_once(':').map(|(_, p)| p) != Some(expected_port.as_str()) {
+            continue;
+        }
+        let local_address = fields[1].split(':').next().unwrap_or_default();
+        if !matches!(local_address, "0100007F" | "00000000") {
+            continue;
+        }
+        if owned_inodes.contains(fields[9]) {
+            return Ok(());
+        }
+    }
+    Err(DaemonError::Config(
+        "AO server PID does not own the expected loopback listener".to_string(),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_go_server_listener(_pid: u32, _port: u16) -> Result<(), DaemonError> {
+    Err(DaemonError::Config(
+        "Go AO production scope preflight requires Linux listener inspection".to_string(),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_environ(_pid: u32) -> Result<HashMap<String, String>, DaemonError> {
+    Err(DaemonError::Config(
+        "Go AO production scope preflight requires Linux /proc server inspection".to_string(),
+    ))
+}
+
+fn go_scope_env(scope: &(std::path::PathBuf, std::path::PathBuf, u16)) -> Vec<(String, String)> {
+    vec![
+        ("AO_RUN_FILE".to_string(), scope.0.display().to_string()),
+        ("AO_DATA_DIR".to_string(), scope.1.display().to_string()),
+        ("AO_PORT".to_string(), scope.2.to_string()),
+    ]
+}
+
+fn run_go_scope_query(
+    agent: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    label: &str,
+) -> Result<String, DaemonError> {
+    let provider = match agent.trim().to_ascii_lowercase().as_str() {
+        "agy" | "antigravity" => crate::account_scope::AiProvider::Antigravity,
+        "codex" => crate::account_scope::AiProvider::Codex,
+        "claude" | "claude-code" => crate::account_scope::AiProvider::Claude,
+        _ => {
+            return Err(DaemonError::Config(
+                "unsupported Go AO harness provider scope".to_string(),
+            ))
+        }
+    };
+    let refs: Vec<(&str, &str)> = env.iter().map(|(key, value)| (*key, *value)).collect();
+    // Preserve DaemonError::Config through this layer too (see matching
+    // comment in tools.rs::run_tool_with_cwd_scoped): a permanent
+    // misconfiguration from the scoped validators must stay non-transient
+    // all the way to dispatch, not get re-flattened into a retryable Tool
+    // error here.
+    crate::tools::run_scoped_tool_with_env(provider, "ao-go", args, None, &refs, 30).map_err(
+        |e| match e {
+            config @ DaemonError::Config(_) => config,
+            _ => DaemonError::Tool {
+                tool: format!("ao-go {label} preflight"),
+                rc: -1,
+                stderr: "scoped AO query failed".to_string(),
+            },
+        },
+    )
+}
+
+fn validate_go_server_scope(
+    run_file: &std::path::Path,
+    data_dir: &std::path::Path,
+    port: u16,
+    server_pid: u32,
+) -> Result<GoAoScope, DaemonError> {
+    let before = process_start_ticks(server_pid).ok_or_else(|| {
+        DaemonError::Config("AO server PID is not alive or has no stable start identity".to_string())
+    })?;
+    verify_go_server_listener(server_pid, port)?;
+    let environ = process_environ(server_pid)?;
+    let expected = [
+        ("AO_RUN_FILE", run_file.display().to_string()),
+        ("AO_DATA_DIR", data_dir.display().to_string()),
+        ("AO_PORT", port.to_string()),
+    ];
+    for (key, value) in expected {
+        if environ.get(key).map(String::as_str) != Some(value.as_str()) {
+            return Err(DaemonError::Config(format!(
+                "AO server scope mismatch for {key}"
+            )));
+        }
+    }
+    let after = process_start_ticks(server_pid);
+    if after != Some(before) {
+        return Err(DaemonError::Config(
+            "AO server exited or PID identity changed during scope preflight".to_string(),
+        ));
+    }
+    Ok(GoAoScope {
+        server_start_ticks: before,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedGoServerBinding {
+    run_file: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
+    port: u16,
+    pid: u32,
+    server_scope: GoAoScope,
+}
+
+fn validate_go_server_binding() -> Result<ValidatedGoServerBinding, DaemonError> {
+    if !cfg!(target_os = "linux") {
+        return Err(DaemonError::Config(
+            "Go AO production dispatch is supported only on Linux".to_string(),
+        ));
+    }
+    let (run_file, data_dir, port) = required_go_scope()?;
+    let runfile_bytes = std::fs::read(&run_file).map_err(|_| {
+        DaemonError::Config("AO_RUN_FILE could not be read for Go AO scope preflight".to_string())
+    })?;
+    let runfile: serde_json::Value = serde_json::from_slice(&runfile_bytes)
+        .map_err(|_| DaemonError::Parse("AO_RUN_FILE was not valid JSON".to_string()))?;
+    let pid = runfile
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|pid| *pid <= u64::from(u32::MAX))
+        .map(|pid| pid as u32)
+        .ok_or_else(|| DaemonError::Parse("AO_RUN_FILE has no valid PID".to_string()))?;
+    let runfile_port = runfile
+        .get("port")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|p| *p <= u64::from(u16::MAX))
+        .map(|p| p as u16)
+        .ok_or_else(|| DaemonError::Parse("AO_RUN_FILE has no valid port".to_string()))?;
+    if runfile_port != port {
+        return Err(DaemonError::Config(
+            "AO_RUN_FILE port does not match AO_PORT".to_string(),
+        ));
+    }
+    let server_scope = validate_go_server_scope(&run_file, &data_dir, port, pid)?;
+    Ok(ValidatedGoServerBinding {
+        run_file,
+        data_dir,
+        port,
+        pid,
+        server_scope,
+    })
+}
+
+fn nonempty_provider_conflict(env: &HashMap<String, String>, allowed: &[&str]) -> Option<&'static str> {
+    crate::account_scope::SCRUBBED_AUTH_VARS
+        .iter()
+        .copied()
+        .filter(|key| !allowed.contains(key))
+        .find(|key| env.get(*key).is_some_and(|value| !value.trim().is_empty()))
+}
+
+#[cfg(unix)]
+fn current_process_uid() -> u32 {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    unsafe { getuid() }
+}
+
+#[cfg(not(unix))]
+fn current_process_uid() -> u32 {
+    0
+}
+
+fn system_tmux() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("tmux");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    for candidate in [
+        "/opt/homebrew/bin/tmux",
+        "/usr/local/bin/tmux",
+        "/usr/bin/tmux",
+        "/bin/tmux",
+    ] {
+        let p = std::path::Path::new(candidate);
+        if p.is_file() {
+            return p.to_path_buf();
+        }
+    }
+    std::path::PathBuf::from("tmux")
+}
+
+fn private_tmux_default_socket(tmux_tmpdir: &std::path::Path) -> std::path::PathBuf {
+    tmux_tmpdir
+        .join(format!("tmux-{}", current_process_uid()))
+        .join("default")
+}
+
+fn query_existing_tmux_env(
+    tmux_tmpdir: &std::path::Path,
+) -> Result<Option<HashMap<String, String>>, DaemonError> {
+    let socket_path = private_tmux_default_socket(tmux_tmpdir);
+    let meta_before = match std::fs::symlink_metadata(&socket_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(DaemonError::Config(format!(
+                "failed to inspect private tmux socket path {}: {e}",
+                socket_path.display()
+            )));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::fs::MetadataExt;
+
+        if meta_before.file_type().is_socket() {
+            if meta_before.uid() != current_process_uid() {
+                return Err(DaemonError::Config(format!(
+                    "failed to query existing tmux socket {}: socket owned by foreign uid {}",
+                    socket_path.display(),
+                    meta_before.uid()
+                )));
+            }
+
+            match std::os::unix::net::UnixStream::connect(&socket_path) {
+                Ok(stream) => {
+                    drop(stream);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    let meta_after = match std::fs::symlink_metadata(&socket_path) {
+                        Ok(m) => m,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(None);
+                        }
+                        Err(e) => {
+                            return Err(DaemonError::Config(format!(
+                                "failed to verify private tmux socket path after liveness probe {}: {e}",
+                                socket_path.display()
+                            )));
+                        }
+                    };
+                    if !meta_after.file_type().is_socket()
+                        || meta_after.uid() != current_process_uid()
+                        || meta_after.ino() != meta_before.ino()
+                    {
+                        return Err(DaemonError::Config(format!(
+                            "failed to query existing tmux socket {}: socket inode changed concurrently during liveness probe",
+                            socket_path.display()
+                        )));
+                    }
+                    return Ok(None);
+                }
+                Err(e) => {
+                    return Err(DaemonError::Config(format!(
+                        "failed to query existing tmux socket {}: liveness probe error: {e}",
+                        socket_path.display()
+                    )));
+                }
+            }
+        }
+    }
+
+    let output = std::process::Command::new(system_tmux())
+        .arg("show-environment")
+        .arg("-g")
+        .env_clear()
+        .env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| {
+                "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin".to_string()
+            }),
+        )
+        .env("TMUX_TMPDIR", tmux_tmpdir)
+        .output()
+        .map_err(|e| {
+            DaemonError::Config(format!(
+                "failed to execute tmux to inspect existing socket {}: {e}",
+                socket_path.display()
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        let detail = if trimmed.is_empty() {
+            "tmux process exited with error".to_string()
+        } else {
+            trimmed.to_string()
+        };
+        return Err(DaemonError::Config(format!(
+            "failed to query existing tmux socket {} (exit status {:?}): {detail}",
+            socket_path.display(),
+            output.status.code()
+        )));
+    }
+
+    let text = std::str::from_utf8(&output.stdout).map_err(|_| {
+        DaemonError::Config(format!(
+            "existing tmux server at {} returned non-UTF-8 environment",
+            socket_path.display()
+        ))
+    })?;
+
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('-') {
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once('=') {
+            map.insert(k.trim().to_string(), v.to_string());
+        }
+    }
+    Ok(Some(map))
+}
+
+fn validate_go_tmux_scope(
+    agent: &str,
+    server_env: &HashMap<String, String>,
+    project_env: &HashMap<String, String>,
+    allowed: &[&str],
+    agy_intended: Option<&std::path::Path>,
+    is_gemini_api: bool,
+) -> Result<(), DaemonError> {
+    let raw_intended = std::env::var("TMUX_TMPDIR").map_err(|_| {
+        DaemonError::Config(
+            "intended TMUX_TMPDIR is absent or blank; Go AO requires an explicit private tmux directory".to_string(),
+        )
+    })?;
+    let raw_trimmed = raw_intended.trim();
+    if raw_trimmed.is_empty() {
+        return Err(DaemonError::Config(
+            "intended TMUX_TMPDIR is absent or blank; Go AO requires an explicit private tmux directory".to_string(),
+        ));
+    }
+    let intended_path = std::path::Path::new(raw_trimmed);
+    if !intended_path.is_absolute() {
+        return Err(DaemonError::Config(format!(
+            "intended TMUX_TMPDIR must be an absolute path: {}",
+            intended_path.display()
+        )));
+    }
+    if !intended_path.is_dir() {
+        return Err(DaemonError::Config(format!(
+            "intended TMUX_TMPDIR must be an existing directory: {}",
+            intended_path.display()
+        )));
+    }
+
+    let intended_canonical = intended_path.canonicalize().map_err(|e| {
+        DaemonError::Config(format!(
+            "failed to canonicalize intended TMUX_TMPDIR {}: {e}",
+            intended_path.display()
+        ))
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let meta = intended_canonical.metadata().map_err(|e| {
+            DaemonError::Config(format!(
+                "failed to read intended TMUX_TMPDIR metadata {}: {e}",
+                intended_canonical.display()
+            ))
+        })?;
+        let uid = meta.uid();
+        let current_uid = current_process_uid();
+        if uid != current_uid {
+            return Err(DaemonError::Config(format!(
+                "intended TMUX_TMPDIR is not owned by current process user (owner UID {uid} != current UID {current_uid})",
+            )));
+        }
+        let mode = meta.permissions().mode();
+        if (mode & 0o077) != 0 {
+            return Err(DaemonError::Config(format!(
+                "intended TMUX_TMPDIR has unsafe shared permissions {:o}; must be private owned 0700",
+                mode & 0o777
+            )));
+        }
+    }
+
+    if server_env.get("TMUX").is_some_and(|v| !v.trim().is_empty()) {
+        return Err(DaemonError::Config(
+            "Go AO server scope contains conflicting nonempty TMUX socket override".to_string(),
+        ));
+    }
+
+    if project_env.get("TMUX").is_some_and(|v| !v.trim().is_empty()) {
+        return Err(DaemonError::Config(
+            "Go AO project scope contains conflicting nonempty TMUX socket override".to_string(),
+        ));
+    }
+
+    let server_tmux_raw = server_env
+        .get("TMUX_TMPDIR")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            DaemonError::Config("Go AO server scope is missing TMUX_TMPDIR".to_string())
+        })?;
+    let server_tmux_path = std::path::Path::new(server_tmux_raw);
+    if !server_tmux_path.is_absolute() || !server_tmux_path.is_dir() {
+        return Err(DaemonError::Config(
+            "Go AO server scope TMUX_TMPDIR must be an existing absolute directory".to_string(),
+        ));
+    }
+    let server_tmux_canonical = server_tmux_path.canonicalize().map_err(|e| {
+        DaemonError::Config(format!(
+            "failed to canonicalize Go AO server scope TMUX_TMPDIR {}: {e}",
+            server_tmux_path.display()
+        ))
+    })?;
+    if server_tmux_canonical != intended_canonical {
+        return Err(DaemonError::Config(
+            "Go AO server scope TMUX_TMPDIR does not match intended daemon TMUX_TMPDIR".to_string(),
+        ));
+    }
+
+    if let Some(proj_tmux_raw) = project_env.get("TMUX_TMPDIR") {
+        let trimmed = proj_tmux_raw.trim();
+        if trimmed.is_empty() {
+            return Err(DaemonError::Config(
+                "Go AO project scope TMUX_TMPDIR cannot be empty".to_string(),
+            ));
+        }
+        let proj_tmux_path = std::path::Path::new(trimmed);
+        if !proj_tmux_path.is_absolute() || !proj_tmux_path.is_dir() {
+            return Err(DaemonError::Config(
+                "Go AO project scope TMUX_TMPDIR must be an existing absolute directory".to_string(),
+            ));
+        }
+        let proj_canonical = proj_tmux_path.canonicalize().map_err(|e| {
+            DaemonError::Config(format!(
+                "failed to canonicalize Go AO project scope TMUX_TMPDIR {}: {e}",
+                proj_tmux_path.display()
+            ))
+        })?;
+        if proj_canonical != intended_canonical {
+            return Err(DaemonError::Config(
+                "Go AO project scope TMUX_TMPDIR does not match server scope".to_string(),
+            ));
+        }
+    }
+
+    if let Some(tmux_env) = query_existing_tmux_env(&intended_canonical)? {
+        if let Some(key) = nonempty_provider_conflict(&tmux_env, allowed) {
+            return Err(DaemonError::Config(format!(
+                "Go AO tmux server scope contains conflicting nonempty variable {key}"
+            )));
+        }
+        let normalized = agent.trim().to_ascii_lowercase();
+        if normalized == "agy" || normalized == "antigravity" {
+            if let Some(tmux_home) = tmux_env.get("HOME").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                let intended_agy = agy_intended.ok_or_else(|| {
+                    DaemonError::Config("missing intended AGY profile home".to_string())
+                })?;
+                if std::path::Path::new(tmux_home).canonicalize().ok().as_deref() != Some(intended_agy) {
+                    return Err(DaemonError::Config(
+                        "Go AO tmux server scope HOME does not match intended daemon profile".to_string(),
+                    ));
+                }
+            }
+            if is_gemini_api {
+                let intended_gemini = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+                let intended_trimmed = intended_gemini.trim();
+                if let Some(tmux_gemini) = tmux_env.get("GEMINI_API_KEY").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                    if tmux_gemini != intended_trimmed {
+                        return Err(DaemonError::Config(
+                            "Go AO tmux server scope GEMINI_API_KEY does not match intended daemon key".to_string(),
+                        ));
+                    }
+                }
+            }
+            if let Some(codex_val) = server_env.get("CODEX_HOME").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                if let Some(tmux_codex) = tmux_env.get("CODEX_HOME").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                    if tmux_codex != codex_val {
+                        return Err(DaemonError::Config(
+                            "Go AO tmux server scope CODEX_HOME does not match server scope".to_string(),
+                        ));
+                    }
+                }
+            }
+            if let Some(claude_val) = server_env.get("CLAUDE_CONFIG_DIR").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                if let Some(tmux_claude) = tmux_env.get("CLAUDE_CONFIG_DIR").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                    if tmux_claude != claude_val {
+                        return Err(DaemonError::Config(
+                            "Go AO tmux server scope CLAUDE_CONFIG_DIR does not match server scope".to_string(),
+                        ));
+                    }
+                }
+            }
+        } else if allowed == ["CODEX_HOME"] {
+            if let Some(codex_val) = server_env.get("CODEX_HOME").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                if let Some(tmux_codex) = tmux_env.get("CODEX_HOME").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                    if tmux_codex != codex_val {
+                        return Err(DaemonError::Config(
+                            "Go AO tmux server scope CODEX_HOME does not match server scope".to_string(),
+                        ));
+                    }
+                }
+            }
+        } else {
+            if let Some(claude_val) = server_env.get("CLAUDE_CONFIG_DIR").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                if let Some(tmux_claude) = tmux_env.get("CLAUDE_CONFIG_DIR").map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                    if tmux_claude != claude_val {
+                        return Err(DaemonError::Config(
+                            "Go AO tmux server scope CLAUDE_CONFIG_DIR does not match server scope".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_go_provider_scope(
+    agent: &str,
+    server_env: &HashMap<String, String>,
+    project_env: &HashMap<String, String>,
+) -> Result<(), DaemonError> {
+    let mut effective = server_env.clone();
+    for (key, value) in project_env {
+        effective.insert(key.clone(), value.clone());
+    }
+    let normalized = agent.trim().to_ascii_lowercase();
+    let (is_gemini_api, agy_intended) = if normalized == "agy" || normalized == "antigravity" {
+        let intended = crate::account_scope::validate_agy_home()?;
+        let is_api = crate::account_scope::validate_agy_settings(&intended)?;
+        (is_api, Some(intended))
+    } else {
+        (false, None)
+    };
+    let allowed: &[&str] = match normalized.as_str() {
+        "agy" | "antigravity" if is_gemini_api => {
+            &["HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "GEMINI_API_KEY"]
+        }
+        "agy" | "antigravity" => &["HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"],
+        "codex" => &["CODEX_HOME"],
+        "claude" | "claude-code" => &["CLAUDE_CONFIG_DIR"],
+        _ => {
+            return Err(DaemonError::Config(
+                "unsupported Go AO harness provider scope".to_string(),
+            ))
+        }
+    };
+    if let Some(key) = nonempty_provider_conflict(server_env, allowed) {
+        return Err(DaemonError::Config(format!(
+            "Go AO server provider scope contains conflicting nonempty variable {key}"
+        )));
+    }
+    if let Some(key) = nonempty_provider_conflict(&effective, allowed) {
+        return Err(DaemonError::Config(format!(
+            "Go AO provider scope contains conflicting nonempty variable {key}"
+        )));
+    }
+    validate_go_tmux_scope(
+        agent,
+        server_env,
+        project_env,
+        allowed,
+        agy_intended.as_deref(),
+        is_gemini_api,
+    )?;
+    if normalized == "agy" || normalized == "antigravity" {
+        let value = effective
+            .get("HOME")
+            .map(|value| value.trim())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| DaemonError::Config("Go AO provider scope is missing HOME".to_string()))?;
+        let path = std::path::Path::new(value);
+        if !path.is_absolute() || !path.is_dir() {
+            return Err(DaemonError::Config(
+                "Go AO provider scope HOME must be an existing absolute directory".to_string(),
+            ));
+        }
+        let server_value = server_env
+            .get("HOME")
+            .map(|value| value.trim())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| DaemonError::Config("Go AO server scope is missing HOME".to_string()))?;
+        if server_value != value {
+            return Err(DaemonError::Config(
+                "Go AO project provider scope HOME does not match server scope".to_string(),
+            ));
+        }
+        let intended = agy_intended.unwrap();
+        if std::path::Path::new(value).canonicalize().ok().as_deref() != Some(intended.as_path()) {
+            return Err(DaemonError::Config(
+                "Go AO provider scope HOME does not match intended daemon profile".to_string(),
+            ));
+        }
+        if is_gemini_api {
+            let intended_gemini = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+            let intended_trimmed = intended_gemini.trim();
+            if intended_trimmed.is_empty() {
+                return Err(DaemonError::Config(
+                    "Go AO provider scope is missing nonblank intended GEMINI_API_KEY for explicit gemini modelProvider".to_string(),
+                ));
+            }
+            let effective_gemini = effective
+                .get("GEMINI_API_KEY")
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty());
+            if effective_gemini.is_none() {
+                return Err(DaemonError::Config(
+                    "Go AO provider scope is missing GEMINI_API_KEY for explicit gemini modelProvider".to_string(),
+                ));
+            }
+            let server_gemini = server_env
+                .get("GEMINI_API_KEY")
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty());
+            if server_gemini.is_none() {
+                return Err(DaemonError::Config(
+                    "Go AO server scope is missing GEMINI_API_KEY for explicit gemini modelProvider".to_string(),
+                ));
+            }
+            if server_gemini != effective_gemini {
+                return Err(DaemonError::Config(
+                    "Go AO project provider scope GEMINI_API_KEY does not match server scope".to_string(),
+                ));
+            }
+            if effective_gemini != Some(intended_trimmed) {
+                return Err(DaemonError::Config(
+                    "Go AO provider scope GEMINI_API_KEY does not match intended daemon key".to_string(),
+                ));
+            }
+        }
+        if let Some(codex_val) = effective
+            .get("CODEX_HOME")
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        {
+            let server_codex = server_env
+                .get("CODEX_HOME")
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty());
+            if server_codex != Some(codex_val) {
+                return Err(DaemonError::Config(
+                    "Go AO project provider scope CODEX_HOME does not match server scope".to_string(),
+                ));
+            }
+            if std::env::var_os("CODEX_HOME").is_some() {
+                let intended_codex = crate::account_scope::validate_codex_home().map_err(|_| {
+                    DaemonError::Config("intended CODEX_HOME profile is missing or invalid".to_string())
+                })?;
+                if std::path::Path::new(codex_val).canonicalize().ok().as_deref()
+                    != Some(intended_codex.as_path())
+                {
+                    return Err(DaemonError::Config(
+                        "Go AO provider scope CODEX_HOME does not match intended daemon profile"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        if let Some(claude_val) = effective
+            .get("CLAUDE_CONFIG_DIR")
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        {
+            let server_claude = server_env
+                .get("CLAUDE_CONFIG_DIR")
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty());
+            if server_claude != Some(claude_val) {
+                return Err(DaemonError::Config(
+                    "Go AO project provider scope CLAUDE_CONFIG_DIR does not match server scope"
+                        .to_string(),
+                ));
+            }
+            if std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR").is_some() {
+                let intended_claude =
+                    crate::account_scope::validate_claude_config_dir().map_err(|_| {
+                        DaemonError::Config(
+                            "intended DARK_FACTORY_CLAUDE_CONFIG_DIR profile is missing or invalid"
+                                .to_string(),
+                        )
+                    })?;
+                if std::path::Path::new(claude_val).canonicalize().ok().as_deref()
+                    != Some(intended_claude.as_path())
+                {
+                    return Err(DaemonError::Config(
+                        "Go AO provider scope CLAUDE_CONFIG_DIR does not match intended daemon profile"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        return Ok(());
+    }
+    let required = if allowed == ["CODEX_HOME"] {
+        "CODEX_HOME"
+    } else {
+        "CLAUDE_CONFIG_DIR"
+    };
+    let value = effective.get(required).map(|value| value.trim()).filter(|v| !v.is_empty()).ok_or_else(|| {
+        DaemonError::Config(format!("Go AO provider scope is missing {required}"))
+    })?;
+    let path = std::path::Path::new(value);
+    if !path.is_absolute() || !path.is_dir() {
+        return Err(DaemonError::Config(format!(
+            "Go AO provider scope {required} must be an existing absolute directory"
+        )));
+    }
+    let server_value = server_env.get(required).map(|value| value.trim()).filter(|v| !v.is_empty()).ok_or_else(|| {
+        DaemonError::Config(format!("Go AO server scope is missing {required}"))
+    })?;
+    if server_value != value {
+        return Err(DaemonError::Config(format!(
+            "Go AO project provider scope {required} does not match server scope"
+        )));
+    }
+    let intended = if required == "CODEX_HOME" {
+        crate::account_scope::validate_codex_home().map_err(|_| {
+            DaemonError::Config("intended CODEX_HOME profile is missing or invalid".to_string())
+        })?
+    } else {
+        crate::account_scope::validate_claude_config_dir().map_err(|_| {
+            DaemonError::Config(
+                "intended DARK_FACTORY_CLAUDE_CONFIG_DIR profile is missing or invalid".to_string(),
+            )
+        })?
+    };
+    if std::path::Path::new(value).canonicalize().ok().as_deref() != Some(intended.as_path()) {
+        return Err(DaemonError::Config(format!(
+            "Go AO provider scope {required} does not match intended daemon profile"
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_go_source_ref(
+    path: &std::path::Path,
+    branch: &str,
+    default_branch: &str,
+    expected_revision: &str,
+) -> Result<(), DaemonError> {
+    if branch.trim().is_empty() || default_branch.trim().is_empty() || expected_revision.trim().is_empty() {
+        return Err(DaemonError::Config(
+            "Go AO source ref preflight requires branch, defaultBranch, and expected revision"
+                .to_string(),
+        ));
+    }
+    run_tool_in_dir("git", &["check-ref-format", "--branch", branch], &path.to_string_lossy(), 30)?;
+    // Match upstream gitworktree.addWorktree/baseRefCandidates, including
+    // short-ref disambiguation. The first existing ref is authoritative.
+    let mut candidates = vec![
+        format!("refs/heads/{branch}"),
+        format!("origin/{branch}"),
+    ];
+    if default_branch.contains('/') {
+        candidates.push(default_branch.to_string());
+    } else {
+        candidates.push(format!("origin/{default_branch}"));
+        candidates.push(format!("refs/heads/{default_branch}"));
+    }
+    candidates.push(branch.to_string());
+    candidates.push(format!("refs/tags/{branch}"));
+    for reference in candidates {
+        let output = Command::new("git")
+            .args(["-C", &path.to_string_lossy(), "rev-parse", "--verify", "--quiet", "--end-of-options", &reference])
+            .output()
+            .map_err(|error| DaemonError::Tool { tool: "git source ref preflight".to_string(), rc: -1, stderr: error.to_string() })?;
+        if output.status.success() {
+            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if value.len() == 40 && value.eq_ignore_ascii_case(expected_revision) {
+                return Ok(());
+            }
+            return Err(DaemonError::Config(
+                "Go AO source ref does not match expected revision".to_string(),
+            ));
+        } else if output.status.code() != Some(1) {
+            return Err(DaemonError::Config(
+                "git source ref lookup failed; refusing fallback to another ref".to_string(),
+            ));
+        }
+    }
+    Err(DaemonError::Config(
+        "Go AO source branch/ref is absent or cannot be pinned to expected revision".to_string(),
+    ))
+}
+
+fn validate_go_ao_preflight(agent: &str, spec: &SpawnSpec) -> Result<(), DaemonError> {
+    let binding = validate_go_server_binding()?;
+
+    let env = [
+        ("AO_RUN_FILE", binding.run_file.display().to_string()),
+        ("AO_DATA_DIR", binding.data_dir.display().to_string()),
+        ("AO_PORT", binding.port.to_string()),
+    ];
+    let refs: Vec<(&str, &str)> = env.iter().map(|(key, value)| (*key, value.as_str())).collect();
+    let status_output = run_go_scope_query(agent, &["status", "--json"], &refs, "status")?;
+    let status: serde_json::Value = serde_json::from_str(status_output.trim()).map_err(|_| DaemonError::Parse("ao-go status returned malformed JSON".to_string()))?;
+    if status.get("state").and_then(serde_json::Value::as_str) != Some("ready")
+        || status.get("pid").and_then(serde_json::Value::as_u64) != Some(binding.pid as u64)
+        || status.get("port").and_then(serde_json::Value::as_u64) != Some(binding.port as u64)
+        || status.get("runFile").and_then(serde_json::Value::as_str) != Some(binding.run_file.to_str().unwrap_or_default())
+        || status.get("dataDir").and_then(serde_json::Value::as_str) != Some(binding.data_dir.to_str().unwrap_or_default())
+    {
+        return Err(DaemonError::Config("ao-go status did not prove the intended server scope".to_string()));
+    }
+    if process_start_ticks(binding.pid) != Some(binding.server_scope.server_start_ticks) {
+        return Err(DaemonError::Config("AO server identity changed during status preflight".to_string()));
+    }
+
+    let project_output = run_go_scope_query(
+        agent,
+        &["project", "get", &spec.ao_project, "--json"],
+        &refs,
+        "project",
+    )?;
+    let project: serde_json::Value = serde_json::from_str(project_output.trim()).map_err(|_| DaemonError::Parse("ao-go project get returned malformed JSON".to_string()))?;
+    let details = project.get("project").ok_or_else(|| DaemonError::Parse("ao-go project response lacked project details".to_string()))?;
+    if details.get("id").and_then(serde_json::Value::as_str) != Some(spec.ao_project.as_str()) {
+        return Err(DaemonError::Config("ao-go project identity did not match requested project".to_string()));
+    }
+    let source = details.get("path").and_then(serde_json::Value::as_str).ok_or_else(|| DaemonError::Parse("ao-go project path was missing".to_string()))?;
+    let source = std::path::PathBuf::from(source);
+    if !source.is_absolute() || !source.is_dir() {
+        return Err(DaemonError::Config("ao-go project path must be an existing absolute directory".to_string()));
+    }
+    let origin = run_tool_in_dir("git", &["remote", "get-url", "origin"], &source.to_string_lossy(), 30)
+        .map_err(|_| DaemonError::Config("could not inspect AO project origin".to_string()))?;
+    if crate::tools::remote_url_matches_repo(&origin, &spec.repo) != Some(true) {
+        return Err(DaemonError::Config("ao-go project origin did not match target repository".to_string()));
+    }
+    let configured_repo = details.get("repo").and_then(serde_json::Value::as_str).ok_or_else(|| DaemonError::Parse("ao-go project repo was missing".to_string()))?;
+    if crate::tools::remote_url_matches_repo(configured_repo, &spec.repo) != Some(true) {
+        return Err(DaemonError::Config("ao-go project repo did not match target repository".to_string()));
+    }
+    let default_branch = details.get("defaultBranch").and_then(serde_json::Value::as_str).ok_or_else(|| DaemonError::Parse("ao-go project defaultBranch was missing".to_string()))?;
+    let project_env = match details.get("config") {
+        None => HashMap::new(),
+        Some(config) => {
+            let config = config.as_object().ok_or_else(|| {
+                DaemonError::Parse("ao-go project config was malformed".to_string())
+            })?;
+            match config.get("env") {
+                None => HashMap::new(),
+                Some(value) => {
+                    let map = value.as_object().ok_or_else(|| {
+                        DaemonError::Parse("ao-go project config.env was malformed".to_string())
+                    })?;
+                    let mut env = HashMap::new();
+                    for (key, value) in map {
+                        let value = value.as_str().ok_or_else(|| {
+                            DaemonError::Parse("ao-go project config.env contained a non-string value".to_string())
+                        })?;
+                        env.insert(key.clone(), value.to_string());
+                    }
+                    env
+                }
+            }
+        }
+    };
+    let server_env = process_environ(binding.pid)?;
+    validate_go_provider_scope(agent, &server_env, &project_env)?;
+    resolve_go_source_ref(&source, &spec.branch, default_branch, spec.expected_revision.as_deref().ok_or_else(|| DaemonError::Config("Go AO spawn requires an expected revision".to_string()))?)?;
+    if process_start_ticks(binding.pid) != Some(binding.server_scope.server_start_ticks) {
+        return Err(DaemonError::Config(
+            "AO server identity changed during scope preflight".to_string(),
+        ));
+    }
+    verify_go_server_listener(binding.pid, binding.port)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 2 is parenthesized and may contain spaces. Everything after its
+    // final ')' begins at field 3, so starttime (field 22) is index 19 there.
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn process_start_identity_from_ps(output: &[u8]) -> Option<u64> {
+    let value = std::str::from_utf8(output).ok()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // Stable FNV-1a over `ps -o lstart=` output. Unlike a process PID alone,
+    // the start-time identity detects PID reuse; unlike DefaultHasher, this
+    // value remains stable across daemon processes and Rust releases.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some(hash)
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let output = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| process_start_identity_from_ps(&output.stdout))
+        .flatten()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_start_ticks(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Returns the process's actual start time as Unix epoch seconds. Unlike
+/// `process_start_ticks` (an opaque per-platform tick/hash value), this is
+/// directly comparable to a self-reported wall-clock timestamp -- used by
+/// `probe_operator_ao_project` to cross-check `running.json`'s `startedAt`
+/// field and reject a PID that has since been silently reused by an
+/// unrelated process (live-verified gap, PR #839 review).
+#[cfg(target_os = "linux")]
+fn process_start_epoch_secs(pid: u32) -> Option<i64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let starttime_ticks: i64 = stat.rsplit_once(") ")?.1.split_whitespace().nth(19)?.parse().ok()?;
+    let uptime_stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let btime: i64 = uptime_stat
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    // sysconf(_SC_CLK_TCK) has been 100 on every mainstream Linux
+    // distribution since the 2.6 kernel era; avoiding an FFI sysconf() call
+    // for a constant that has not varied in over a decade.
+    const CLOCK_TICKS_PER_SEC: i64 = 100;
+    Some(btime + starttime_ticks / CLOCK_TICKS_PER_SEC)
+}
+
+/// Parses macOS `ps -o etime=` output -- `[[dd-]hh:]mm:ss` -- into total
+/// seconds. macOS `ps` has no `etimes=` (raw-seconds) keyword, unlike Linux,
+/// so the formatted form has to be parsed.
+#[cfg(target_os = "macos")]
+fn parse_macos_etime_secs(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let (days, rest) = match value.split_once('-') {
+        Some((d, rest)) => (d.parse::<i64>().ok()?, rest),
+        None => (0, value),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [h, m, s] => (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?, s.parse::<i64>().ok()?),
+        [m, s] => (0, m.parse::<i64>().ok()?, s.parse::<i64>().ok()?),
+        _ => return None,
+    };
+    Some(((days * 24 + hours) * 60 + minutes) * 60 + seconds)
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_epoch_secs(pid: u32) -> Option<i64> {
+    let output = Command::new("ps")
+        .args(["-o", "etime=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let elapsed_secs = parse_macos_etime_secs(std::str::from_utf8(&output.stdout).ok()?)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some(now - elapsed_secs)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_start_epoch_secs(_pid: u32) -> Option<i64> {
+    None
+}
+
+/// Parses AO's `new Date().toISOString()` output (e.g.
+/// `"2026-09-06T12:10:23.191Z"`) into Unix epoch seconds. Deliberately
+/// narrow -- this is not a general RFC3339 parser, only the exact fixed
+/// shape `running-state.ts` is known to emit, so anything else fails
+/// closed. Uses the standard days-from-civil-date algorithm (Howard
+/// Hinnant's `days_from_civil`) rather than pulling in a date/time crate
+/// for one narrow conversion.
+fn parse_ao_started_at_epoch(value: &str) -> Option<i64> {
+    let value = value.strip_suffix('Z')?;
+    let (date, time) = value.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: i64 = date_parts.next()?.parse().ok()?;
+    let day: i64 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    let time = time.split('.').next().unwrap_or(time);
+    let mut time_parts = time.split(':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next()?.parse().ok()?;
+    let second: i64 = time_parts.next()?.parse().ok()?;
+    if time_parts.next().is_some() {
+        return None;
+    }
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..24).contains(&hour)
+        || !(0..60).contains(&minute)
+        || !(0..60).contains(&second)
+    {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days_since_epoch = era * 146097 + doe - 719468;
+    Some(days_since_epoch * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+fn acquire_ao_recovery_file_lock(project: &str) -> Result<AoRecoveryFileLock, String> {
+    use std::os::fd::AsRawFd;
+    use std::io::Write;
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    let home = ao_controller_home(project)?;
+    std::fs::create_dir_all(&home)
+        .map_err(|error| format!("failed to create {}: {error}", home.display()))?;
+    let path = home.join("recovery.lock");
+    let pid = std::process::id();
+    let start_ticks = process_start_ticks(pid).ok_or_else(|| {
+        format!("could not read recovery owner process start time for pid {pid}")
+    })?;
+    let token = serde_json::to_vec(&serde_json::json!({
+        "pid": pid,
+        "process_start_ticks": start_ticks,
+        "project": project,
+    }))
+    .map_err(|error| error.to_string())?;
+    let deadline = Instant::now()
+        + recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_LOCK_TIMEOUT_MS", 20_000);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    loop {
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+            file.set_len(0)
+                .and_then(|_| file.write_all(&token))
+                .and_then(|_| file.sync_all())
+                .map_err(|error| format!("failed to initialize {}: {error}", path.display()))?;
+            return Ok(AoRecoveryFileLock { _file: file });
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(error.kind(), std::io::ErrorKind::WouldBlock) {
+            return Err(format!("failed to lock {}: {error}", path.display()));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for AO recovery election lock {}",
+                path.display()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn controller_manifest_path(project: &str) -> Result<std::path::PathBuf, String> {
+    Ok(ao_controller_home(project)?.join("controller.json"))
+}
+
+fn write_controller_manifest(
+    project: &str,
+    target: &str,
+    child: &std::process::Child,
+) -> Result<(), String> {
+    let path = controller_manifest_path(project)?;
+    let start_ticks = process_start_ticks(child.id())
+        .ok_or_else(|| format!("could not read process start time for AO pid {}", child.id()))?;
+    let manifest = AoControllerManifest {
+        pid: child.id(),
+        process_start_ticks: start_ticks,
+        project: project.to_string(),
+        target: target.to_string(),
+    };
+    let temp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    std::fs::write(
+        &temp,
+        serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("failed to write {}: {error}", temp.display()))?;
+    std::fs::rename(&temp, &path)
+        .map_err(|error| format!("failed to install {}: {error}", path.display()))
+}
+
+fn read_controller_manifest(project: &str) -> Result<Option<AoControllerManifest>, String> {
+    let path = controller_manifest_path(project)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("invalid {}: {error}", path.display()))
+}
+
+fn validate_controller_manifest_project(
+    manifest: &AoControllerManifest,
+    project: &str,
+) -> Result<(), String> {
+    if manifest.project == project {
+        Ok(())
+    } else {
+        Err(format!(
+            "AO controller manifest project {:?} does not match requested project {project:?}; refusing to signal or remove it",
+            manifest.project
+        ))
+    }
+}
+
+/// True iff a healthy AO instance is ALREADY polling `project` under the
+/// operator's real, shared `$HOME` -- e.g. a long-lived operator-run `ao
+/// start` that predates this daemon and serves multiple projects (worked
+/// example on jeff-ubuntu 2026-09-06: one `agent-orchestrator-ts` process
+/// polling `my-project`, `worldarchitect`, and `dark-factory` at once).
+/// Unlike `probe_ao_project`, this has no daemon-owned controller manifest to
+/// cross-check a PID against -- the operator's `ao start` is not a process
+/// this daemon spawned or tracks.
+///
+/// PID-alive alone is not identity: a PID recorded in a stale `running.json`
+/// (AO crashed without cleanup) can be reused by an unrelated live process.
+/// An earlier version of this check tried to compensate with a command-line
+/// substring match (`"agent-orchestrator"`), but that is itself unreliable --
+/// an ordinary install, an alternate package layout, or the project's
+/// canonical Go AO binary need not contain that literal string in argv,
+/// which would wrongly reject a genuinely healthy instance and reproduce the
+/// exact "AO is not running" outage this function exists to prevent
+/// (independent finding from both a CodeRabbit review and a GitHub Codex
+/// review on PR #839). Instead, bind identity to `running.json`'s own
+/// `configPath` field: it must match the exact AO config this daemon itself
+/// resolves for this project (`resolve_ao_config_path`). An unrelated
+/// process reusing the PID would need to also have written a `running.json`
+/// declaring our specific config path to pass this check, which is not
+/// something PID reuse can produce by accident -- and a differently-shaped
+/// AO binary is trivially recognized because the check has nothing to do
+/// with argv.
+fn probe_operator_ao_project(project: &str, operator_home: &str) -> AoReadiness {
+    let running_path =
+        std::path::Path::new(operator_home).join(".agent-orchestrator/running.json");
+    let running: serde_json::Value = match std::fs::read(&running_path)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+    {
+        Ok(value) => value,
+        Err(_) => return AoReadiness::Unavailable,
+    };
+    let Some(pid) = running.get("pid").and_then(serde_json::Value::as_u64) else {
+        return AoReadiness::Unavailable;
+    };
+    if pid > u64::from(u32::MAX) || process_start_ticks(pid as u32).is_none() {
+        return AoReadiness::Unavailable;
+    }
+    let expected_config_path = resolve_ao_config_path(operator_home);
+    if running.get("configPath").and_then(serde_json::Value::as_str) != Some(expected_config_path.as_str())
+    {
+        return AoReadiness::Unavailable;
+    }
+    // configPath alone does not defend against PID reuse: a `running.json`
+    // that AO wrote before crashing (without cleanup) still declares the
+    // correct configPath verbatim, so a later, unrelated process that
+    // happens to receive the same recycled PID would otherwise pass every
+    // check above. Cross-check the PID's ACTUAL start time against AO's own
+    // self-reported `startedAt` -- a process that took over a recycled PID
+    // necessarily started strictly after the original one exited, which is
+    // strictly after `startedAt`, so a mismatch beyond measurement slop
+    // means this is not the process that wrote this file (live-verified gap
+    // in prior revisions of this function, PR #839 review).
+    let Some(claimed_started_at) = running
+        .get("startedAt")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_ao_started_at_epoch)
+    else {
+        return AoReadiness::Unavailable;
+    };
+    let Some(actual_started_at) = process_start_epoch_secs(pid as u32) else {
+        return AoReadiness::Unavailable;
+    };
+    const START_TIME_TOLERANCE_SECS: i64 = 120;
+    if (actual_started_at - claimed_started_at).abs() > START_TIME_TOLERANCE_SECS {
+        return AoReadiness::Unavailable;
+    }
+    let has_project = running
+        .get("projects")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|projects| projects.iter().any(|value| value.as_str() == Some(project)));
+    if has_project {
+        AoReadiness::Ready(format!(
+            "operator AO instance pid={pid} already polling project={project}"
+        ))
+    } else {
+        AoReadiness::Unavailable
+    }
+}
+
+fn probe_ao_project(project: &str) -> AoReadiness {
+    let manifest = match read_controller_manifest(project) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return AoReadiness::Unavailable,
+        Err(error) => return AoReadiness::Unknown(error),
+    };
+    if manifest.project != project
+        || process_start_ticks(manifest.pid) != Some(manifest.process_start_ticks)
+    {
+        return AoReadiness::Unavailable;
+    }
+    let running_path = match ao_controller_home(project) {
+        Ok(home) => home.join(".agent-orchestrator/running.json"),
+        Err(error) => return AoReadiness::Unknown(error),
+    };
+    let running: serde_json::Value = match std::fs::read(&running_path)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+    {
+        Ok(value) => value,
+        Err(_) => return AoReadiness::Unavailable,
+    };
+    let same_pid = running.get("pid").and_then(serde_json::Value::as_u64)
+        == Some(manifest.pid as u64);
+    let has_project = running
+        .get("projects")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|projects| projects.iter().any(|value| value.as_str() == Some(project)));
+    if same_pid && has_project {
+        AoReadiness::Ready(format!(
+            "project={project} controller_pid={} start_ticks={}",
+            manifest.pid, manifest.process_start_ticks
+        ))
+    } else {
+        AoReadiness::Unavailable
+    }
+}
+
+#[cfg(unix)]
+fn kill_controller_scope(child: &mut std::process::Child) {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // The child is placed in its own process group below, so a negative pid
+    // reaps only the startup scope owned by this recovery attempt.
+    unsafe {
+        let _ = kill(-(child.id() as i32), 9);
+    }
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn reap_owned_controller(project: &str) -> Result<(), String> {
+    let Some(manifest) = read_controller_manifest(project)? else {
+        return Ok(());
+    };
+    validate_controller_manifest_project(&manifest, project)?;
+    if process_start_ticks(manifest.pid) == Some(manifest.process_start_ticks) {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        unsafe {
+            let _ = kill(-(manifest.pid as i32), 15);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_start_ticks(manifest.pid) == Some(manifest.process_start_ticks)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if process_start_ticks(manifest.pid) == Some(manifest.process_start_ticks) {
+            unsafe {
+                let _ = kill(-(manifest.pid as i32), 9);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(controller_manifest_path(project)?);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reap_owned_controller(project: &str) -> Result<(), String> {
+    let Some(manifest) = read_controller_manifest(project)? else {
+        return Ok(());
+    };
+    validate_controller_manifest_project(&manifest, project)?;
+    let _ = std::fs::remove_file(controller_manifest_path(project)?);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn kill_controller_scope(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Ensure AO is persistently polling `project`, without touching a shared AO
+/// instance. The elected caller starts one detached, factory-owned controller
+/// and polls a project-scoped ready condition for a bounded interval.
+fn ensure_ao_recovery_for_target(project: &str, target: &str) -> RecoveryOutcome {
+    // A shared operator instance already polling this project makes the rest
+    // of this function actively harmful to invoke: its `ao start` would
+    // detect that live session, print "reused existing session", and exit
+    // immediately without ever satisfying `probe_ao_project`'s private-HOME
+    // readiness check below -- burning the recovery cooldown on a doomed
+    // attempt every cycle. Check first and skip the private sandbox entirely.
+    if let Ok(home) = operator_home() {
+        if let AoReadiness::Ready(evidence) = probe_operator_ao_project(project, &home) {
+            return RecoveryOutcome::Healthy { evidence };
+        }
+    }
+    let slot = ao_recovery_slot(project);
+    let mut slot = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _election = match acquire_ao_recovery_file_lock(project) {
+        Ok(lock) => lock,
+        Err(error) => return RecoveryOutcome::FailClosed { error },
+    };
+
+    match probe_ao_project(project) {
+        AoReadiness::Ready(evidence) => return RecoveryOutcome::Healthy { evidence },
+        AoReadiness::Unknown(error) => return RecoveryOutcome::Unknown { error },
+        AoReadiness::Unavailable => {}
+    }
+
+    let cooldown = recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_COOLDOWN_MS", 30_000);
+    if slot
+        .last_failed_attempt
+        .is_some_and(|last| last.elapsed() < cooldown)
+    {
+        return RecoveryOutcome::FailClosed {
+            error: format!(
+                "AO controller recovery for project {project} is in its cooldown window"
+            ),
+        };
+    }
+
+
+    if let Err(error) = reap_owned_controller(project) {
+        slot.last_failed_attempt = Some(Instant::now());
+        return RecoveryOutcome::Unknown { error };
+    }
+
+    let mut command = Command::new("ao");
+    command
+        .args(["start", target, "--no-dashboard", "--no-open"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Err(error) = apply_ao_controller_env(&mut command, project) {
+        slot.last_failed_attempt = Some(Instant::now());
+        return RecoveryOutcome::Unknown { error };
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            slot.last_failed_attempt = Some(Instant::now());
+            return RecoveryOutcome::Unknown {
+                error: format!("ao start execution failed: {error}"),
+            };
+        }
+    };
+    if let Err(error) = write_controller_manifest(project, target, &child) {
+        kill_controller_scope(&mut child);
+        slot.last_failed_attempt = Some(Instant::now());
+        return RecoveryOutcome::Unknown { error };
+    }
+
+    let timeout = recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_TIMEOUT_MS", 15_000);
+    let poll = recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_POLL_MS", 250);
+    let sustain = recovery_duration_ms("DARK_FACTORY_AO_RECOVERY_SUSTAIN_MS", 1_000);
+    let deadline = Instant::now() + timeout;
+    loop {
+        match probe_ao_project(project) {
+            AoReadiness::Ready(evidence) => {
+                // Require the PID/start-time/project binding to survive a
+                // sustain interval so a one-sample startup flash cannot
+                // release dispatch.
+                std::thread::sleep(sustain);
+                if matches!(probe_ao_project(project), AoReadiness::Ready(_)) {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    slot.last_failed_attempt = None;
+                    return RecoveryOutcome::Restarted { evidence };
+                }
+            }
+            AoReadiness::Unknown(error) => {
+                kill_controller_scope(&mut child);
+                let _ = std::fs::remove_file(controller_manifest_path(project).unwrap_or_default());
+                slot.last_failed_attempt = Some(Instant::now());
+                return RecoveryOutcome::Unknown { error };
+            }
+            AoReadiness::Unavailable => {}
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                slot.last_failed_attempt = Some(Instant::now());
+                return RecoveryOutcome::FailClosed {
+                    error: format!(
+                        "AO controller for project {project} exited before readiness: {status}"
+                    ),
+                };
+            }
+            Err(error) => {
+                kill_controller_scope(&mut child);
+                let _ = std::fs::remove_file(controller_manifest_path(project).unwrap_or_default());
+                slot.last_failed_attempt = Some(Instant::now());
+                return RecoveryOutcome::Unknown {
+                    error: format!("failed to inspect AO controller process: {error}"),
+                };
+            }
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            kill_controller_scope(&mut child);
+            let _ = std::fs::remove_file(controller_manifest_path(project).unwrap_or_default());
+            slot.last_failed_attempt = Some(Instant::now());
+            return RecoveryOutcome::FailClosed {
+                error: format!(
+                    "AO controller for project {project} did not become ready within {}ms",
+                    timeout.as_millis()
+                ),
+            };
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+pub fn ensure_ao_recovery(project: &str) -> RecoveryOutcome {
+    ensure_ao_recovery_for_target(project, project)
+}
+
+/// Result-shaped facade used at dispatch boundaries and by integration
+/// contract tests. `target` is the exact AO `start` positional target (project
+/// id, configured path, or repository URL); readiness remains scoped to the
+/// canonical `project` id.
+pub fn ensure_ao_project_recovered(project: &str, target: &str) -> Result<(), DaemonError> {
+    match ensure_ao_recovery_for_target(project, target) {
+        RecoveryOutcome::Healthy { .. } | RecoveryOutcome::Restarted { .. } => Ok(()),
+        RecoveryOutcome::FailClosed { error } | RecoveryOutcome::Unknown { error } => {
+            Err(DaemonError::Deferred(format!(
+                "AO controller readiness unresolved for project {project}: {error}"
+            )))
+        }
+    }
+}
+
 fn ao_spawn_command_with_mode(
     agent: &str,
     spec: &SpawnSpec,
     diagnostic: bool,
 ) -> Result<Command, DaemonError> {
-    let bridge = ao_spawn_bridge_path();
-    if !bridge.is_file() {
-        return Err(DaemonError::Config(format!(
-            "AO v0.1.3 spawn bridge is missing at {}; rebuild/reinstall the daemon from a complete checkout",
-            bridge.display()
-        )));
-    }
-    let bridge_arg = format!("--import={}", bridge.display());
-    if bridge_arg.chars().any(char::is_whitespace) {
-        return Err(DaemonError::Config(format!(
-            "AO v0.1.3 spawn bridge path contains whitespace and cannot be represented safely in NODE_OPTIONS: {}",
-            bridge.display()
-        )));
-    }
+    let is_go_ao = std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go");
 
+    let bridge_arg = if !is_go_ao {
+        let bridge = ao_spawn_bridge_path();
+        if !bridge.is_file() {
+            return Err(DaemonError::Config(format!(
+                "AO v0.1.3 spawn bridge is missing at {}; rebuild/reinstall the daemon from a complete checkout",
+                bridge.display()
+            )));
+        }
+        let b_arg = format!("--import={}", bridge.display());
+        if b_arg.chars().any(char::is_whitespace) {
+            return Err(DaemonError::Config(format!(
+                "AO v0.1.3 spawn bridge path contains whitespace and cannot be represented safely in NODE_OPTIONS: {}",
+                bridge.display()
+            )));
+        }
+        Some(b_arg)
+    } else {
+        None
+    };
+
+    let bin_name = if is_go_ao { "ao-go" } else { "ao" };
     let mut cmd = if std::env::consts::OS == "macos" {
         let holdouts = resolve_holdouts_path_or_fail()?;
         let profile = format!(
@@ -2951,11 +5009,23 @@ fn ao_spawn_command_with_mode(
             holdouts, holdouts
         );
         let mut command = Command::new("sandbox-exec");
-        command.arg("-p").arg(&profile).arg("ao");
+        command.arg("-p").arg(&profile).arg(bin_name);
         command
     } else {
-        Command::new("ao")
+        Command::new(bin_name)
     };
+    apply_ao_controller_env(&mut cmd, &spec.ao_project).map_err(DaemonError::Config)?;
+    if is_go_ao {
+        // The preflight is authoritative for production. When the command is
+        // inspected in isolation (unit tests/startup diagnostics), preserve
+        // construction but only pin the explicit AO scope when it is present.
+        if let Ok(scope) = required_go_scope() {
+            crate::account_scope::scrub_all_ai_provider_auth(&mut cmd);
+            for (key, value) in go_scope_env(&scope) {
+                cmd.env(key, value);
+            }
+        }
+    }
 
     // Bind every worker spawn to its routed target checkout. Without this, AO
     // inherits the daemon process cwd (normally the dark-factory checkout),
@@ -3017,36 +5087,56 @@ fn ao_spawn_command_with_mode(
         }
     }
 
-    // This is the complete AO v0.1.3 public spawn argv: no --prompt,
-    // --name, or --branch. The preload validates this shape independently.
-    cmd.arg("spawn")
-        .arg("--project")
-        .arg(&spec.ao_project)
-        .arg("--agent")
-        .arg(agent);
-    if diagnostic {
-        // If the preload fails to execute, AO v0.1.3 rejects this unknown
-        // option before dispatch. That makes the supposedly read-only probe
-        // fail safe instead of accidentally creating a worker.
-        cmd.arg("--dark-factory-read-only-diagnostic");
-    }
-    cmd.arg("--")
-        .arg(&spec.prompt)
-        .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
-        .env("DARK_FACTORY_AO_SPAWN_BRANCH", &spec.branch);
-    if diagnostic {
-        cmd.env("DARK_FACTORY_AO_BRIDGE_DIAGNOSTIC", "1");
+    if is_go_ao {
+        let harness = match agent {
+            "antigravity" | "agy" => "agy",
+            "claude" | "claude-code" => "claude-code",
+            "codex" => "codex",
+            other => other,
+        };
+        cmd.arg("spawn")
+            .arg("--project")
+            .arg(&spec.ao_project)
+            .arg("--harness")
+            .arg(harness)
+            .arg("--branch")
+            .arg(&spec.branch)
+            .arg("--prompt")
+            .arg(&spec.prompt);
+    } else {
+        // This is the complete AO v0.1.3 public spawn argv: no --prompt,
+        // --name, or --branch. The preload validates this shape independently.
+        cmd.arg("spawn")
+            .arg("--project")
+            .arg(&spec.ao_project)
+            .arg("--agent")
+            .arg(agent);
+        if diagnostic {
+            // If the preload fails to execute, AO v0.1.3 rejects this unknown
+            // option before dispatch. That makes the supposedly read-only probe
+            // fail safe instead of accidentally creating a worker.
+            cmd.arg("--dark-factory-read-only-diagnostic");
+        }
+        cmd.arg("--")
+            .arg(&spec.prompt)
+            .env("DARK_FACTORY_AO_V013_BRIDGE", "1")
+            .env("DARK_FACTORY_AO_SPAWN_BRANCH", &spec.branch);
+        if diagnostic {
+            cmd.env("DARK_FACTORY_AO_BRIDGE_DIAGNOSTIC", "1");
+        }
+
+        let node_options = std::env::var("NODE_OPTIONS").unwrap_or_default();
+        let bridge_options = format!("--experimental-import-meta-resolve {}", bridge_arg.as_ref().unwrap());
+        let bridged_node_options = if node_options.trim().is_empty() {
+            bridge_options
+        } else {
+            format!("{node_options} {bridge_options}")
+        };
+        cmd.env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", &node_options)
+            .env("NODE_OPTIONS", bridged_node_options);
     }
 
-    let node_options = std::env::var("NODE_OPTIONS").unwrap_or_default();
-    let bridge_options = format!("--experimental-import-meta-resolve {bridge_arg}");
-    let bridged_node_options = if node_options.trim().is_empty() {
-        bridge_options
-    } else {
-        format!("{node_options} {bridge_options}")
-    };
-    cmd.env("DARK_FACTORY_AO_PARENT_NODE_OPTIONS", &node_options)
-        .env("NODE_OPTIONS", bridged_node_options);
+    cmd.env("DARK_FACTORY_VIA_AF", "1");
 
     for (key, _) in std::env::vars() {
         if key == "DARK_FACTORY_HOLDOUTS" || key.to_uppercase().contains("HOLDOUT") {
@@ -3054,11 +5144,87 @@ fn ao_spawn_command_with_mode(
         }
     }
 
+    if is_go_ao {
+        crate::account_scope::validate_ao_worker_agent_scope(agent, &mut cmd)?;
+    } else {
+        validate_node_ao_worker_agent_scope(agent, &mut cmd)?;
+    }
+
     Ok(cmd)
+}
+
+fn validate_node_ao_worker_agent_scope(
+    agent: &str,
+    cmd: &mut Command,
+) -> Result<(), DaemonError> {
+    let normalized = agent.trim().to_ascii_lowercase();
+    if normalized == "antigravity" || normalized == "agy" {
+        let mut temp_cmd = Command::new("dummy");
+        crate::account_scope::validate_ao_worker_agent_scope(agent, &mut temp_cmd)?;
+
+        let agy_home = crate::account_scope::validate_agy_home()?;
+        let ao_original_home = cmd
+            .get_envs()
+            .find(|(k, _)| k.to_str() == Some("AO_ORIGINAL_HOME"))
+            .and_then(|(_, v)| v)
+            .and_then(|v| v.to_str())
+            .map(std::path::PathBuf::from)
+            .or_else(|| operator_home().ok().map(std::path::PathBuf::from))
+            .ok_or_else(|| {
+                DaemonError::Config("AO_ORIGINAL_HOME is unavailable for Node AO AGY worker".to_string())
+            })?;
+
+        let ao_original_canonical = ao_original_home.canonicalize().map_err(|e| {
+            DaemonError::Config(format!(
+                "failed to canonicalize AO_ORIGINAL_HOME {}: {e}",
+                ao_original_home.display()
+            ))
+        })?;
+
+        if agy_home != ao_original_canonical {
+            return Err(DaemonError::Config(format!(
+                "Node AO AGY worker account root AO_ORIGINAL_HOME ({}) does not match intended AGY home ({})",
+                ao_original_canonical.display(),
+                agy_home.display()
+            )));
+        }
+
+        crate::account_scope::scrub_all_ai_provider_auth(cmd);
+        for (key, value) in temp_cmd.get_envs() {
+            if key != "HOME" {
+                if let Some(val) = value {
+                    cmd.env(key, val);
+                } else {
+                    cmd.env_remove(key);
+                }
+            }
+        }
+        Ok(())
+    } else {
+        crate::account_scope::validate_ao_worker_agent_scope(agent, cmd)
+    }
 }
 
 fn ao_spawn_command(agent: &str, spec: &SpawnSpec) -> Result<Command, DaemonError> {
     ao_spawn_command_with_mode(agent, spec, false)
+}
+
+/// Single source of truth for the repo+revision identity check `run_spawn_process`
+/// applies both before dispatch (against `spec.local_checkout`, when it already
+/// exists) and after dispatch (against the AO-reported workspace). A no-op
+/// unless `expected_revision` is set, so pre/post-spawn call sites cannot drift
+/// into re-implementing the "only check when a revision is pinned" policy
+/// independently.
+fn validate_target_identity_if_expected(
+    repo: &str,
+    path: &std::path::Path,
+    expected_revision: Option<&str>,
+) -> Result<(), DaemonError> {
+    let Some(expected_revision) = expected_revision else {
+        return Ok(());
+    };
+    crate::target_worktree::validate_existing_target_worktree(repo, path, Some(expected_revision))
+        .map(|_| ())
 }
 
 /// Maps legacy vendor aliases onto their canonical AO plugin names. The
@@ -3157,6 +5323,59 @@ pub fn verify_ao_bridge_compatibility(
     agent: &str,
     configured_vendors: &[String],
 ) -> Result<(), DaemonError> {
+    if std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go") {
+        let binding = validate_go_server_binding()?;
+        let mut command = Command::new("ao-go");
+        command
+            .arg("status")
+            .arg("--json")
+            .env("AO_RUN_FILE", &binding.run_file)
+            .env("AO_DATA_DIR", &binding.data_dir)
+            .env("AO_PORT", binding.port.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = command.output().map_err(|error| DaemonError::Tool {
+            tool: "ao-go status".to_string(),
+            rc: -1,
+            stderr: format!("execution failed: {error}"),
+        })?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if !output.status.success() {
+            return Err(DaemonError::Tool {
+                tool: "ao-go status".to_string(),
+                rc: output.status.code().unwrap_or(-1),
+                stderr,
+            });
+        }
+        let status: serde_json::Value = serde_json::from_str(&stdout).map_err(|error| {
+            DaemonError::Parse(format!("failed to parse ao-go status JSON: {error}"))
+        })?;
+        let is_healthy = status.get("health").and_then(|v| v.as_str()) == Some("ok")
+            || status.get("state").and_then(|v| v.as_str()) == Some("ready")
+            || status.get("ready").and_then(|v| v.as_str()) == Some("ready");
+        if !is_healthy {
+            return Err(DaemonError::Config(format!(
+                "ao-go status reported unhealthy: {stdout}"
+            )));
+        }
+        if status.get("pid").and_then(serde_json::Value::as_u64) != Some(binding.pid as u64)
+            || status.get("port").and_then(serde_json::Value::as_u64) != Some(binding.port as u64)
+            || status.get("runFile").and_then(serde_json::Value::as_str) != Some(binding.run_file.to_str().unwrap_or_default())
+            || status.get("dataDir").and_then(serde_json::Value::as_str) != Some(binding.data_dir.to_str().unwrap_or_default())
+        {
+            return Err(DaemonError::Config(
+                "ao-go status did not prove the intended server scope".to_string(),
+            ));
+        }
+        if process_start_ticks(binding.pid) != Some(binding.server_scope.server_start_ticks) {
+            return Err(DaemonError::Config(
+                "AO server identity changed during status compatibility probe".to_string(),
+            ));
+        }
+        return Ok(());
+    }
     let spec = SpawnSpec {
         bead_id: "daemon-startup-diagnostic".to_string(),
         branch: "factory/daemon-startup-diagnostic".to_string(),
@@ -3263,6 +5482,136 @@ pub fn verify_ao_bridge_compatibility(
     Ok(())
 }
 
+/// SPEC #4 residual limitation: this is still lexical stderr classification
+/// for any `ao` CLI invocation that actually ran and returned a real exit
+/// code (AO does not expose a structured failure-reason taxonomy over its
+/// CLI, so there is nothing else to key on for e.g. "unknown project").
+///
+/// `rc == -1` is never sufficient evidence: it also represents a missing AO
+/// executable, signal death, and wait errors. Only an explicit AO lifecycle
+/// diagnostic may trigger `ao start`; starting a daemon cannot repair a CLI
+/// binary that the process failed to execute.
+fn is_ao_not_running_error(err: &DaemonError) -> bool {
+    let msg = match err {
+        DaemonError::Tool { stderr, .. } => stderr.as_str(),
+        DaemonError::Config(msg) => msg.as_str(),
+        DaemonError::Parse(msg) => msg.as_str(),
+        DaemonError::SpawnFallbackExhausted(list) => {
+            return list.iter().any(|(_, e)| is_ao_not_running_error(e));
+        }
+        _ => return false,
+    };
+    let lower = msg.to_lowercase();
+    lower.contains("ao is not running")
+        || lower.contains("daemon is not running")
+        || lower.contains("orchestrator not running")
+        || lower.contains("unknown project")
+        || lower.contains("no such project")
+        || lower.contains("failed to connect to daemon")
+        || lower.contains("cannot connect to daemon")
+}
+
+#[cfg(test)]
+mod is_ao_not_running_error_tests {
+    use super::is_ao_not_running_error;
+    use crate::errors::DaemonError;
+
+    #[test]
+    fn rc_negative_one_cli_launch_failure_is_not_ao_not_running() {
+        let err = DaemonError::Tool {
+            tool: "ao".to_string(),
+            rc: -1,
+            stderr: "execution failed: No such file or directory (os error 2)".to_string(),
+        };
+        assert!(!is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn rc_negative_one_killed_by_signal_without_spawn_failure_wording_is_not_ao_not_running() {
+        // A process that WAS launched (the `ao` binary exists and ran) but
+        // was killed by an external signal (e.g. OOM killer, operator
+        // `kill -9`) also surfaces as `rc == -1` because
+        // `Command::status().code()` is `None` on signal death -- see
+        // `run_tool_with_cwd`'s `status.code().unwrap_or(-1)`. That is NOT
+        // evidence AO needs (re)starting: the binary itself launched fine,
+        // so `ao start` would not address whatever killed it.
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: -1,
+            stderr: "Killed".to_string(),
+        };
+        assert!(!is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn rc_negative_one_try_wait_failure_is_not_ao_not_running() {
+        // `run_tool_with_cwd` also produces `rc == -1` when the OS-level
+        // `try_wait()` poll itself errors -- an unrelated wait(2) failure,
+        // not evidence AO is not running.
+        let err = DaemonError::Tool {
+            tool: "ao".to_string(),
+            rc: -1,
+            stderr: "try_wait failed: some os error".to_string(),
+        };
+        assert!(!is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn real_exit_code_still_requires_lexical_match() {
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "some unrelated ao CLI validation error".to_string(),
+        };
+        assert!(!is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn real_exit_code_with_recognized_phrase_still_matches() {
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "Error: daemon is not running".to_string(),
+        };
+        assert!(is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn bridge_ao_is_not_running_phrase_triggers_recovery() {
+        let err = DaemonError::Tool {
+            tool: "ao spawn --agent minimax".to_string(),
+            rc: 1,
+            stderr: "[dark-factory AO bridge] AO is not running; run `ao start` before factory dispatch"
+                .to_string(),
+        };
+        assert!(is_ao_not_running_error(&err));
+    }
+
+    #[test]
+    fn spawn_fallback_exhausted_recurses_into_each_agent_error() {
+        let err = DaemonError::SpawnFallbackExhausted(vec![
+            (
+                "minimax".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent minimax".to_string(),
+                    rc: 1,
+                    stderr: "some unrelated ao CLI validation error".to_string(),
+                },
+            ),
+            (
+                "antigravity".to_string(),
+                DaemonError::Tool {
+                    tool: "ao spawn --agent antigravity".to_string(),
+                    rc: 1,
+                    stderr: "AO is not running; start the project first".to_string(),
+                },
+            ),
+        ]);
+        assert!(is_ao_not_running_error(&err));
+    }
+}
+
+
 pub struct CliSessions {
     pub project: String,
     pub agent: String,
@@ -3271,11 +5620,18 @@ pub struct CliSessions {
     spawned_session_worktrees: std::sync::Mutex<
         std::collections::HashMap<String, (String, std::path::PathBuf)>,
     >,
+    spawned_session_projects: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    spawned_branch_projects: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    spawned_session_branches: std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    allow_default_project_fallback: bool,
 }
 
 impl CliSessions {
     pub fn new(repo: &str, agent: &str) -> Self {
-        let mut project = repo.split('/').next_back().unwrap_or(repo).to_string();
+        let mut project = repo.rsplit('/').next().unwrap_or(repo).to_string();
+        if project.ends_with(".git") {
+            project.truncate(project.len() - 4);
+        }
         if project == "worldarchitect.ai" {
             project = "worldarchitect".to_string();
         }
@@ -3284,10 +5640,173 @@ impl CliSessions {
             agent: agent.to_string(),
             spawned_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
             spawned_session_worktrees: std::sync::Mutex::new(std::collections::HashMap::new()),
+            spawned_session_projects: std::sync::Mutex::new(std::collections::HashMap::new()),
+            spawned_branch_projects: std::sync::Mutex::new(std::collections::HashMap::new()),
+            spawned_session_branches: std::sync::Mutex::new(std::collections::HashMap::new()),
+            allow_default_project_fallback: true,
         }
     }
 
+    pub fn with_restored_projects<I>(
+        repo: &str,
+        agent: &str,
+        bindings: I,
+        allow_default_project_fallback: bool,
+    ) -> Result<Self, DaemonError>
+    where
+        I: IntoIterator<Item = (Option<String>, Option<String>, String)>,
+    {
+        let mut sessions = Self::new(repo, agent);
+        sessions.allow_default_project_fallback = allow_default_project_fallback;
+        for (session, branch, project) in bindings {
+            if let Some(session) = session {
+                let mut owners = sessions.spawned_session_projects.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if owners.insert(session.clone(), project.clone())
+                    .is_some_and(|prior| prior != project) {
+                    return Err(DaemonError::Config(format!(
+                        "durable AO session {session:?} has conflicting project owners"
+                    )));
+                }
+                let mut branches = sessions.spawned_session_branches.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if branches.insert(session.clone(), branch.clone())
+                    .is_some_and(|prior| prior != branch) {
+                    return Err(DaemonError::Config(format!(
+                        "durable AO session {session:?} has conflicting branch identities"
+                    )));
+                }
+            }
+            if let Some(branch) = branch {
+                let mut owners = sessions.spawned_branch_projects.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if owners.insert(branch.clone(), project.clone())
+                    .is_some_and(|prior| prior != project) {
+                    return Err(DaemonError::Config(format!(
+                        "durable AO branch {branch:?} has conflicting project owners"
+                    )));
+                }
+            }
+        }
+        Ok(sessions)
+    }
+
+    fn record_session_project(&self, session: &SessionId, project: &str) {
+        self.spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session.0.clone(), project.to_string());
+    }
+
+    fn project_for_session(&self, session: &SessionId) -> Result<String, DaemonError> {
+        if let Some(project) = self.spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session.0)
+            .cloned() {
+            return Ok(project);
+        }
+        if self.allow_default_project_fallback {
+            return Ok(self.project.clone());
+        }
+        Err(DaemonError::Config(format!(
+            "AO session {:?} has no durable project owner; refusing default-project fallback",
+            session.0
+        )))
+    }
+
+    fn project_for_branch(&self, branch: &str) -> Result<String, DaemonError> {
+        if let Some(project) = self.spawned_branch_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(branch)
+            .cloned() {
+            return Ok(project);
+        }
+        if let Some(project) = self.spawned_worktrees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .find_map(|(project, candidate)| (candidate == branch).then(|| project.clone())) {
+            return Ok(project);
+        }
+        if self.allow_default_project_fallback {
+            return Ok(self.project.clone());
+        }
+        Err(DaemonError::Config(format!(
+            "AO branch {branch:?} has no durable project owner; refusing default-project fallback"
+        )))
+    }
+
+    fn kill_in_project(project: &str, id: &SessionId) -> Result<(), DaemonError> {
+        if std::env::var("DARK_FACTORY_AO_ENGINE").as_deref() == Ok("strongdm-go") {
+            let binding = validate_go_server_binding()?;
+            let mut command = Command::new("ao-go");
+            command
+                .args(["session", "kill", &id.0, "-p", project])
+                .env("AO_RUN_FILE", &binding.run_file)
+                .env("AO_DATA_DIR", &binding.data_dir)
+                .env("AO_PORT", binding.port.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let output = command.output().map_err(|error| DaemonError::Tool {
+                tool: format!("ao-go session kill {}", id.0),
+                rc: -1,
+                stderr: format!("execution failed: {error}"),
+            })?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                return Err(DaemonError::Tool {
+                    tool: format!("ao-go session kill {}", id.0),
+                    rc: output.status.code().unwrap_or(-1),
+                    stderr,
+                });
+            }
+            if process_start_ticks(binding.pid) != Some(binding.server_scope.server_start_ticks) {
+                return Err(DaemonError::Config(
+                    "AO server identity changed during session kill".to_string(),
+                ));
+            }
+        } else {
+            run_tool("ao", &["session", "kill", &id.0, "-p", project], 30)?;
+        }
+        Ok(())
+    }
+
     fn run_spawn_process(&self, agent: &str, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
+        if is_go_ao() {
+            // The Go CLI is only a client; its long-lived server owns the
+            // actual worker launch. Prove that server, project, provider, and
+            // source scope before constructing a spawn that could reach it.
+            validate_go_ao_preflight(agent, spec)?;
+        }
+        // Validate the path boundary before allowing checkout preparation to
+        // touch disk. `ao_spawn_command` provisions missing managed checkouts
+        // and refreshes clean daemon-owned stale snapshots; construct it before
+        // the exact-head check so both paths can reach the expected revision.
+        if let Some(ref local_checkout) = spec.local_checkout {
+            crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), local_checkout)?;
+        }
+        let mut cmd = ao_spawn_command(agent, spec)?;
+        // Preparation above fails closed for dirty, operator-owned, or
+        // wrong-origin checkouts without executing AO. Re-check the resulting
+        // checkout identity immediately before dispatch.
+        if let Some(ref local_checkout) = spec.local_checkout {
+            if local_checkout.is_dir() {
+                validate_target_identity_if_expected(
+                    &spec.repo,
+                    local_checkout,
+                    spec.expected_revision.as_deref(),
+                )?;
+            }
+        }
+        if is_go_ao() {
+            // Checkout preparation can take time and external state can move;
+            // take a fresh, identical boundary snapshot immediately before
+            // the only mutating `ao-go spawn` child is created.
+            validate_go_ao_preflight(agent, spec)?;
+        }
         // jleechan-bqdv Stage C: spawn into `spec.ao_project` (resolved per
         // bead by `Config::resolve_repo`, Stage B), not `self.project` (the
         // daemon's single global project bound once at `CliSessions::new`
@@ -3299,7 +5818,6 @@ impl CliSessions {
         // `target_repo` names a DIFFERENT `[repos.*]` entry spawn into ITS
         // project instead of silently landing in the global one (the
         // jleechan-9sh5 root cause).
-        let mut cmd = ao_spawn_command(agent, spec)?;
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = cmd.output().map_err(|e| DaemonError::Tool {
@@ -3310,15 +5828,95 @@ impl CliSessions {
 
         let out = String::from_utf8_lossy(&output.stdout).into_owned();
         let err_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-        let session = Self::classify_spawn_output(
-            agent,
-            output.status.success(),
-            output.status.code(),
-            &out,
-            &err_msg,
-        )?;
-        let workspace = Self::spawn_workspace_path(&out);
-        let observed_branch = Self::spawn_branch(&out);
+        let (session, workspace, observed_branch, metadata_branch) = if is_go_ao() {
+            let session_id = out
+                .lines()
+                .find_map(|line| {
+                    let rest = line.strip_prefix("spawned session ")?;
+                    rest.split_whitespace().next().map(|s| s.to_string())
+                });
+            let harness = match agent {
+                "antigravity" | "agy" => "agy",
+                "claude" | "claude-code" => "claude-code",
+                "codex" => "codex",
+                other => other,
+            };
+            if !output.status.success() {
+                let spawn_error = DaemonError::Tool {
+                    tool: format!("ao-go spawn --harness {harness}"),
+                    rc: output.status.code().unwrap_or(-1),
+                    stderr: err_msg.clone(),
+                };
+                if let Some(session_id) = session_id {
+                    let session = SessionId(session_id);
+                    return match Self::kill_in_project(&spec.ao_project, &session) {
+                        Ok(()) => Err(spawn_error),
+                        Err(cleanup_error) => Err(DaemonError::SpawnCleanupFailed {
+                            session: session.0,
+                            spawn_error: Box::new(spawn_error),
+                            cleanup_error: Box::new(cleanup_error),
+                        }),
+                    };
+                }
+                return Err(DaemonError::SessionAmbiguous {
+                    branch: spec.branch.clone(),
+                    sessions: vec![format!(
+                        "ao-go spawn failed with rc={:?} but produced no session id: stdout={out}, stderr={err_msg}",
+                        output.status.code()
+                    )],
+                });
+            }
+            let session_id = match session_id {
+                Some(id) => id,
+                None => {
+                    return Err(DaemonError::SessionAmbiguous {
+                        branch: spec.branch.clone(),
+                        sessions: vec![format!(
+                            "ao-go spawn exited 0 but produced no 'spawned session ' line: stdout={out}, stderr={err_msg}"
+                        )],
+                    });
+                }
+            };
+            let session = SessionId(session_id);
+            let (mut ws, metadata_branch) = go_ao_session_workspace_and_branch(&session.0);
+            if ws.is_none() {
+                if let Ok(home) = operator_home().or_else(|_| std::env::var("HOME").map_err(|e| e.to_string())) {
+                    let fallback = std::path::Path::new(&home)
+                        .join(".ao/data/worktrees")
+                        .join(&spec.ao_project)
+                        .join(&session.0);
+                    if fallback.is_dir() {
+                        ws = Some(fallback);
+                    }
+                }
+            }
+            // Persisted AO metadata is useful diagnostics only. Always query
+            // the workspace's symbolic Git branch at this boundary so a
+            // stale/misbound database row cannot authorize the wrong branch.
+            let actual_branch = ws.as_ref().and_then(|workspace_path| {
+                run_tool_in_dir(
+                    "git",
+                    &["branch", "--show-current"],
+                    &workspace_path.to_string_lossy(),
+                    30,
+                )
+                .ok()
+                .map(|branch| branch.trim().to_string())
+                .filter(|branch| !branch.is_empty())
+            });
+            (session, ws, actual_branch, metadata_branch)
+        } else {
+            let session = Self::classify_spawn_output(
+                agent,
+                output.status.success(),
+                output.status.code(),
+                &out,
+                &err_msg,
+            )?;
+            let workspace = Self::spawn_workspace_path(&out);
+            let observed_branch = Self::spawn_branch(&out);
+            (session, workspace, observed_branch, None)
+        };
         let spawn_error = match workspace.as_ref() {
             None => Some(DaemonError::Parse(format!(
                 "ao spawn --agent {agent} returned session {} without an absolute Worktree path; refusing to dispatch without remote verification",
@@ -3327,28 +5925,51 @@ impl CliSessions {
             Some(workspace_path) => {
                 if observed_branch.as_deref() != Some(spec.branch.as_str()) {
                     Some(DaemonError::Parse(format!(
-                        "ao spawn --agent {agent} returned session {} with branch {:?}, expected {:?}; refusing to dispatch a branch-mismatched worker",
-                        session.0, observed_branch, spec.branch
+                        "ao spawn --agent {agent} returned session {} with actual branch {:?} (metadata branch {:?}), expected {:?}; refusing to dispatch a branch-mismatched worker",
+                        session.0, observed_branch, metadata_branch, spec.branch
                     )))
-                } else if let Some(expected_revision) = spec.expected_revision.as_deref() {
-                    match crate::target_worktree::validate_existing_target_worktree(
-                        &spec.repo,
-                        workspace_path,
-                        Some(expected_revision),
-                    ) {
-                        Ok(_) => None,
-                        Err(error) => Some(DaemonError::Config(format!(
-                            "AO worker workspace for session {} is not bound to repo {} at expected revision {}: {error}",
-                            session.0, spec.repo, expected_revision
-                        ))),
+                } else if !is_go_ao() && crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), workspace_path).is_err() {
+                    Some(crate::tools::check_cwd_guard(spec.expected_cwd.as_deref(), workspace_path).unwrap_err())
+                } else if is_go_ao() {
+                    if !workspace_path.is_absolute() || !workspace_path.is_dir() {
+                        Some(DaemonError::Config(format!(
+                            "Go AO worker workspace path is not a directory: {}",
+                            workspace_path.display()
+                        )))
+                    } else {
+                        match crate::target_worktree::validate_existing_target_worktree(
+                            &spec.repo,
+                            workspace_path,
+                            spec.expected_revision.as_deref(),
+                        ) {
+                            Ok(_) => None,
+                            Err(error) => Some(DaemonError::Config(format!(
+                                "Go AO worker workspace for session {} is not bound to repo {} at expected revision {}: {error}",
+                                session.0,
+                                spec.repo,
+                                spec.expected_revision.as_deref().unwrap_or("?"),
+                            ))),
+                        }
                     }
                 } else {
-                    None
+                    match validate_target_identity_if_expected(
+                        &spec.repo,
+                        workspace_path,
+                        spec.expected_revision.as_deref(),
+                    ) {
+                        Ok(()) => None,
+                        Err(error) => Some(DaemonError::Config(format!(
+                            "AO worker workspace for session {} is not bound to repo {} at expected revision {}: {error}",
+                            session.0,
+                            spec.repo,
+                            spec.expected_revision.as_deref().unwrap_or("?")
+                        ))),
+                    }
                 }
             }
         };
         if let Some(spawn_error) = spawn_error {
-            return match run_tool("ao", &["session", "kill", &session.0], 30) {
+            return match Self::kill_in_project(&spec.ao_project, &session) {
                 Ok(_) => Err(spawn_error),
                 Err(cleanup_error) => Err(DaemonError::SpawnCleanupFailed {
                     session: session.0,
@@ -3374,6 +5995,13 @@ impl CliSessions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(session.0.clone(), (spec.branch.clone(), workspace));
+        self.spawned_branch_projects.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(spec.branch.clone(), spec.ao_project.clone());
+        self.record_session_project(&session, &spec.ao_project);
+        self.spawned_session_branches.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session.0.clone(), Some(spec.branch.clone()));
         Ok(session)
     }
 
@@ -3503,28 +6131,57 @@ impl CliSessions {
 /// `canonical_for_alias` map the startup preflight uses. Dedup is by
 /// canonical form so a config that names both `agy` and `antigravity`
 /// doesn't try the same plugin twice.
-fn build_runtime_fallback_chain(default_agent: &str, fallback_str: &str) -> Vec<String> {
-    let canonicalize = |vendor: &str| -> String {
-        canonical_for_alias(vendor)
-            .map(str::to_string)
-            .unwrap_or_else(|| vendor.to_string())
-    };
-    let mut chain: Vec<String> = Vec::new();
-    let default_canonical = canonicalize(default_agent);
-    if !default_canonical.is_empty() {
-        chain.push(default_canonical);
-    }
-    for part in fallback_str.split("->") {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
+pub fn build_runtime_fallback_chain(default_agent: &str, fallback_str: &str) -> Vec<String> {
+    if is_go_ao() {
+        let canonicalize = |vendor: &str| -> Option<String> {
+            let normalized = vendor.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "antigravity" | "agy" => Some("agy".to_string()),
+                "claude" | "claude-code" => Some("claude-code".to_string()),
+                "codex" => Some("codex".to_string()),
+                "minimax" | "claudem" | "aow" => None,
+                _ => None,
+            }
+        };
+        let mut chain: Vec<String> = Vec::new();
+        if let Some(default_canonical) = canonicalize(default_agent) {
+            chain.push(default_canonical);
         }
-        let canonical = canonicalize(trimmed);
-        if !canonical.is_empty() && !chain.contains(&canonical) {
-            chain.push(canonical);
+        for part in fallback_str.split("->") {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(canonical) = canonicalize(trimmed) {
+                if !chain.contains(&canonical) {
+                    chain.push(canonical);
+                }
+            }
         }
+        chain
+    } else {
+        let canonicalize = |vendor: &str| -> String {
+            canonical_for_alias(vendor)
+                .map(str::to_string)
+                .unwrap_or_else(|| vendor.to_string())
+        };
+        let mut chain: Vec<String> = Vec::new();
+        let default_canonical = canonicalize(default_agent);
+        if !default_canonical.is_empty() {
+            chain.push(default_canonical);
+        }
+        for part in fallback_str.split("->") {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let canonical = canonicalize(trimmed);
+            if !canonical.is_empty() && !chain.contains(&canonical) {
+                chain.push(canonical);
+            }
+        }
+        chain
     }
-    chain
 }
 
 /// Walks `agents` in order, calling `attempt_spawn` for each until one
@@ -3548,7 +6205,10 @@ where
     for agent in agents {
         match attempt_spawn(agent) {
             Ok(sess) => return Ok(sess),
-            Err(error @ DaemonError::SpawnCleanupFailed { .. }) => return Err(error),
+            Err(
+                error @ (DaemonError::SpawnCleanupFailed { .. }
+                | DaemonError::SessionAmbiguous { .. }),
+            ) => return Err(error),
             Err(e) => {
                 attempts.push((agent.clone(), e));
             }
@@ -3577,6 +6237,10 @@ mod spawn_fallback_tests {
     // argv-shape behavior.
     #[test]
     fn runtime_fallback_chain_never_emits_legacy_alias_after_agy_rename() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        std::env::remove_var("DARK_FACTORY_AO_ENGINE");
+
         // Default `agy` (legacy alias) plus a fallback chain that names
         // both `agy` and `antigravity`. After canonicalization + dedup the
         // chain must contain ONLY canonical plugin names; no literal
@@ -3596,10 +6260,18 @@ mod spawn_fallback_tests {
             chain,
             vec!["antigravity".to_string(), "minimax".to_string()]
         );
+        match prior {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
     }
 
     #[test]
     fn runtime_fallback_chain_preserves_passthrough_when_no_alias_matches() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        std::env::remove_var("DARK_FACTORY_AO_ENGINE");
+
         let chain = build_runtime_fallback_chain(
             "minimax",
             "claude-code->antigravity->agy",
@@ -3612,6 +6284,10 @@ mod spawn_fallback_tests {
                 "antigravity".to_string(),
             ]
         );
+        match prior {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
     }
 
     /// jleechan-r56m red proof: simulate all 3 vendors in a fallback chain
@@ -3690,6 +6366,59 @@ mod spawn_fallback_tests {
         .expect("fallback to minimax must succeed when claude-code fails auth");
 
         assert_eq!(session, SessionId("wa-minimax-success".to_string()));
+    }
+
+    #[test]
+    fn session_ambiguous_halts_fallback_immediately() {
+        let agents = vec![
+            "antigravity".to_string(),
+            "minimax".to_string(),
+            "claude-code".to_string(),
+        ];
+        let mut attempts = Vec::new();
+
+        let err = fallback_spawn(&agents, |agent| {
+            attempts.push(agent.to_string());
+            Err(DaemonError::SessionAmbiguous {
+                branch: "factory/feature-1".to_string(),
+                sessions: vec!["unparseable output".to_string()],
+            })
+        })
+        .expect_err("SessionAmbiguous must halt fallback");
+
+        assert!(matches!(err, DaemonError::SessionAmbiguous { .. }));
+        assert_eq!(attempts, vec!["antigravity".to_string()], "fallback must not attempt next vendor");
+    }
+
+    #[test]
+    fn spawn_cleanup_failed_halts_fallback_immediately() {
+        let agents = vec![
+            "antigravity".to_string(),
+            "minimax".to_string(),
+            "claude-code".to_string(),
+        ];
+        let mut attempts = Vec::new();
+
+        let err = fallback_spawn(&agents, |agent| {
+            attempts.push(agent.to_string());
+            Err(DaemonError::SpawnCleanupFailed {
+                session: "known-id".to_string(),
+                spawn_error: Box::new(DaemonError::Tool {
+                    tool: "ao-go spawn".to_string(),
+                    rc: 1,
+                    stderr: "spawn failed".to_string(),
+                }),
+                cleanup_error: Box::new(DaemonError::Tool {
+                    tool: "ao-go session kill".to_string(),
+                    rc: 1,
+                    stderr: "kill failed".to_string(),
+                }),
+            })
+        })
+        .expect_err("SpawnCleanupFailed must halt fallback");
+
+        assert!(matches!(err, DaemonError::SpawnCleanupFailed { .. }));
+        assert_eq!(attempts, vec!["antigravity".to_string()], "fallback must not attempt next vendor");
     }
 }
 
@@ -3828,10 +6557,149 @@ mod spawn_classification_tests {
 
 #[cfg(test)]
 mod ao_spawn_contract_tests {
-    use super::{ao_spawn_bridge_path, gh_env_test_lock, CliSessions};
+    use super::{
+        ao_controller_env, ao_controller_home, ao_spawn_bridge_path, ensure_ao_recovery_for_target,
+        parse_ao_started_at_epoch, probe_operator_ao_project, process_start_epoch_secs,
+        process_start_identity_from_ps, process_start_ticks, resolve_ao_config_path,
+        safe_project_component, validate_controller_manifest_project, AoControllerManifest,
+        AoReadiness, CliSessions, RecoveryOutcome,
+    };
     use crate::errors::DaemonError;
-    use crate::tools::{Sessions, SpawnSpec};
+    use crate::tools::{SessionId, Sessions, SpawnSpec};
     use std::os::unix::fs::PermissionsExt;
+    use std::collections::HashMap;
+
+    struct TestEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        cleanup_dir: std::path::PathBuf,
+    }
+
+    impl TestEnvGuard {
+        fn install(dir: &std::path::Path, bindings: &serde_json::Value, log: &std::path::Path) -> Self {
+            const KEYS: &[&str] = &[
+                "PATH",
+                "AO_FAKE_EXPECTED_BINDINGS",
+                "AO_FAKE_LOG",
+                "AO_FAKE_FAIL_PROMPT",
+                "AO_FAKE_KILL_FAIL",
+                "AO_FAKE_RETURN_BRANCH",
+                "AO_FAKE_WORKTREE",
+                "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
+                "FAKE_GIT_EXPECTED_ORIGIN",
+                "FAKE_GIT_LOCAL_SOURCE",
+                "FAKE_GIT_REAL_BIN",
+                "MINIMAX_API_KEY",
+                "DARK_FACTORY_CODER_FALLBACK_CHAIN",
+                "DARK_FACTORY_AO_ENGINE",
+            ];
+            let saved: Vec<(&'static str, Option<std::ffi::OsString>)> = KEYS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            let old_path = std::env::var_os("PATH").unwrap_or_default();
+            let mut paths = vec![dir.to_path_buf()];
+            paths.extend(std::env::split_paths(&old_path));
+            std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+            std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", bindings.to_string());
+            std::env::set_var("AO_FAKE_LOG", log);
+            std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
+            std::env::remove_var("DARK_FACTORY_AO_ENGINE");
+            Self {
+                saved,
+                cleanup_dir: dir.to_path_buf(),
+            }
+        }
+    }
+
+    /// Synthetic account configuration for subprocess fixtures.  Tests must
+    /// never inherit an operator credential or account directory merely
+    /// because the host running the suite happens to provide one.
+    struct SyntheticAccountScopeEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl SyntheticAccountScopeEnv {
+        fn install(root: &std::path::Path) -> Self {
+            const KEYS: &[&str] = &[
+                "DARK_FACTORY_CLAUDE_CONFIG_DIR",
+                "CODEX_HOME",
+                "DARK_FACTORY_AGY_HOME",
+                "DARK_FACTORY_OPERATOR_HOME",
+                "AO_ORIGINAL_HOME",
+                "TMUX_TMPDIR",
+                "MINIMAX_API_KEY",
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "GEMINI_API_KEY",
+                "DARK_FACTORY_CODER_FALLBACK_CHAIN",
+                "DARK_FACTORY_AO_ENGINE",
+            ];
+            let saved: Vec<(&'static str, Option<std::ffi::OsString>)> = KEYS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            let claude_dir = root.join("synthetic-claude-config");
+            let codex_home = root.join("synthetic-codex-home");
+            let agy_home = root.join("synthetic-agy-home");
+            let tmux_dir = root.join("synthetic-tmux-tmpdir");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            std::fs::create_dir_all(&codex_home).unwrap();
+            std::fs::create_dir_all(&agy_home).unwrap();
+            std::fs::create_dir_all(&tmux_dir).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tmux_dir, std::fs::Permissions::from_mode(0o700));
+            }
+            std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_dir);
+            std::env::set_var("CODEX_HOME", &codex_home);
+            std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_home);
+            std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &agy_home);
+            std::env::set_var("AO_ORIGINAL_HOME", &agy_home);
+            std::env::set_var("TMUX_TMPDIR", &tmux_dir);
+            std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
+            std::env::remove_var("GEMINI_API_KEY");
+            std::env::remove_var("DARK_FACTORY_AO_ENGINE");
+            Self { saved }
+        }
+    }
+
+    impl Drop for SyntheticAccountScopeEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.cleanup_dir);
+        }
+    }
+
+    fn system_git() -> std::path::PathBuf {
+        let canonical = std::path::PathBuf::from("/usr/bin/git");
+        if canonical.is_file() {
+            return canonical;
+        }
+        std::env::var_os("PATH")
+            .as_deref()
+            .into_iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join("git"))
+            .find(|path| path.is_file())
+            .expect("test environment must provide git")
+    }
 
     fn spec(prompt: &str, branch: &str) -> SpawnSpec {
         SpawnSpec {
@@ -3846,6 +6714,1058 @@ mod ao_spawn_contract_tests {
             managed_checkout: false,
             expected_cwd: None,
         }
+    }
+
+    #[test]
+    fn go_source_ref_accepts_existing_and_fresh_branch_pins_only() {
+        let root = std::env::temp_dir().join(format!(
+            "df_go_source_ref_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = system_git();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["-c", "user.email=test@example.invalid", "-c", "user.name=synthetic", "commit", "--allow-empty", "-m", "base"],
+        ] {
+            let status = std::process::Command::new(&git)
+                .args(&args)
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "fixture git command failed: {args:?}");
+        }
+        let rev_parse = std::process::Command::new(&git)
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            rev_parse.status.success(),
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&rev_parse.stderr)
+        );
+        let sha = String::from_utf8(rev_parse.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let resolved = super::resolve_go_source_ref(&root, "factory/new", "main", &sha);
+        assert!(
+            resolved.is_ok(),
+            "expected resolve_go_source_ref to accept valid revision pin, got: {resolved:?}"
+        );
+        let stale = super::resolve_go_source_ref(&root, "factory/new", "main", "0".repeat(40).as_str());
+        assert!(
+            stale.is_err(),
+            "expected resolve_go_source_ref to reject invalid revision pin, got: {stale:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn go_source_ref_matches_upstream_tag_and_default_precedence() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!("df_go_ref_precedence_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = system_git();
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new(&git)
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "synthetic git fixture failed: {args:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.name", "Synthetic Fixture"]);
+        run(&["config", "user.email", "fixture@example.invalid"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        let base = run(&["rev-parse", "HEAD"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "next"]);
+        let next = run(&["rev-parse", "HEAD"]);
+
+        run(&["update-ref", "refs/remotes/origin/factory/shadow", &base]);
+        run(&["tag", "origin/factory/shadow", &next]);
+        assert_eq!(run(&["rev-parse", "--verify", "origin/factory/shadow"]), next);
+        assert!(super::resolve_go_source_ref(&root, "factory/shadow", "main", &base).is_err());
+
+        run(&["tag", "factory/new", &base]);
+        assert!(super::resolve_go_source_ref(&root, "factory/new", "main", &base).is_err());
+        assert!(super::resolve_go_source_ref(&root, "factory/new", "main", &next).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn go_provider_scope_rejects_matching_but_unintended_profile() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!("df_go_provider_scope_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = SyntheticAccountScopeEnv::install(&root);
+        let intended_codex = root.join("synthetic-codex-home");
+        let intended_agy = root.join("synthetic-agy-home");
+        let intended_tmux = root.join("synthetic-tmux-tmpdir");
+        let mut server = HashMap::new();
+        server.insert("HOME".to_string(), intended_agy.display().to_string());
+        server.insert("CODEX_HOME".to_string(), intended_codex.display().to_string());
+        server.insert("TMUX_TMPDIR".to_string(), intended_tmux.display().to_string());
+        assert!(super::validate_go_provider_scope("agy", &server, &HashMap::new()).is_ok());
+        server.insert("MINIMAX_API_KEY".to_string(), "SYNTHETIC_SERVER_KEY".to_string());
+        let project = HashMap::from([("MINIMAX_API_KEY".to_string(), String::new())]);
+        assert!(super::validate_go_provider_scope("agy", &server, &project).is_err());
+        server.remove("MINIMAX_API_KEY");
+        let wrong_agy = root.join("wrong-agy-home");
+        std::fs::create_dir_all(&wrong_agy).unwrap();
+        server.insert("HOME".to_string(), wrong_agy.display().to_string());
+        assert!(super::validate_go_provider_scope("agy", &server, &HashMap::new()).is_err());
+        server.insert("HOME".to_string(), intended_agy.display().to_string());
+        let wrong = root.join("wrong-codex-home");
+        std::fs::create_dir_all(&wrong).unwrap();
+        server.insert("CODEX_HOME".to_string(), wrong.display().to_string());
+        assert!(super::validate_go_provider_scope("agy", &server, &HashMap::new()).is_err());
+        server.insert("CODEX_HOME".to_string(), intended_codex.display().to_string());
+
+        // Native AGY rejects ambient GEMINI_API_KEY in server or project scope
+        server.insert("GEMINI_API_KEY".to_string(), "SYNTHETIC_SERVER_GEMINI_KEY".to_string());
+        assert!(super::validate_go_provider_scope("agy", &server, &HashMap::new()).is_err());
+        server.remove("GEMINI_API_KEY");
+        let project_gemini = HashMap::from([("GEMINI_API_KEY".to_string(), "SYNTHETIC_PROJECT_GEMINI_KEY".to_string())]);
+        assert!(super::validate_go_provider_scope("agy", &server, &project_gemini).is_err());
+
+        // Native AGY with empty/removed GEMINI_API_KEY succeeds (root actual server contract)
+        let project_empty_gemini = HashMap::from([("GEMINI_API_KEY".to_string(), String::new())]);
+        assert!(super::validate_go_provider_scope("agy", &server, &project_empty_gemini).is_ok());
+
+        // Explicit Gemini API mode requires and validates GEMINI_API_KEY matching intended daemon key and server
+        let agy_settings_dir = intended_agy.join(".gemini").join("antigravity-cli");
+        std::fs::create_dir_all(&agy_settings_dir).unwrap();
+        std::fs::write(agy_settings_dir.join("settings.json"), r#"{"modelProvider":"gemini"}"#).unwrap();
+
+        let key_a = "SYNTHETIC_CALLER_KEY_A";
+        let key_b = "SYNTHETIC_SERVER_KEY_B";
+        std::env::set_var("GEMINI_API_KEY", key_a);
+
+        // Without GEMINI_API_KEY in effective, fails
+        assert!(super::validate_go_provider_scope("agy", &server, &HashMap::new()).is_err());
+
+        // Caller key A, server+project key B must fail even though server equals project
+        let mut server_b = server.clone();
+        server_b.insert("GEMINI_API_KEY".to_string(), key_b.to_string());
+        let project_b = HashMap::from([("GEMINI_API_KEY".to_string(), key_b.to_string())]);
+        assert!(super::validate_go_provider_scope("agy", &server_b, &project_b).is_err());
+
+        // All three key A (caller A, server A, project A) must pass
+        server.insert("GEMINI_API_KEY".to_string(), key_a.to_string());
+        let project_a = HashMap::from([("GEMINI_API_KEY".to_string(), key_a.to_string())]);
+        assert!(super::validate_go_provider_scope("agy", &server, &project_a).is_ok());
+
+        // With mismatched GEMINI_API_KEY between server and project, fails
+        let project_mismatched_gemini = HashMap::from([("GEMINI_API_KEY".to_string(), "WRONG_KEY".to_string())]);
+        assert!(super::validate_go_provider_scope("agy", &server, &project_mismatched_gemini).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    struct TestTmuxSessionGuard {
+        tmux_tmpdir: std::path::PathBuf,
+        session_name: &'static str,
+    }
+
+    impl Drop for TestTmuxSessionGuard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new(super::system_tmux())
+                .args(["kill-session", "-t", self.session_name])
+                .env_clear()
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .env("TMUX_TMPDIR", &self.tmux_tmpdir)
+                .output();
+        }
+    }
+
+    #[test]
+    fn go_provider_scope_rejects_missing_or_unscoped_tmux_tmpdir_and_dirty_tmux_env() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::path::PathBuf::from("/tmp").join(format!("dft_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+        }
+        let _scope = SyntheticAccountScopeEnv::install(&root);
+        let intended_codex = root.join("synthetic-codex-home");
+        let intended_agy = root.join("synthetic-agy-home");
+        let intended_tmux = root.join("synthetic-tmux-tmpdir");
+
+        let base_server = HashMap::from([
+            ("HOME".to_string(), intended_agy.display().to_string()),
+            ("CODEX_HOME".to_string(), intended_codex.display().to_string()),
+            ("TMUX_TMPDIR".to_string(), intended_tmux.display().to_string()),
+        ]);
+
+        // Clean private scope with fresh namespace (no tmux server) passes
+        assert!(super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).is_ok());
+
+        // 1. Missing caller TMUX_TMPDIR rejects
+        std::env::remove_var("TMUX_TMPDIR");
+        let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("intended TMUX_TMPDIR is absent or blank"));
+
+        // 2. Blank caller TMUX_TMPDIR rejects
+        std::env::set_var("TMUX_TMPDIR", "   ");
+        let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("intended TMUX_TMPDIR is absent or blank"));
+
+        // 3. Relative caller TMUX_TMPDIR rejects
+        std::env::set_var("TMUX_TMPDIR", "relative/tmpdir");
+        let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("must be an absolute path"));
+
+        // 4. Non-existent caller TMUX_TMPDIR rejects
+        let nonexistent = root.join("nonexistent-tmux");
+        std::env::set_var("TMUX_TMPDIR", &nonexistent);
+        let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("must be an existing directory"));
+
+        // 5. Unsafe shared permissions on caller TMUX_TMPDIR rejects
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let unsafe_dir = root.join("unsafe-tmux-tmpdir");
+            std::fs::create_dir_all(&unsafe_dir).unwrap();
+            let _ = std::fs::set_permissions(&unsafe_dir, std::fs::Permissions::from_mode(0o755));
+            std::env::set_var("TMUX_TMPDIR", &unsafe_dir);
+            let mut server_unsafe = base_server.clone();
+            server_unsafe.insert("TMUX_TMPDIR".to_string(), unsafe_dir.display().to_string());
+            let err = super::validate_go_provider_scope("agy", &server_unsafe, &HashMap::new()).unwrap_err();
+            assert!(err.to_string().contains("unsafe shared permissions"));
+        }
+
+        // Restore valid caller TMUX_TMPDIR
+        std::env::set_var("TMUX_TMPDIR", &intended_tmux);
+
+        // 6. Missing TMUX_TMPDIR in server scope rejects
+        let mut missing_server = base_server.clone();
+        missing_server.remove("TMUX_TMPDIR");
+        let err = super::validate_go_provider_scope("agy", &missing_server, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("Go AO server scope is missing TMUX_TMPDIR"));
+
+        // 7. Mismatched TMUX_TMPDIR in server scope rejects
+        let other_tmux = root.join("other-tmux-tmpdir");
+        std::fs::create_dir_all(&other_tmux).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&other_tmux, std::fs::Permissions::from_mode(0o700));
+        }
+        let mut mismatch_server = base_server.clone();
+        mismatch_server.insert("TMUX_TMPDIR".to_string(), other_tmux.display().to_string());
+        let err = super::validate_go_provider_scope("agy", &mismatch_server, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("does not match intended daemon TMUX_TMPDIR"));
+
+        // 8. Mismatched TMUX_TMPDIR in project scope rejects
+        let project_mismatch = HashMap::from([("TMUX_TMPDIR".to_string(), other_tmux.display().to_string())]);
+        let err = super::validate_go_provider_scope("agy", &base_server, &project_mismatch).unwrap_err();
+        assert!(err.to_string().contains("does not match server scope"));
+
+        // 9. Empty TMUX_TMPDIR in project scope rejects
+        let project_empty = HashMap::from([("TMUX_TMPDIR".to_string(), String::new())]);
+        let err = super::validate_go_provider_scope("agy", &base_server, &project_empty).unwrap_err();
+        assert!(err.to_string().contains("Go AO project scope TMUX_TMPDIR cannot be empty"));
+
+        // 10. Existing dirty tmux server inspection
+        let tmux_bin = super::system_tmux();
+        let tmux_available = std::process::Command::new(&tmux_bin)
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if tmux_available {
+            let _tmux_guard = TestTmuxSessionGuard {
+                tmux_tmpdir: intended_tmux.clone(),
+                session_name: "scope_probe",
+            };
+            let run_tmux = |args: &[&str]| {
+                std::process::Command::new(&tmux_bin)
+                    .args(args)
+                    .env_clear()
+                    .env("PATH", std::env::var("PATH").unwrap_or_default())
+                    .env("TMUX_TMPDIR", &intended_tmux)
+                    .output()
+                    .expect("tmux test command failed to execute")
+            };
+
+            // Start tmux server in intended private socket dir
+            let start = run_tmux(&["new-session", "-d", "-s", "scope_probe"]);
+            assert!(start.status.success(), "failed to start test tmux session: {}", String::from_utf8_lossy(&start.stderr));
+
+            // Ambient dirty ANTHROPIC_API_KEY in tmux server rejects without leaking secret
+            let dirty_secret_ant = "sk-ant-ambient-leak-secret-value";
+            run_tmux(&["set-environment", "-g", "ANTHROPIC_API_KEY", dirty_secret_ant]);
+            let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+            let err_msg = err.to_string();
+            assert!(err_msg.contains("conflicting nonempty variable ANTHROPIC_API_KEY"));
+            assert!(!err_msg.contains(dirty_secret_ant), "error must not log secret credential value");
+
+            // Ambient dirty MINIMAX_API_KEY in tmux server rejects without leaking secret
+            run_tmux(&["set-environment", "-g", "-u", "ANTHROPIC_API_KEY"]);
+            let dirty_secret_mini = "sk-minimax-ambient-leak-secret-value";
+            run_tmux(&["set-environment", "-g", "MINIMAX_API_KEY", dirty_secret_mini]);
+            let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+            let err_msg = err.to_string();
+            assert!(err_msg.contains("conflicting nonempty variable MINIMAX_API_KEY"));
+            assert!(!err_msg.contains(dirty_secret_mini), "error must not log secret credential value");
+
+            // Native AGY with ambient GEMINI_API_KEY in tmux server rejects without leaking secret
+            run_tmux(&["set-environment", "-g", "-u", "MINIMAX_API_KEY"]);
+            let dirty_secret_gemini = "sk-gemini-ambient-leak-secret-value";
+            run_tmux(&["set-environment", "-g", "GEMINI_API_KEY", dirty_secret_gemini]);
+            let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+            let err_msg = err.to_string();
+            assert!(err_msg.contains("conflicting nonempty variable GEMINI_API_KEY"));
+            assert!(!err_msg.contains(dirty_secret_gemini), "error must not log secret credential value");
+
+            // Unset dirty secret and set clean matching HOME in tmux server -> passes
+            run_tmux(&["set-environment", "-g", "-u", "GEMINI_API_KEY"]);
+            run_tmux(&["set-environment", "-g", "HOME", &intended_agy.display().to_string()]);
+            assert!(super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).is_ok());
+
+            // Mismatched HOME in tmux server rejects
+            let wrong_home = root.join("wrong-tmux-home");
+            std::fs::create_dir_all(&wrong_home).unwrap();
+            run_tmux(&["set-environment", "-g", "HOME", &wrong_home.display().to_string()]);
+            let err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+            assert!(err.to_string().contains("Go AO tmux server scope HOME does not match intended daemon profile"));
+
+            // Exact named owned session cleanup, not shared kill-server
+            let _ = run_tmux(&["kill-session", "-t", "scope_probe"]);
+
+            // After killing the last session, the tmux server exits asynchronously, leaving a stale socket.
+            let default_sock = super::private_tmux_default_socket(&intended_tmux);
+            let mut server_exited = false;
+            for _ in 0..50 {
+                #[cfg(unix)]
+                {
+                    if std::os::unix::net::UnixStream::connect(&default_sock).is_err() {
+                        server_exited = true;
+                        break;
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    server_exited = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(server_exited, "tmux server must exit after last session is killed");
+            assert!(default_sock.exists(), "tmux socket must remain on disk after server exit");
+            assert_eq!(
+                super::query_existing_tmux_env(&intended_tmux).unwrap(),
+                None,
+                "stale socket after last-session exit must return None"
+            );
+            assert!(
+                super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).is_ok(),
+                "scope validation must cleanly pass on stale socket after last-session exit"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn go_provider_scope_existing_uninspectable_socket_rejects_and_fresh_namespace_passes() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::path::PathBuf::from("/tmp").join(format!("dft_uninsp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+        }
+        let _scope = SyntheticAccountScopeEnv::install(&root);
+        let intended_codex = root.join("synthetic-codex-home");
+        let intended_agy = root.join("synthetic-agy-home");
+        let intended_tmux = root.join("synthetic-tmux-tmpdir");
+
+        let base_server = HashMap::from([
+            ("HOME".to_string(), intended_agy.display().to_string()),
+            ("CODEX_HOME".to_string(), intended_codex.display().to_string()),
+            ("TMUX_TMPDIR".to_string(), intended_tmux.display().to_string()),
+        ]);
+
+        let socket_path = super::private_tmux_default_socket(&intended_tmux);
+
+        // 1. Fresh namespace with verified no private default socket cleanly passes
+        assert!(!socket_path.exists());
+        assert_eq!(super::query_existing_tmux_env(&intended_tmux).unwrap(), None);
+        assert!(super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).is_ok());
+
+        // 2. Existing uninspectable socket on private default socket path rejects before AO marker
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(socket_path.parent().unwrap(), std::fs::Permissions::from_mode(0o700));
+        }
+        std::fs::write(&socket_path, b"unresponsive_corrupted_socket_payload").unwrap();
+        assert!(socket_path.exists());
+
+        let canonical_tmux = intended_tmux.canonicalize().unwrap();
+        let query_err = super::query_existing_tmux_env(&canonical_tmux).unwrap_err();
+        assert!(matches!(query_err, DaemonError::Config(_)));
+        let query_err_msg = query_err.to_string();
+        assert!(
+            query_err_msg.contains("failed to query existing tmux socket")
+                || query_err_msg.contains("failed to execute tmux to inspect existing socket"),
+            "expected uninspectable socket error, got: {query_err_msg}"
+        );
+
+        let scope_err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+        assert!(matches!(scope_err, DaemonError::Config(_)));
+        assert_eq!(
+            scope_err.to_string(),
+            query_err_msg,
+            "scope must propagate exact error from existing socket query"
+        );
+
+        // 2b. Controlled missing/unexecutable tmux binary demonstration:
+        // When tmux command cannot be executed, uninspectable socket still fails closed with Config error
+        let non_executable_dir = root.join("missing-tmux-bin");
+        std::fs::create_dir_all(&non_executable_dir).unwrap();
+        let fake_tmux = non_executable_dir.join("tmux");
+        std::fs::write(&fake_tmux, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o644));
+        }
+        let prior_path = std::env::var_os("PATH");
+        let mut stub_path = std::ffi::OsString::from(&non_executable_dir);
+        if let Some(ref prior) = prior_path {
+            stub_path.push(":");
+            stub_path.push(prior);
+        }
+        std::env::set_var("PATH", &stub_path);
+
+        let missing_query_err = super::query_existing_tmux_env(&canonical_tmux).unwrap_err();
+        assert!(matches!(missing_query_err, DaemonError::Config(_)));
+        let missing_msg = missing_query_err.to_string();
+        assert!(
+            missing_msg.contains("failed to execute tmux to inspect existing socket"),
+            "expected execution failure, got: {missing_msg}"
+        );
+
+        let missing_scope_err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+        assert_eq!(missing_scope_err.to_string(), missing_msg);
+
+        // Restore PATH
+        match prior_path {
+            Some(val) => std::env::set_var("PATH", val),
+            None => std::env::remove_var("PATH"),
+        }
+
+        // 3. Removing the uninspectable socket restores verified clean fresh namespace
+        std::fs::remove_file(&socket_path).unwrap();
+        assert!(!socket_path.exists());
+        assert_eq!(super::query_existing_tmux_env(&intended_tmux).unwrap(), None);
+        assert!(super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).is_ok());
+
+        // 3b. Definitively stale socket from an exited server (ConnectionRefused on owned socket):
+        // Must be treated as fresh namespace without deleting the socket.
+        #[cfg(unix)]
+        {
+            let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+            drop(listener);
+            assert!(socket_path.exists());
+
+            let stale_query = super::query_existing_tmux_env(&intended_tmux).unwrap();
+            assert_eq!(stale_query, None, "stale socket must return None without manual deletion");
+            assert!(socket_path.exists(), "stale socket must not be deleted by query_existing_tmux_env");
+
+            assert!(
+                super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).is_ok(),
+                "scope validation must cleanly pass on stale socket"
+            );
+
+            std::fs::remove_file(&socket_path).unwrap();
+
+            // 3c. Active uninspectable listener (UnixListener actively listening but not tmux protocol)
+            // must fail closed and reject before AO marker
+            let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let r_clone = running.clone();
+            let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+            let _ = listener.set_nonblocking(true);
+            let handle = std::thread::spawn(move || {
+                while r_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok((mut stream, _)) = listener.accept() {
+                        use std::io::Write;
+                        let _ = stream.write_all(b"corrupted_not_tmux\n");
+                        let _ = stream.flush();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+
+            let active_err = super::query_existing_tmux_env(&intended_tmux).unwrap_err();
+            assert!(matches!(active_err, DaemonError::Config(_)));
+            assert!(
+                active_err.to_string().contains("failed to query existing tmux socket")
+                    || active_err.to_string().contains("failed to execute tmux to inspect existing socket")
+            );
+
+            let active_scope_err = super::validate_go_provider_scope("agy", &base_server, &HashMap::new()).unwrap_err();
+            assert!(matches!(active_scope_err, DaemonError::Config(_)));
+
+            running.store(false, std::sync::atomic::Ordering::Relaxed);
+            let _ = handle.join();
+            std::fs::remove_file(&socket_path).unwrap();
+        }
+
+        // 4. Nonempty Go server TMUX socket override rejects before launch
+        let mut server_with_tmux = base_server.clone();
+        server_with_tmux.insert("TMUX".to_string(), "/tmp/tmux-1000/default,3794,0".to_string());
+        let tmux_err = super::validate_go_provider_scope("agy", &server_with_tmux, &HashMap::new()).unwrap_err();
+        assert!(tmux_err.to_string().contains("conflicting nonempty TMUX socket override"));
+
+        // 4b. Nonempty project TMUX socket override rejects before launch; empty remains allowed
+        let mut proj_with_tmux = HashMap::new();
+        proj_with_tmux.insert("TMUX".to_string(), "/tmp/tmux-1000/default,3794,0".to_string());
+        let proj_err = super::validate_go_provider_scope("agy", &base_server, &proj_with_tmux).unwrap_err();
+        assert!(matches!(proj_err, DaemonError::Config(_)));
+        assert!(proj_err.to_string().contains("Go AO project scope contains conflicting nonempty TMUX socket override"));
+
+        let mut proj_with_empty_tmux = HashMap::new();
+        proj_with_empty_tmux.insert("TMUX".to_string(), "   ".to_string());
+        assert!(super::validate_go_provider_scope("agy", &base_server, &proj_with_empty_tmux).is_ok());
+
+        // 5. Non-NotFound filesystem inspection error propagates, does not treat as fresh namespace
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let unreadable_root = root.join("unreadable-tmux-dir");
+            let unreadable_parent = unreadable_root.join(format!("tmux-{}", super::current_process_uid()));
+            std::fs::create_dir_all(&unreadable_parent).unwrap();
+            let _ = std::fs::set_permissions(&unreadable_parent, std::fs::Permissions::from_mode(0o000));
+            let res = super::query_existing_tmux_env(&unreadable_root);
+            let _ = std::fs::set_permissions(&unreadable_parent, std::fs::Permissions::from_mode(0o700));
+            assert!(res.is_err(), "non-NotFound error on socket path must propagate, not return None");
+            assert!(res.unwrap_err().to_string().contains("failed to inspect private tmux socket path"));
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_controller_home_is_scoped_by_project() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var_os("DARK_FACTORY_AO_CONTROLLER_HOME");
+        let base = std::env::temp_dir().join(format!(
+            "afd_controller_scope_{}",
+            std::process::id()
+        ));
+        std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", &base);
+
+        let resolved = ao_controller_home("worldarchitect/preview").unwrap();
+
+        assert_eq!(resolved, base.join(safe_project_component("worldarchitect/preview")));
+        assert_ne!(
+            safe_project_component("a/b"),
+            safe_project_component("a_b"),
+            "distinct AO projects must never share a controller namespace"
+        );
+        let special: Vec<_> = ["", ".", ".."]
+            .into_iter()
+            .map(|project| ao_controller_home(project).unwrap())
+            .collect();
+        assert!(special.iter().all(|path| path.starts_with(&base) && path != &base));
+        assert_ne!(special[0], special[1]);
+        assert_ne!(special[1], special[2]);
+        match prior {
+            Some(value) => std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_AO_CONTROLLER_HOME"),
+        }
+    }
+
+    #[test]
+    fn controller_manifest_project_mismatch_fails_before_reaping() {
+        let manifest = AoControllerManifest {
+            pid: std::process::id(),
+            process_start_ticks: process_start_ticks(std::process::id()).unwrap(),
+            project: "other-project".to_string(),
+            target: "other-project".to_string(),
+        };
+        let error = validate_controller_manifest_project(&manifest, "dark-factory").unwrap_err();
+        assert!(error.contains("refusing to signal or remove"));
+    }
+
+    /// Returns a PID that is guaranteed dead: spawn a trivial child and wait
+    /// for it to exit, then hand back its now-recycled-eventually-but-
+    /// currently-reaped PID.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn /bin/true for a dead-pid fixture");
+        let pid = child.id();
+        child.wait().expect("wait for dead-pid fixture to exit");
+        pid
+    }
+
+    /// Inverse of `parse_ao_started_at_epoch`, for test fixtures only:
+    /// formats an epoch-seconds value the way AO's `new Date().toISOString()`
+    /// would. Uses the standard civil-from-days algorithm (inverse of the
+    /// days-from-civil algorithm the parser uses).
+    fn format_epoch_as_ao_started_at(epoch: i64) -> String {
+        let days = epoch.div_euclid(86400);
+        let secs_of_day = epoch.rem_euclid(86400);
+        let (hour, minute, second) = (secs_of_day / 3600, (secs_of_day / 60) % 60, secs_of_day % 60);
+        let z = days + 719468;
+        let era = z.div_euclid(146097);
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = if month <= 2 { y + 1 } else { y };
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.000Z")
+    }
+
+    /// Writes `running.json` with whatever `configPath` `resolve_ao_config_path`
+    /// would ACTUALLY derive for `home` right now -- calling it directly
+    /// (rather than reimplementing its default formula) keeps this fixture
+    /// correct even when the ambient dev/CI environment already exports
+    /// `AO_CONFIG_PATH`/`DARK_FACTORY_AO_CONFIG_PATH` (observed locally: a
+    /// developer shell with `AO_CONFIG_PATH` set globally silently broke a
+    /// hardcoded-formula version of this fixture). `startedAt` is derived
+    /// from `pid`'s own actual start time via `process_start_epoch_secs` so
+    /// it is self-consistent with the identity check by construction; when
+    /// the pid is already dead (the `dead_pid` fixture), falls back to now.
+    fn write_running_json(home: &std::path::Path, pid: u32, projects: &[&str]) {
+        let config_path = resolve_ao_config_path(&home.to_string_lossy());
+        write_running_json_with_config(home, pid, projects, &config_path);
+    }
+
+    fn write_running_json_with_config(
+        home: &std::path::Path,
+        pid: u32,
+        projects: &[&str],
+        config_path: &str,
+    ) {
+        let started_at_epoch = process_start_epoch_secs(pid).unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+        });
+        let started_at = format_epoch_as_ao_started_at(started_at_epoch);
+        let dir = home.join(".agent-orchestrator");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("running.json"),
+            serde_json::json!({
+                "pid": pid,
+                "projects": projects,
+                "configPath": config_path,
+                "startedAt": started_at,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// Live incident, jeff-ubuntu 2026-09-06: an operator-run AO instance was
+    /// already healthy and polling "dark-factory", but the daemon's private
+    /// controller-HOME probe could never see it (that instance's
+    /// `running.json` lives under the operator's real `$HOME`, not the
+    /// private sandbox), so every real spawn attempt saw "AO is not running"
+    /// forever. `probe_operator_ao_project` closes that gap.
+    #[test]
+    fn probe_operator_ao_project_detects_healthy_shared_instance() {
+        // AO_CONFIG_PATH/DARK_FACTORY_AO_CONFIG_PATH are process-global, and
+        // other tests in this module (via ReadyAoControllerEnv) mutate them
+        // under this same lock -- without it, a concurrent test can flip
+        // the value between this test's write and probe_operator_ao_project's
+        // own read, causing a spurious configPath mismatch.
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_healthy_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json(&home, std::process::id(), &["dark-factory", "worldarchitect"]);
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Ready(_)), "{outcome:?}");
+    }
+
+    /// The threat model both CodeRabbit and a GitHub Codex review converged
+    /// on independently: a PID recorded in a stale `running.json` (AO
+    /// crashed without cleanup) can be reused by an unrelated live process.
+    /// Binding identity to `configPath` (rather than a command-line
+    /// heuristic) means an unrelated process cannot pass this check merely
+    /// by existing -- its `running.json` would need to also declare our
+    /// exact AO config path, which PID reuse cannot produce by accident.
+    #[test]
+    fn probe_operator_ao_project_rejects_config_path_mismatch() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_config_mismatch_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json_with_config(
+            &home,
+            std::process::id(),
+            &["dark-factory"],
+            "/some/other/unrelated-config.yaml",
+        );
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    /// The gap that survived Round 1 (configPath alone): a `running.json`
+    /// genuinely written by the real AO before it crashed without cleanup
+    /// still declares the correct configPath and project verbatim. If the
+    /// OS later reissues that same PID to any unrelated process, the
+    /// unrelated process's mere liveness plus the stale-but-accurate
+    /// configPath would otherwise pass every prior check. A process that
+    /// took over a recycled PID necessarily started AFTER the file's own
+    /// `startedAt` claim (live-verified gap found by an independent /advice
+    /// pass reading the real host, PR #839 review) -- so a `startedAt` far
+    /// in the past relative to the live PID's actual start time must be
+    /// rejected even though the PID is alive right now.
+    #[test]
+    fn probe_operator_ao_project_rejects_started_at_mismatch() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_started_at_mismatch_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let config_path = resolve_ao_config_path(&home.to_string_lossy());
+        // A startedAt far enough in the past that no real process start-time
+        // tolerance could excuse it, while the pid (this test binary) is
+        // genuinely alive right now -- exactly the stale-file-plus-live-
+        // unrelated-pid shape the check must reject.
+        write_running_json_with_config(&home, std::process::id(), &["dark-factory"], &config_path);
+        let running_path = home.join(".agent-orchestrator/running.json");
+        let mut running: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&running_path).unwrap()).unwrap();
+        running["startedAt"] = serde_json::Value::String("2000-01-01T00:00:00.000Z".to_string());
+        std::fs::write(&running_path, running.to_string()).unwrap();
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    #[test]
+    fn probe_operator_ao_project_rejects_missing_started_at() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_missing_started_at_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let config_path = resolve_ao_config_path(&home.to_string_lossy());
+        let dir = home.join(".agent-orchestrator");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("running.json"),
+            serde_json::json!({
+                "pid": std::process::id(),
+                "projects": ["dark-factory"],
+                "configPath": config_path,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    #[test]
+    fn parse_ao_started_at_epoch_matches_known_values() {
+        assert_eq!(
+            parse_ao_started_at_epoch("2026-09-06T12:10:23.191Z"),
+            Some(1788696623)
+        );
+        assert_eq!(
+            parse_ao_started_at_epoch("1970-01-01T00:00:00.000Z"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_ao_started_at_epoch("2000-03-01T00:00:00.000Z"),
+            Some(951868800)
+        );
+        assert_eq!(parse_ao_started_at_epoch("not-a-timestamp"), None);
+        assert_eq!(parse_ao_started_at_epoch("2026-09-06T12:10:23.191"), None);
+    }
+
+    #[test]
+    fn started_at_round_trips_through_format_and_parse() {
+        for epoch in [0_i64, 1788696623, 951868800, 1893456000] {
+            let formatted = format_epoch_as_ao_started_at(epoch);
+            assert_eq!(
+                parse_ao_started_at_epoch(&formatted),
+                Some(epoch),
+                "round-trip failed for {epoch} -> {formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_operator_ao_project_rejects_project_not_in_running_json() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_wrong_project_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json(&home, std::process::id(), &["worldarchitect"]);
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    #[test]
+    fn probe_operator_ao_project_rejects_dead_pid() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_dead_pid_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json(&home, dead_pid(), &["dark-factory"]);
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    #[test]
+    fn probe_operator_ao_project_rejects_missing_running_json() {
+        let home = std::env::temp_dir().join(format!(
+            "afd_operator_probe_missing_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let outcome = probe_operator_ao_project("dark-factory", &home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(outcome, AoReadiness::Unavailable), "{outcome:?}");
+    }
+
+    /// The actual bug: `ensure_ao_recovery_for_target` must short-circuit to
+    /// `Healthy` the moment a shared operator instance is already polling the
+    /// project, WITHOUT ever invoking the `ao` binary. Proven here with a
+    /// stub `ao` on PATH that always exits nonzero -- if the private-sandbox
+    /// recovery path ran at all, `Command::new("ao").spawn()` would succeed
+    /// (the stub exists) but the stub's failure would surface as
+    /// `Unknown`/`FailClosed`, not `Healthy`. A stub that actively fails is a
+    /// stronger negative proof than an empty PATH entry, which would pass
+    /// silently if a real `ao` happened to be reachable elsewhere on PATH in
+    /// some other environment (CodeRabbit finding on PR #839).
+    #[test]
+    fn ensure_ao_recovery_short_circuits_when_operator_instance_already_healthy() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_operator_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+        let prior_path = std::env::var_os("PATH");
+        let home = std::env::temp_dir().join(format!(
+            "afd_recovery_short_circuit_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        write_running_json(&home, std::process::id(), &["dark-factory"]);
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &home);
+        // Prepend a directory containing a hard-failing `ao` stub, ahead of
+        // the real PATH, so if the private-sandbox path ran at all it would
+        // hit this stub (not silently succeed via some other `ao` on PATH),
+        // while keeping the real PATH so `ps`/`true`/`sh` (used by liveness
+        // checks and the fake-AO fixture) keep working on macOS test runs.
+        let empty_bin = std::env::temp_dir().join(format!(
+            "afd_recovery_short_circuit_bin_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&empty_bin).unwrap();
+        let ao_stub = empty_bin.join("ao");
+        std::fs::write(
+            &ao_stub,
+            "#!/bin/sh\necho 'stub ao: recovery must not invoke ao' >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&ao_stub).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&ao_stub, permissions).unwrap();
+        }
+        let mut paths = vec![empty_bin.clone()];
+        paths.extend(std::env::split_paths(&prior_path.clone().unwrap_or_default()));
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+
+        let outcome = ensure_ao_recovery_for_target("dark-factory", "dark-factory");
+        let _ = std::fs::remove_dir_all(&empty_bin);
+
+        match prior_operator_home {
+            Some(value) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        match prior_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            matches!(outcome, RecoveryOutcome::Healthy { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// When a shared operator instance is already healthy for the project,
+    /// the bridge's `HOME` must point at the operator's real home (where
+    /// AO's own `getRunning()` will actually find it) instead of the private
+    /// controller sandbox.
+    #[test]
+    fn ao_controller_env_uses_operator_home_when_shared_instance_healthy() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_operator_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+        let prior_controller_home = std::env::var_os("DARK_FACTORY_AO_CONTROLLER_HOME");
+        let home = std::env::temp_dir().join(format!(
+            "afd_controller_env_operator_home_{}",
+            std::process::id()
+        ));
+        let controller_base = std::env::temp_dir().join(format!(
+            "afd_controller_env_private_home_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&controller_base);
+        write_running_json(&home, std::process::id(), &["dark-factory"]);
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &home);
+        std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", &controller_base);
+
+        let env = ao_controller_env("dark-factory").unwrap();
+
+        match prior_operator_home {
+            Some(value) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        match prior_controller_home {
+            Some(value) => std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_AO_CONTROLLER_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&controller_base);
+
+        let resolved_home = env
+            .iter()
+            .find(|(key, _)| key == "HOME")
+            .map(|(_, value)| value.clone())
+            .expect("HOME must be set");
+        assert_eq!(resolved_home, home.to_string_lossy());
+    }
+
+    #[test]
+    fn ps_start_identity_is_stable_and_rejects_empty_output() {
+        let first = process_start_identity_from_ps(b"Sun Aug 31 17:00:01 2026\n").unwrap();
+        let second = process_start_identity_from_ps(b"Sun Aug 31 17:00:01 2026\n").unwrap();
+        assert_eq!(first, second);
+        assert_ne!(first, 0);
+        assert!(process_start_identity_from_ps(b"  \n").is_none());
+    }
+
+    #[test]
+    fn session_owner_lookup_uses_spawn_project_and_safe_fallback() {
+        let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+        let owned = SessionId("wa-owned".to_string());
+        let unknown = SessionId("wa-unknown".to_string());
+        sessions.record_session_project(&owned, "worldarchitect");
+
+        assert_eq!(sessions.project_for_session(&owned).unwrap(), "worldarchitect");
+        assert_eq!(sessions.project_for_session(&unknown).unwrap(), "dark-factory");
+    }
+
+    #[test]
+    fn restored_session_and_branch_owners_survive_new_adapter_instance() {
+        let restarted = CliSessions::with_restored_projects(
+            "jleechanorg/dark-factory",
+            "minimax",
+            [(Some("wa-owned".to_string()), Some("factory/wa-owned-r1".to_string()), "worldarchitect".to_string())],
+            false,
+        ).unwrap();
+        assert_eq!(restarted.project_for_session(&SessionId("wa-owned".into())).unwrap(), "worldarchitect");
+        assert_eq!(restarted.project_for_branch("factory/wa-owned-r1").unwrap(), "worldarchitect");
+        assert!(restarted.project_for_session(&SessionId("unknown".into())).is_err());
+        assert!(restarted.project_for_branch("factory/unknown-r1").is_err());
+    }
+
+    #[test]
+    fn restored_session_rejects_conflicting_branch_identity() {
+        let result = CliSessions::with_restored_projects(
+            "jleechanorg/dark-factory",
+            "minimax",
+            [
+                (Some("wa-owned".to_string()), Some("factory/first-r1".to_string()), "worldarchitect".to_string()),
+                (Some("wa-owned".to_string()), Some("factory/second-r1".to_string()), "worldarchitect".to_string()),
+            ],
+            false,
+        );
+        let error = match result {
+            Ok(_) => panic!("conflicting durable identity must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("conflicting branch identities"));
     }
 
     fn bridge_test_node() -> std::path::PathBuf {
@@ -3898,12 +7818,22 @@ import os
 import sys
 
 args = sys.argv[1:]
-if args[:2] == ["session", "kill"] and len(args) == 3:
+if args[:2] == ["session", "kill"]:
+    assert len(args) == 5, args
+    assert args[3] == "-p", args
     with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"kind": "kill", "args": args, "session": args[2]}) + "\n")
+        handle.write(json.dumps({"kind": "kill", "args": args, "session": args[2], "project": args[4]}) + "\n")
     if os.environ.get("AO_FAKE_KILL_FAIL") == "1":
         print("scripted batch cleanup failure", file=sys.stderr)
         raise SystemExit(8)
+    raise SystemExit(0)
+if args[:1] == ["status"]:
+    assert len(args) == 4, args
+    assert args[1] == "-p", args
+    assert args[3] == "--json", args
+    with open(os.environ["AO_FAKE_LOG"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"kind": "status", "args": args, "project": args[2]}) + "\n")
+    print(os.environ.get("AO_FAKE_STATUS_JSON", "[]"))
     raise SystemExit(0)
 assert len(args) == 7, args
 assert args[:5] == ["spawn", "--project", "dark-factory", "--agent", "minimax"], args
@@ -3931,36 +7861,93 @@ print("  Branch:   " + os.environ.get("AO_FAKE_RETURN_BRANCH", os.environ["DARK_
         dir
     }
 
+    struct ReadyAoControllerEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ReadyAoControllerEnv {
+        fn seed(root: &std::path::Path) -> Self {
+            const ENV_VARS: [(&str, &str); 7] = [
+                ("DARK_FACTORY_AO_CONTROLLER_HOME", ""),
+                ("DARK_FACTORY_OPERATOR_HOME", ""),
+                ("DARK_FACTORY_AO_CONFIG_PATH", ""),
+                ("DARK_FACTORY_AO_RECOVERY_TIMEOUT_MS", "100"),
+                ("DARK_FACTORY_AO_RECOVERY_POLL_MS", "1"),
+                ("DARK_FACTORY_AO_RECOVERY_SUSTAIN_MS", "1"),
+                ("DARK_FACTORY_AO_RECOVERY_COOLDOWN_MS", "1"),
+            ];
+            let controller_base = root.join("controller-home");
+            let controller_home = controller_base.join("dark-factory");
+            let operator_home = root.join("operator-home");
+            let config_path = operator_home.join("agent-orchestrator.yaml");
+            std::fs::create_dir_all(controller_home.join(".agent-orchestrator")).unwrap();
+            std::fs::create_dir_all(&operator_home).unwrap();
+
+            let pid = std::process::id();
+            let start_ticks = process_start_ticks(pid)
+                .expect("test process must expose /proc start ticks for AO readiness");
+            std::fs::write(
+                controller_home.join("controller.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "pid": pid,
+                    "process_start_ticks": start_ticks,
+                    "project": "dark-factory",
+                    "target": "dark-factory",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                controller_home.join(".agent-orchestrator/running.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "pid": pid,
+                    "projects": ["dark-factory"],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let saved = ENV_VARS
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            for (key, default) in ENV_VARS {
+                let value = match key {
+                    "DARK_FACTORY_AO_CONTROLLER_HOME" => controller_base.as_os_str(),
+                    "DARK_FACTORY_OPERATOR_HOME" => operator_home.as_os_str(),
+                    "DARK_FACTORY_AO_CONFIG_PATH" => config_path.as_os_str(),
+                    _ => std::ffi::OsStr::new(default),
+                };
+                std::env::set_var(key, value);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for ReadyAoControllerEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     fn with_fake_ao<T>(
         test_name: &str,
         bindings: serde_json::Value,
         run: impl FnOnce(&std::path::Path) -> T,
     ) -> T {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = fake_ao_dir(test_name);
+        let _ready_controller = ReadyAoControllerEnv::seed(&dir);
         let log = dir.join("calls.jsonl");
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        let old_bindings = std::env::var("AO_FAKE_EXPECTED_BINDINGS").ok();
-        let old_log = std::env::var("AO_FAKE_LOG").ok();
-        std::env::set_var("PATH", format!("{}:{old_path}", dir.display()));
-        std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", bindings.to_string());
-        std::env::set_var("AO_FAKE_LOG", &log);
-
-        let result = run(&log);
-
-        std::env::set_var("PATH", old_path);
-        match old_bindings {
-            Some(value) => std::env::set_var("AO_FAKE_EXPECTED_BINDINGS", value),
-            None => std::env::remove_var("AO_FAKE_EXPECTED_BINDINGS"),
-        }
-        match old_log {
-            Some(value) => std::env::set_var("AO_FAKE_LOG", value),
-            None => std::env::remove_var("AO_FAKE_LOG"),
-        }
-        let _ = std::fs::remove_dir_all(dir);
-        result
+        let _env = TestEnvGuard::install(&dir, &bindings, &log);
+        run(&log)
     }
 
     fn run_bridge_with_registered_source(
@@ -4367,7 +8354,7 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn bridge_fails_closed_when_adopted_origin_ref_head_diverges_from_expected_revision() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Build a remote whose `alice/<branch>` is at SHA X, but pass
@@ -4574,6 +8561,275 @@ export const isTerminalSession = () => false;
     }
 
     #[test]
+    fn go_ao_dispatch_arguments_and_binary() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_holdouts = std::env::var_os("DARK_FACTORY_HOLDOUTS");
+
+        let temp_holdouts = std::env::temp_dir().join(format!("df_test_holdouts_go_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_holdouts);
+        let _scope = SyntheticAccountScopeEnv::install(&temp_holdouts);
+        std::env::set_var("DARK_FACTORY_HOLDOUTS", &temp_holdouts);
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+
+        let test_spec = spec("test prompt message", "factory/go-ao-branch");
+        let cmd = super::ao_spawn_command_with_mode("antigravity", &test_spec, false)
+            .expect("ao_spawn_command_with_mode must succeed for strongdm-go");
+
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+
+        // Binary check
+        if std::env::consts::OS == "macos" {
+            assert_eq!(cmd.get_program(), "sandbox-exec");
+            assert!(args.contains(&"ao-go".to_string()));
+        } else {
+            assert_eq!(cmd.get_program(), "ao-go");
+        }
+
+        // Arguments check: spawn --project <proj> --harness <agent> --branch <branch> --prompt <prompt>
+        assert!(args.contains(&"spawn".to_string()));
+        assert!(args.contains(&"--project".to_string()));
+        assert!(args.contains(&"dark-factory".to_string()));
+        assert!(args.contains(&"--harness".to_string()));
+        assert!(args.contains(&"agy".to_string()));
+        assert!(args.contains(&"--branch".to_string()));
+        assert!(args.contains(&"factory/go-ao-branch".to_string()));
+        assert!(args.contains(&"--prompt".to_string()));
+        assert!(args.contains(&"test prompt message".to_string()));
+
+        // Ensure NODE_OPTIONS and preload bridge are NOT set in env
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(!envs.iter().any(|(k, v)| k.to_str() == Some("NODE_OPTIONS") && v.is_some()));
+        assert!(!envs.iter().any(|(k, v)| k.to_str() == Some("DARK_FACTORY_AO_V013_BRIDGE") && v.is_some()));
+
+        let _ = std::fs::remove_dir_all(&temp_holdouts);
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_holdouts {
+            Some(v) => std::env::set_var("DARK_FACTORY_HOLDOUTS", v),
+            None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
+        }
+    }
+
+    #[test]
+    fn go_ao_build_runtime_fallback_chain() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+
+        // 1. antigravity and agy canonicalize to "agy", duplicates deduped, minimax/claudem/aow omitted
+        let chain = super::build_runtime_fallback_chain("agy", "antigravity->agy->aow->minimax->claudem");
+        assert_eq!(chain, vec!["agy".to_string()]);
+
+        // 2. claude and claude-code canonicalize to "claude-code", codex to "codex", minimax omitted
+        let chain = super::build_runtime_fallback_chain("antigravity", "claude->codex->minimax->claude-code");
+        assert_eq!(
+            chain,
+            vec![
+                "agy".to_string(),
+                "claude-code".to_string(),
+                "codex".to_string(),
+            ]
+        );
+
+        // 3. unsupported default agent (minimax) is omitted from chain
+        let chain = super::build_runtime_fallback_chain("minimax", "claude-code->antigravity->agy");
+        assert_eq!(
+            chain,
+            vec![
+                "claude-code".to_string(),
+                "agy".to_string(),
+            ]
+        );
+
+        // 4. codex default with agy and claude in fallback
+        let chain = super::build_runtime_fallback_chain("codex", "agy->claude");
+        assert_eq!(
+            chain,
+            vec![
+                "codex".to_string(),
+                "agy".to_string(),
+                "claude-code".to_string(),
+            ]
+        );
+
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+    }
+
+    #[test]
+    fn ao_spawn_agent_scope_validation() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_holdouts = std::env::var_os("DARK_FACTORY_HOLDOUTS");
+        let temp_holdouts = std::env::temp_dir().join(format!("df_test_holdouts_val_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_holdouts);
+        std::env::set_var("DARK_FACTORY_HOLDOUTS", &temp_holdouts);
+
+        let test_spec = spec("test prompt", "factory/val-branch");
+
+        // Unknown agent fails closed
+        let res = super::ao_spawn_command_with_mode("unsupported-agent", &test_spec, false);
+        assert!(res.is_err());
+        assert!(format!("{}", res.unwrap_err()).contains("Unsupported AO worker agent"));
+
+        // Claude without DARK_FACTORY_CLAUDE_CONFIG_DIR fails closed
+        let prior_claude = std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR");
+        std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR");
+        let res = super::ao_spawn_command_with_mode("claude", &test_spec, false);
+        assert!(res.is_err());
+
+        // Restore
+        match prior_claude {
+            Some(v) => std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR"),
+        }
+        match prior_holdouts {
+            Some(v) => std::env::set_var("DARK_FACTORY_HOLDOUTS", v),
+            None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_holdouts);
+    }
+
+    #[test]
+    fn node_ao_agy_spawn_preserves_controller_home_and_validates_account_root() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_holdouts = std::env::var_os("DARK_FACTORY_HOLDOUTS");
+        let prior_controller = std::env::var_os("DARK_FACTORY_AO_CONTROLLER_HOME");
+        let prior_operator = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+        let prior_ao_orig = std::env::var_os("AO_ORIGINAL_HOME");
+        let prior_agy_home = std::env::var_os("DARK_FACTORY_AGY_HOME");
+
+        let root = std::env::temp_dir().join(format!("df_test_node_agy_scope_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::create_dir_all(&root);
+
+        let temp_holdouts = root.join("holdouts");
+        let _ = std::fs::create_dir_all(&temp_holdouts);
+        std::env::set_var("DARK_FACTORY_HOLDOUTS", &temp_holdouts);
+
+        let controller_base = root.join("controller-base");
+        let _ = std::fs::create_dir_all(&controller_base);
+        std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", &controller_base);
+
+        let agy_home = root.join("intended-agy-home");
+        let _ = std::fs::create_dir_all(&agy_home);
+        std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_home);
+
+        // Node AO mode
+        std::env::remove_var("DARK_FACTORY_AO_ENGINE");
+
+        let test_spec = spec("test prompt", "factory/node-agy-branch");
+
+        // 1. Matching intended AO_ORIGINAL_HOME account profile succeeds
+        // and private controller HOME remains selected (not overwritten with agy_home)
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &agy_home);
+        std::env::set_var("AO_ORIGINAL_HOME", &agy_home);
+
+        let cmd = super::ao_spawn_command_with_mode("antigravity", &test_spec, false)
+            .expect("matching AO_ORIGINAL_HOME and DARK_FACTORY_AGY_HOME must succeed");
+
+        let env_map: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|val| (k.to_string_lossy().to_string(), val.to_string_lossy().to_string()))
+            })
+            .collect();
+
+        let expected_controller_home = controller_base
+            .join(safe_project_component(&test_spec.ao_project))
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            env_map.get("HOME").map(String::as_str),
+            Some(expected_controller_home.as_str()),
+            "private controller HOME must remain selected for Node ao command"
+        );
+        assert_ne!(
+            env_map.get("HOME").map(String::as_str),
+            Some(agy_home.to_string_lossy().as_ref()),
+            "Node ao command must NOT overwrite controller HOME with AGY profile home"
+        );
+        let agy_canonical = agy_home.canonicalize().unwrap().to_string_lossy().into_owned();
+        let ao_orig_canonical = std::path::Path::new(env_map.get("AO_ORIGINAL_HOME").unwrap())
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            ao_orig_canonical,
+            agy_canonical,
+            "AO_ORIGINAL_HOME must equal intended AGY profile"
+        );
+
+        // 2. Mismatched AGY profile fails before child
+        let mismatched_home = root.join("other-operator-home");
+        let _ = std::fs::create_dir_all(&mismatched_home);
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &mismatched_home);
+        std::env::set_var("AO_ORIGINAL_HOME", &mismatched_home);
+
+        let err = super::ao_spawn_command_with_mode("antigravity", &test_spec, false)
+            .expect_err("mismatched AGY profile and AO_ORIGINAL_HOME must fail before child");
+        assert!(
+            format!("{err}").contains("does not match intended AGY home"),
+            "error should indicate profile mismatch: {err}"
+        );
+
+        // Also test "agy" alias with mismatched profile
+        let err_alias = super::ao_spawn_command_with_mode("agy", &test_spec, false)
+            .expect_err("mismatched AGY profile must fail closed for 'agy' alias");
+        assert!(format!("{err_alias}").contains("does not match intended AGY home"));
+
+        // 3. Go actual scope remains unchanged
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+        let go_cmd = super::ao_spawn_command_with_mode("antigravity", &test_spec, false)
+            .expect("Go AO scope must succeed even with operator home pointing elsewhere");
+        let go_args: Vec<String> = go_cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert!(go_args.contains(&"--harness".to_string()));
+        assert!(go_args.contains(&"agy".to_string()));
+
+        // Cleanup
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_holdouts {
+            Some(v) => std::env::set_var("DARK_FACTORY_HOLDOUTS", v),
+            None => std::env::remove_var("DARK_FACTORY_HOLDOUTS"),
+        }
+        match prior_controller {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_CONTROLLER_HOME"),
+        }
+        match prior_operator {
+            Some(v) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        match prior_ao_orig {
+            Some(v) => std::env::set_var("AO_ORIGINAL_HOME", v),
+            None => std::env::remove_var("AO_ORIGINAL_HOME"),
+        }
+        match prior_agy_home {
+            Some(v) => std::env::set_var("DARK_FACTORY_AGY_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_AGY_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn single_spawn_uses_v013_positional_prompt_and_exact_branch_binding() {
         let prompt = "single prompt with spaces\nand a second line";
         let branch = "factory/jleechan-contract-single-r1";
@@ -4649,15 +8905,214 @@ export const isTerminalSession = () => false;
     }
 
     #[test]
+    fn worker_spawn_refreshes_clean_managed_checkout_before_exact_head_validation() {
+        let real_git = system_git();
+        let root = std::env::temp_dir().join(format!(
+            "afd_clean_managed_stale_checkout_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(std::process::Command::new(&real_git)
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new(&real_git)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/jleechanorg/dark-factory.git",
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let commit = |message: &str| {
+            assert!(std::process::Command::new(&real_git)
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "user.name=Test",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    message,
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+            String::from_utf8(
+                std::process::Command::new(&real_git)
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(&root)
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string()
+        };
+        let stale_head = commit("stale managed snapshot");
+        let expected_head = commit("adopted PR head");
+        assert_ne!(stale_head, expected_head);
+        assert!(std::process::Command::new(&real_git)
+            .args(["checkout", "-q", "--detach", &stale_head])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let prompt = "refresh clean managed stale checkout";
+        let branch = "factory/jleechan-contract-clean-managed-refresh-r1";
+        let (spawn_result, calls) = with_fake_ao(
+            "clean_managed_refresh",
+            serde_json::json!({prompt: branch}),
+            |log| {
+                let fake_git = log.parent().unwrap().join("git");
+                std::fs::write(
+                    &fake_git,
+                    r#"#!/bin/sh
+if [ "$1" = "fetch" ]; then
+  exit 0
+fi
+exec "$FAKE_GIT_REAL_BIN" "$@"
+"#,
+                )
+                .unwrap();
+                let mut permissions = std::fs::metadata(&fake_git).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&fake_git, permissions).unwrap();
+
+                let saved_real_git = std::env::var_os("FAKE_GIT_REAL_BIN");
+                let saved_workspace = std::env::var_os("AO_FAKE_WORKTREE");
+                std::env::set_var("FAKE_GIT_REAL_BIN", &real_git);
+                std::env::set_var("AO_FAKE_WORKTREE", &root);
+                let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+                let mut managed = spec(prompt, branch);
+                managed.local_checkout = Some(root.clone());
+                managed.managed_checkout = true;
+                managed.expected_revision = Some(expected_head.clone());
+                let result = sessions.spawn(&managed);
+                match saved_real_git {
+                    Some(value) => std::env::set_var("FAKE_GIT_REAL_BIN", value),
+                    None => std::env::remove_var("FAKE_GIT_REAL_BIN"),
+                }
+                match saved_workspace {
+                    Some(value) => std::env::set_var("AO_FAKE_WORKTREE", value),
+                    None => std::env::remove_var("AO_FAKE_WORKTREE"),
+                }
+                (result, std::fs::read_to_string(log).unwrap_or_default())
+            },
+        );
+        let observed_head = String::from_utf8(
+            std::process::Command::new(&real_git)
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let session = spawn_result.unwrap_or_else(|error| {
+            panic!("clean daemon-managed checkout must refresh before validation: {error}")
+        });
+        assert!(!session.0.is_empty());
+        assert_eq!(observed_head, expected_head);
+        assert_eq!(
+            calls.lines().filter(|line| !line.trim().is_empty()).count(),
+            1,
+            "AO must spawn exactly once after refresh: {calls}"
+        );
+    }
+
+    /// jleechan round-2 finding P1 (4c): "adopted PR" is not a separate
+    /// boolean/struct field in this file -- `SpawnSpec.expected_revision`'s
+    /// doc comment (tools.rs) says explicitly: "For adopted remediation this
+    /// is the remote branch SHA captured immediately before dispatch; a
+    /// same-origin checkout at another HEAD is unsafe." That IS the
+    /// adopted-PR-drift mechanism this file has, and it is the exact same
+    /// pre-spawn gate `worker_spawn_rejects_stale_expected_revision_before_ao`
+    /// exercises above. This test is intentionally that same mechanism,
+    /// explicitly named and framed for the adopted-PR review finding (using
+    /// the real checkout at its real HEAD, with `expected_revision` set to a
+    /// distinct placeholder standing in for "the adopted PR's head captured
+    /// at intake time", which the checkout has since drifted away from) --
+    /// it is NOT a new code path, since adapters.rs has no separate
+    /// adopted-PR-specific construct beyond `expected_revision`.
+    #[test]
+    fn adopted_pr_rejects_drift_before_ao_spawn() {
+        let prompt = "adopted PR drift prompt";
+        let branch = "factory/jleechan-contract-adopted-pr-drift-r1";
+        // Real checkout (CARGO_MANIFEST_DIR, not `std::env::current_dir()` --
+        // see `worker_spawn_rejects_same_origin_stale_ao_workspace_after_spawn`
+        // above for why the latter is a cross-test cwd race).
+        let checkout = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // Stands in for "the adopted PR's remote branch head captured before
+        // dispatch" -- a real-shaped SHA the checkout's actual HEAD does not
+        // match, i.e. drift since intake.
+        let adopted_pr_head = "f".repeat(40);
+
+        let (spawn_result, calls) = with_fake_ao(
+            "adopted_pr_drift",
+            serde_json::json!({prompt: branch}),
+            |log| {
+                let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+                let mut adopted = spec(prompt, branch);
+                adopted.local_checkout = Some(checkout.clone());
+                adopted.expected_revision = Some(adopted_pr_head.clone());
+                let result = sessions.spawn(&adopted);
+                let calls = std::fs::read_to_string(log).unwrap_or_default();
+                (result, calls)
+            },
+        );
+
+        let error = spawn_result.expect_err("drifted adopted-PR checkout must fail closed before ao spawn");
+        assert!(error.to_string().contains("expected snapshot"), "{error}");
+        assert!(calls.is_empty(), "AO must never be invoked when the adopted PR's checkout has drifted");
+    }
+
+    #[test]
     fn worker_spawn_rejects_same_origin_stale_ao_workspace_after_spawn() {
+        let real_git = system_git();
         let prompt = "same origin stale AO workspace";
         let branch = "factory/jleechan-contract-stale-ao-workspace-r1";
-        let checkout = std::env::current_dir().unwrap();
-        let expected_revision = std::process::Command::new("git")
+        // jleechan round-2 CI-blocking finding: this used to read
+        // `std::env::current_dir()`, a PROCESS-WIDE mutable value. Under
+        // `cargo test`'s default parallel execution, `offline_cache_tests`'
+        // `OfflineDir` calls `std::env::set_current_dir` (guarded by
+        // `crate::test_env_lock()`) for the FULL lifetime of its own tests. This
+        // test read `current_dir()` here BEFORE ever acquiring
+        // `crate::test_env_lock()` (that only happens later, inside
+        // `with_fake_ao`), so it could observe `OfflineDir`'s temp
+        // directory instead of the real checkout, making `git rev-parse
+        // HEAD` below fail/return something unrelated to the actual repo
+        // state and silently flipping this test's outcome. `CARGO_MANIFEST_DIR`
+        // is a compile-time constant embedded by the build (already used
+        // by `ao_spawn_bridge_path` above for the same reason) and is
+        // exactly what `current_dir()` resolves to here in the unraced
+        // case anyway (Cargo sets a test binary's cwd to its package root),
+        // so this is a like-for-like substitution that removes the shared
+        // mutable global dependency instead of adding a lock (locking here
+        // would deadlock: `with_fake_ao` below re-acquires the same
+        // non-reentrant `crate::test_env_lock()`).
+        let checkout = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let expected_revision = std::process::Command::new(&real_git)
             .args(["rev-parse", "HEAD"])
             .current_dir(&checkout)
             .output()
             .unwrap();
+        assert!(expected_revision.status.success());
         let expected_revision = String::from_utf8(expected_revision.stdout)
             .unwrap()
             .trim()
@@ -4668,12 +9123,13 @@ export const isTerminalSession = () => false;
         ));
         let _ = std::fs::remove_dir_all(&workspace);
         std::fs::create_dir_all(&workspace).unwrap();
-        std::process::Command::new("git")
+        assert!(std::process::Command::new(&real_git)
             .args(["init", "-q"])
             .current_dir(&workspace)
             .status()
-            .unwrap();
-        std::process::Command::new("git")
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new(&real_git)
             .args([
                 "remote",
                 "add",
@@ -4682,8 +9138,9 @@ export const isTerminalSession = () => false;
             ])
             .current_dir(&workspace)
             .status()
-            .unwrap();
-        std::process::Command::new("git")
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new(&real_git)
             .args([
                 "-c",
                 "user.email=test@example.invalid",
@@ -4696,7 +9153,8 @@ export const isTerminalSession = () => false;
             ])
             .current_dir(&workspace)
             .status()
-            .unwrap();
+            .unwrap()
+            .success());
 
         let (spawn_result, calls) = with_fake_ao(
             "stale_ao_workspace",
@@ -4726,6 +9184,173 @@ export const isTerminalSession = () => false;
             .collect();
         assert_eq!(rows.iter().filter(|row| row["kind"] == "spawn").count(), 1);
         assert_eq!(rows.iter().filter(|row| row["kind"] == "kill").count(), 1);
+    }
+
+    /// jleechan finding P1: pre-spawn validation used to run
+    /// `validate_existing_target_worktree` (which hard-requires the checkout
+    /// to already be a directory) before `ao_spawn_command`, even though
+    /// `ao_spawn_command` -> `ensure_managed_target_worktree` is the code
+    /// that provisions a missing managed checkout by cloning it. That made
+    /// every first-ever spawn into a brand new managed checkout fail closed
+    /// with "is not a directory" before the provisioning step ever ran. This
+    /// test drives the real `ensure_managed_target_worktree` clone path
+    /// (redirected to a local, offline "origin") through the same call
+    /// sequence `run_spawn_process` uses, so it fails red on the ordering bug
+    /// and passes once pre-spawn validation only applies to checkouts that
+    /// already exist.
+    #[test]
+    fn worker_spawn_provisions_missing_managed_checkout_before_pre_spawn_validation() {
+        // Deliberately distinct from `fake_ao_dir`'s
+        // `afd_ao_spawn_contract_<test_name>_<pid>` naming scheme: that
+        // helper `remove_dir_all`s its own directory on entry, which would
+        // otherwise wipe this root (and the source repo staged inside it)
+        // the moment `with_fake_ao` starts.
+        let root = std::env::temp_dir().join(format!(
+            "afd_missing_managed_checkout_src_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Local "source" repo stands in for the real GitHub remote so the
+        // clone `ao_spawn_command` performs for a missing managed checkout
+        // stays fully offline.
+        let source = root.join("source-repo");
+        std::fs::create_dir_all(&source).unwrap();
+        let source_str = source.to_string_lossy().to_string();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "uploadpack.allowReachableSHA1InWant", "true"])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "seed",
+            ])
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        let expected_revision = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&source)
+            .output()
+            .unwrap();
+        let expected_revision = String::from_utf8(expected_revision.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let prompt = "missing managed checkout prompt";
+        let branch = "factory/jleechan-contract-missing-managed-checkout-r1";
+        let repo = "jleechanorg/dark-factory-managed-missing-test";
+        let checkout = root.join("managed-target");
+        assert!(!checkout.exists(), "checkout must start out missing");
+
+        let real_git = system_git();
+
+        let (spawn_result, calls) = with_fake_ao(
+            "missing_managed_checkout",
+            serde_json::json!({prompt: branch}),
+            |log| {
+                let fake_bin_dir = log.parent().unwrap();
+                let fake_git = fake_bin_dir.join("git");
+                std::fs::write(
+                    &fake_git,
+                    r#"#!/usr/bin/env python3
+import os, subprocess, sys
+args = sys.argv[1:]
+real_git = os.environ["FAKE_GIT_REAL_BIN"]
+local_source = os.environ["FAKE_GIT_LOCAL_SOURCE"]
+expected_origin = os.environ.get("FAKE_GIT_EXPECTED_ORIGIN")
+if args and args[0] == "clone":
+    new_args = [local_source if a.startswith("https://github.com/") else a for a in args]
+    sys.exit(subprocess.call([real_git] + new_args))
+if len(args) >= 2 and args[0] == "checkout" and args[1] == "--detach" and expected_origin:
+    rc = subprocess.call([real_git] + args)
+    if rc == 0:
+        subprocess.call([real_git, "remote", "set-url", "origin", expected_origin])
+    sys.exit(rc)
+os.execv(real_git, [real_git] + args)
+"#,
+                )
+                .unwrap();
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut permissions = std::fs::metadata(&fake_git).unwrap().permissions();
+                    permissions.set_mode(0o755);
+                    std::fs::set_permissions(&fake_git, permissions).unwrap();
+                }
+
+                let expected_origin = format!("https://github.com/{repo}.git");
+                let old_real = std::env::var("FAKE_GIT_REAL_BIN").ok();
+                let old_source = std::env::var("FAKE_GIT_LOCAL_SOURCE").ok();
+                let old_origin = std::env::var("FAKE_GIT_EXPECTED_ORIGIN").ok();
+                let old_worktree = std::env::var("AO_FAKE_WORKTREE").ok();
+                std::env::set_var("FAKE_GIT_REAL_BIN", &real_git);
+                std::env::set_var("FAKE_GIT_LOCAL_SOURCE", &source_str);
+                std::env::set_var("FAKE_GIT_EXPECTED_ORIGIN", &expected_origin);
+                std::env::set_var("AO_FAKE_WORKTREE", &checkout);
+
+                let sessions = CliSessions::new(repo, "minimax");
+                let mut managed = spec(prompt, branch);
+                managed.repo = repo.to_string();
+                managed.local_checkout = Some(checkout.clone());
+                managed.managed_checkout = true;
+                managed.expected_revision = Some(expected_revision.clone());
+                let result = sessions.spawn(&managed);
+                let calls = std::fs::read_to_string(log).unwrap_or_default();
+
+                match old_real {
+                    Some(v) => std::env::set_var("FAKE_GIT_REAL_BIN", v),
+                    None => std::env::remove_var("FAKE_GIT_REAL_BIN"),
+                }
+                match old_source {
+                    Some(v) => std::env::set_var("FAKE_GIT_LOCAL_SOURCE", v),
+                    None => std::env::remove_var("FAKE_GIT_LOCAL_SOURCE"),
+                }
+                match old_origin {
+                    Some(v) => std::env::set_var("FAKE_GIT_EXPECTED_ORIGIN", v),
+                    None => std::env::remove_var("FAKE_GIT_EXPECTED_ORIGIN"),
+                }
+                match old_worktree {
+                    Some(v) => std::env::set_var("AO_FAKE_WORKTREE", v),
+                    None => std::env::remove_var("AO_FAKE_WORKTREE"),
+                }
+
+                (result, calls)
+            },
+        );
+
+        let checkout_has_git_dir = checkout.join(".git").is_dir();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let session = spawn_result.unwrap_or_else(|error| {
+            panic!(
+                "missing managed checkout must be provisioned by ao_spawn_command \
+                 before pre-spawn validation runs, got: {error}"
+            )
+        });
+        assert!(!session.0.is_empty());
+        assert!(
+            checkout_has_git_dir,
+            "ao_spawn_command must provision the missing managed checkout"
+        );
+        assert!(
+            !calls.trim().is_empty(),
+            "ao spawn must have been invoked once provisioning succeeded"
+        );
     }
 
     #[test]
@@ -4806,6 +9431,138 @@ export const isTerminalSession = () => false;
             rows.iter().filter(|row| row["kind"] == "kill").count(),
             1
         );
+        let kill = rows.iter().find(|row| row["kind"] == "kill").unwrap();
+        assert_eq!(kill["project"], "dark-factory");
+    }
+
+    #[test]
+    fn explicit_stop_binds_kill_to_the_sessions_project() {
+        let (_, calls) = with_fake_ao("project_bound_stop", serde_json::json!({}), |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.stop_in_project(
+                &crate::tools::SessionId("session-project-bound".to_string()),
+                "dark-factory",
+            );
+            (result, std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        let row: serde_json::Value = calls.lines().next().unwrap().parse().unwrap();
+        assert_eq!(
+            row["args"],
+            serde_json::json!(["session", "kill", "session-project-bound", "-p", "dark-factory"])
+        );
+        assert_eq!(row["project"], "dark-factory");
+    }
+
+    #[test]
+    fn stop_uses_the_project_recorded_for_a_routed_session() {
+        let (_, calls) = with_fake_ao("routed_project_stop", serde_json::json!({}), |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            sessions
+                .spawned_session_projects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert("session-routed-project".to_string(), "secondary-project".to_string());
+            let result = sessions.stop(&crate::tools::SessionId(
+                "session-routed-project".to_string(),
+            ));
+            (result, std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        let row: serde_json::Value = calls.lines().next().unwrap().parse().unwrap();
+        assert_eq!(
+            row["args"],
+            serde_json::json!([
+                "session",
+                "kill",
+                "session-routed-project",
+                "-p",
+                "secondary-project"
+            ])
+        );
+    }
+
+    #[test]
+    fn restarted_cleanup_uses_the_callers_resolved_project() {
+        let (_, calls) = with_fake_ao("restarted_routed_project_stop", serde_json::json!({}), |log| {
+            // A new adapter has no process-local spawn map, as after a daemon
+            // restart. The durable overlay caller must still bind cleanup to
+            // its resolved repository project.
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.stop_in_project(
+                &crate::tools::SessionId("session-routed-after-restart".to_string()),
+                "secondary-project",
+            );
+            (result, std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        let row: serde_json::Value = calls.lines().next().unwrap().parse().unwrap();
+        assert_eq!(
+            row["args"],
+            serde_json::json!([
+                "session",
+                "kill",
+                "session-routed-after-restart",
+                "-p",
+                "secondary-project"
+            ])
+        );
+    }
+
+    #[test]
+    fn routed_session_status_operations_use_the_explicit_project() {
+        let (_, calls) = with_fake_ao("routed_status_project", serde_json::json!({}), |log| {
+            let previous = std::env::var("AO_FAKE_STATUS_JSON").ok();
+            std::env::set_var(
+                "AO_FAKE_STATUS_JSON",
+                r#"[{"name":"session-routed-status","branch":"factory/routed-status","activity":"idle","status":"running"}]"#,
+            );
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let id = sessions
+                .attach_in_project("factory/routed-status", "bead-status", "secondary-project")
+                .unwrap();
+            assert!(!sessions.is_quiescent_in_project(&id, "secondary-project").unwrap());
+            assert_eq!(
+                sessions
+                    .session_activity_in_project(&id, "secondary-project")
+                    .unwrap(),
+                crate::tools::SessionActivity::Idle
+            );
+            assert_eq!(
+                sessions
+                    .session_branch_in_project(&id, "secondary-project")
+                    .unwrap()
+                    .as_deref(),
+                Some("factory/routed-status")
+            );
+            match previous {
+                Some(value) => std::env::set_var("AO_FAKE_STATUS_JSON", value),
+                None => std::env::remove_var("AO_FAKE_STATUS_JSON"),
+            }
+            ((), std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 4);
+        for row in rows {
+            assert_eq!(row["kind"], "status");
+            assert_eq!(row["args"], serde_json::json!(["status", "-p", "secondary-project", "--json"]));
+        }
+    }
+
+    #[test]
+    fn unscoped_stop_rejects_an_unowned_session() {
+        let (result, calls) = with_fake_ao("unowned_project_stop", serde_json::json!({}), |log| {
+            let sessions = CliSessions::new("jleechanorg/dark-factory", "minimax");
+            let result = sessions.stop(&crate::tools::SessionId("unknown-session".to_string()));
+            (result, std::fs::read_to_string(log).unwrap_or_default())
+        });
+
+        assert!(result.unwrap_err().to_string().contains("refusing unscoped cleanup"));
+        assert!(calls.is_empty(), "unowned session must not issue an AO kill");
     }
 
     #[test]
@@ -4907,8 +9664,9 @@ export const isTerminalSession = () => false;
         assert_eq!(kills.len(), successful_spawns.len(), "calls={calls}");
         assert_eq!(
             kills[0]["args"],
-            serde_json::json!(["session", "kill", kills[0]["session"]])
+            serde_json::json!(["session", "kill", kills[0]["session"], "-p", first.ao_project])
         );
+        assert_eq!(kills[0]["project"], first.ao_project);
     }
 
     #[test]
@@ -4975,6 +9733,224 @@ export const isTerminalSession = () => false;
         );
     }
 
+    /// jleechan round-2 finding P1 (4b): `ensure_ao_project_recovered` is
+    /// keyed per-`ao_project`, and `CliSessions::spawn` (called once per
+    /// item by `spawn_batch`) invokes it independently for each spec. This
+    /// proves recovery is driven correctly when a SINGLE `spawn_batch` call
+    /// covers TWO DIFFERENT projects that both start out "AO not running":
+    /// each project must get its own `ao start`, and each spawn must only
+    /// succeed after ITS OWN project's recovery completes -- one project's
+    /// recovery must not be mistaken for the other's.
+    ///
+    /// There is no separate "batch recovery" entrypoint in this file distinct
+    /// from `spawn_batch` + the per-item `ensure_ao_project_recovered` call
+    /// inside `CliSessions::spawn` -- this test exercises that real
+    /// production path end-to-end (a fresh, bespoke fake `ao` binary, not
+    /// the shared `with_fake_ao`/`fake_ao_dir` fixture, since it must also
+    /// answer `status`/`start` for two distinct projects).
+    #[test]
+    fn adapters_batch_recovery_integration() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let root = std::env::temp_dir().join(format!(
+            "afd_batch_recovery_integration_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = SyntheticAccountScopeEnv::install(&root);
+
+        let repo = "jleechanorg/dark-factory";
+        let init_checkout = |name: &str| -> std::path::PathBuf {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            std::process::Command::new("git")
+                .args(["remote", "add", "origin", &format!("https://github.com/{repo}.git")])
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            dir
+        };
+        let target_a = init_checkout("checkout-a");
+        let target_b = init_checkout("checkout-b");
+        let marker_a = root.join("healthy-a.marker");
+        let marker_b = root.join("healthy-b.marker");
+        let controller_home = root.join("controller-home");
+        let log = root.join("calls.jsonl");
+
+        let project_a = "afd-batch-recovery-project-a";
+        let project_b = "afd-batch-recovery-project-b";
+        let branch_a = "factory/jleechan-batch-recovery-a-r1";
+        let branch_b = "factory/jleechan-batch-recovery-b-r1";
+
+        let fake_ao = root.join("ao");
+        std::fs::write(
+            &fake_ao,
+            format!(
+                r#"#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+log_path = {log:?}
+project_a = {project_a:?}
+project_b = {project_b:?}
+target_a = {target_a:?}
+target_b = {target_b:?}
+branch_a = {branch_a:?}
+branch_b = {branch_b:?}
+marker_a = {marker_a:?}
+marker_b = {marker_b:?}
+controller_home = {controller_home:?}
+
+def log_call(entry):
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+if args == ["status", "-p", project_a, "--json"]:
+    log_call({{"kind": "status", "project": project_a}})
+    if os.path.exists(marker_a):
+        print("[]")
+        sys.exit(0)
+    sys.exit(1)
+if args == ["status", "-p", project_b, "--json"]:
+    log_call({{"kind": "status", "project": project_b}})
+    if os.path.exists(marker_b):
+        print("[]")
+        sys.exit(0)
+    sys.exit(1)
+if len(args) == 4 and args[0] == "start" and args[2:] == ["--no-dashboard", "--no-open"]:
+    target = args[1]
+    if target == target_a:
+        log_call({{"kind": "start", "project": project_a}})
+        open(marker_a, "w", encoding="utf-8").close()
+        running_dir_a = os.path.join(controller_home, project_a, ".agent-orchestrator")
+        os.makedirs(running_dir_a, exist_ok=True)
+        with open(os.path.join(running_dir_a, "running.json"), "w", encoding="utf-8") as fh:
+            json.dump({{"pid": os.getpid(), "projects": [project_a]}}, fh)
+        # A real `ao start` is a persistent controller process; the daemon
+        # polls whether the spawned child is still alive to judge readiness
+        # (write_controller_manifest / process_start_identity_from_ps), so
+        # exiting immediately here reads as "controller exited before
+        # readiness" even though the marker file was written successfully.
+        time.sleep(5)
+        sys.exit(0)
+    if target == target_b:
+        log_call({{"kind": "start", "project": project_b}})
+        open(marker_b, "w", encoding="utf-8").close()
+        running_dir_b = os.path.join(controller_home, project_b, ".agent-orchestrator")
+        os.makedirs(running_dir_b, exist_ok=True)
+        with open(os.path.join(running_dir_b, "running.json"), "w", encoding="utf-8") as fh:
+            json.dump({{"pid": os.getpid(), "projects": [project_b]}}, fh)
+        time.sleep(5)
+        sys.exit(0)
+    print("UNEXPECTED start target: " + target, file=sys.stderr)
+    sys.exit(2)
+if len(args) == 7 and args[:2] == ["spawn", "--project"]:
+    project = args[2]
+    prompt = args[6]
+    if project == project_a:
+        marker, target, branch = marker_a, target_a, branch_a
+    elif project == project_b:
+        marker, target, branch = marker_b, target_b, branch_b
+    else:
+        print("UNEXPECTED project: " + project, file=sys.stderr)
+        sys.exit(3)
+    if not os.path.exists(marker):
+        log_call({{"kind": "spawn-rejected", "project": project}})
+        print("ao daemon is not running for project " + project, file=sys.stderr)
+        sys.exit(1)
+    log_call({{"kind": "spawn-ok", "project": project, "prompt": prompt}})
+    print("SESSION=fake-" + project)
+    print("  Worktree: " + target)
+    print("  Branch:   " + branch)
+    sys.exit(0)
+print("UNEXPECTED ARGV: " + json.dumps(args), file=sys.stderr)
+sys.exit(99)
+"#,
+                log = log.to_string_lossy(),
+                project_a = project_a,
+                project_b = project_b,
+                target_a = target_a.to_string_lossy(),
+                target_b = target_b.to_string_lossy(),
+                branch_a = branch_a,
+                branch_b = branch_b,
+                marker_a = marker_a.to_string_lossy(),
+                marker_b = marker_b.to_string_lossy(),
+                controller_home = controller_home.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&fake_ao).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&fake_ao, permissions).unwrap();
+        }
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_fallback = std::env::var("DARK_FACTORY_CODER_FALLBACK_CHAIN").ok();
+        let old_controller_home = std::env::var("DARK_FACTORY_AO_CONTROLLER_HOME").ok();
+        std::env::set_var("PATH", format!("{}:{old_path}", root.display()));
+        // Empty fallback chain: only the default agent is attempted, so each
+        // project's recovery cycle is exactly one rejected spawn -> one
+        // `ao start` -> one accepted spawn, keeping the call log easy to
+        // reason about.
+        std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", "");
+        std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", &controller_home);
+
+        let mut spec_a = spec("batch recovery prompt a", branch_a);
+        spec_a.ao_project = project_a.to_string();
+        spec_a.local_checkout = Some(target_a.clone());
+        let mut spec_b = spec("batch recovery prompt b", branch_b);
+        spec_b.ao_project = project_b.to_string();
+        spec_b.local_checkout = Some(target_b.clone());
+
+        let sessions = CliSessions::new(repo, "minimax");
+        let result = sessions.spawn_batch(&[spec_a, spec_b]);
+
+        std::env::set_var("PATH", old_path);
+        match old_fallback {
+            Some(v) => std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", v),
+            None => std::env::remove_var("DARK_FACTORY_CODER_FALLBACK_CHAIN"),
+        }
+        match old_controller_home {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_CONTROLLER_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_CONTROLLER_HOME"),
+        }
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.is_ok(), "batch recovery across two projects failed: {result:?}; calls={calls}");
+        let rows: Vec<serde_json::Value> = calls
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for project in [project_a, project_b] {
+            assert_eq!(
+                rows.iter().filter(|r| r["kind"] == "spawn-rejected" && r["project"] == project).count(),
+                1,
+                "each project must be rejected exactly once before recovery: {calls}"
+            );
+            assert_eq!(
+                rows.iter().filter(|r| r["kind"] == "start" && r["project"] == project).count(),
+                1,
+                "each project must be started exactly once: {calls}"
+            );
+            assert_eq!(
+                rows.iter().filter(|r| r["kind"] == "spawn-ok" && r["project"] == project).count(),
+                1,
+                "each project must succeed exactly once after its own recovery: {calls}"
+            );
+        }
+    }
+
     #[test]
     fn prompt_beginning_with_dash_remains_positional() {
         let prompt = "--not-an-ao-option preserve this prompt verbatim";
@@ -4997,7 +9973,7 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn missing_worktree_uses_session_kill_cleanup_contract() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -5006,6 +9982,8 @@ export const isTerminalSession = () => false;
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let _scope = SyntheticAccountScopeEnv::install(&root);
+        let _ready_controller = ReadyAoControllerEnv::seed(&root);
         let log = root.join("calls.jsonl");
         let fake_ao = root.join("ao");
         std::fs::write(
@@ -5019,7 +9997,7 @@ with open(os.environ["AO_FAKE_CLEANUP_LOG"], "a", encoding="utf-8") as handle:
 if sys.argv[1] == "spawn":
     print("SESSION=missing-worktree-session")
     raise SystemExit(0)
-if sys.argv[1:] == ["session", "kill", "missing-worktree-session"]:
+if sys.argv[1:] == ["session", "kill", "missing-worktree-session", "-p", "dark-factory"]:
     raise SystemExit(0)
 raise SystemExit(9)
 "#,
@@ -5059,20 +10037,22 @@ raise SystemExit(9)
         assert!(result.is_err(), "missing Worktree must fail closed");
         assert_eq!(
             calls.last().unwrap(),
-            &serde_json::json!(["session", "kill", "missing-worktree-session"])
+            &serde_json::json!(["session", "kill", "missing-worktree-session", "-p", "dark-factory"])
         );
         assert!(!calls.iter().any(|call| call == &serde_json::json!(["stop", "missing-worktree-session"])));
     }
 
     #[test]
     fn missing_worktree_kill_failure_does_not_spawn_fallback_vendor() {
-        let _guard = gh_env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "afd_ao_missing_worktree_kill_failure_{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let _scope = SyntheticAccountScopeEnv::install(&root);
+        let _ready_controller = ReadyAoControllerEnv::seed(&root);
         let log = root.join("calls.jsonl");
         let fake_ao = root.join("ao");
         std::fs::write(
@@ -5086,7 +10066,7 @@ with open(os.environ["AO_FAKE_CLEANUP_LOG"], "a", encoding="utf-8") as handle:
 if sys.argv[1] == "spawn":
     print("SESSION=untracked-session")
     raise SystemExit(0)
-if sys.argv[1:] == ["session", "kill", "untracked-session"]:
+if sys.argv[1:] == ["session", "kill", "untracked-session", "-p", "dark-factory"]:
     print("scripted kill failure", file=sys.stderr)
     raise SystemExit(8)
 raise SystemExit(9)
@@ -5131,7 +10111,7 @@ raise SystemExit(9)
         );
         assert_eq!(
             calls.last().unwrap(),
-            &serde_json::json!(["session", "kill", "untracked-session"])
+            &serde_json::json!(["session", "kill", "untracked-session", "-p", "dark-factory"])
         );
     }
 
@@ -5186,7 +10166,7 @@ raise SystemExit(9)
 
     #[test]
     fn bridge_resolves_import_only_ao_core_from_hoisted_node_modules() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -5278,7 +10258,7 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn bridge_runs_v013_guards_and_defers_at_active_cap_without_spawning() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -5388,7 +10368,7 @@ export const ensureLifecycleWorker = async () => appendFileSync(process.env.AO_F
 
     #[test]
     fn bridge_sanitizes_prompt_preserves_branch_and_cleans_worker_environment() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -5511,7 +10491,7 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn bridge_backed_batch_and_invalid_workspace_cleanup_are_fail_closed() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -5519,6 +10499,7 @@ export const isTerminalSession = () => false;
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
+        let _scope = SyntheticAccountScopeEnv::install(&root);
         let bin = root.join("bin");
         let cli = root.join("node_modules/@jleechanorg/ao-cli");
         let core = root.join("node_modules/@jleechanorg/ao-core");
@@ -5527,6 +10508,7 @@ export const isTerminalSession = () => false;
         let first_workspace = root.join("df-batch-alpha");
         let second_workspace = root.join("df-batch-beta");
         std::fs::create_dir_all(&bin).unwrap();
+        let _ready_controller = ReadyAoControllerEnv::seed(&root);
         std::fs::create_dir_all(cli.join("dist/lib")).unwrap();
         std::fs::create_dir_all(core.join("dist")).unwrap();
         for workspace in [&first_workspace, &second_workspace] {
@@ -5720,7 +10702,7 @@ os.execvp(os.environ["AO_FAKE_NODE"], [os.environ["AO_FAKE_NODE"], os.environ["A
 
     #[test]
     fn bridge_creates_worktree_at_expected_revision_for_adopted_pr() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -6036,7 +11018,7 @@ export const isTerminalSession = () => false;
 
     #[test]
     fn bridge_remediates_and_resets_stale_branch_on_clean_retry() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -6308,7 +11290,25 @@ export const isTerminalSession = () => false;
 
 impl Sessions for CliSessions {
     fn active_count(&self) -> Result<usize, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], 30)?;
+        if is_go_ao() {
+            let conn = open_go_ao_db()?;
+            let mut stmt = conn
+                .prepare("SELECT count(*) FROM sessions WHERE project_id = ?1 AND is_terminated = 0")
+                .map_err(|e| DaemonError::Tool {
+                    tool: "go-ao-sqlite".to_string(),
+                    rc: 1,
+                    stderr: format!("failed to prepare active_count query: {e}"),
+                })?;
+            let count: i64 = stmt
+                .query_row([&self.project], |row| row.get(0))
+                .map_err(|e| DaemonError::Tool {
+                    tool: "go-ao-sqlite".to_string(),
+                    rc: 1,
+                    stderr: format!("failed to query active_count: {e}"),
+                })?;
+            return Ok(count as usize);
+        }
+        let out = run_ao_tool(&self.project, &["status", "-p", &self.project, "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6317,7 +11317,30 @@ impl Sessions for CliSessions {
     }
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError> {
-        self.spawn_with_fallback(spec)
+        let res = self.spawn_with_fallback(spec);
+        match res {
+            Ok(session) => Ok(session),
+            Err(err) => {
+                if is_ao_not_running_error(&err) {
+                    let start_target = spec
+                        .local_checkout
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| format!("https://github.com/{}.git", spec.repo));
+                    if let Err(recovery_error) =
+                        ensure_ao_project_recovered(&spec.ao_project, &start_target)
+                    {
+                        return Err(DaemonError::SpawnRecoveryFailed {
+                            spawn_error: Box::new(err),
+                            recovery_error: Box::new(recovery_error),
+                        });
+                    }
+                    self.spawn_with_fallback(spec)
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 
     fn spawn_batch(&self, specs: &[SpawnSpec]) -> Result<Vec<SessionId>, DaemonError> {
@@ -6329,12 +11352,14 @@ impl Sessions for CliSessions {
         // admission, fallback, workspace, and error semantics.
         let mut spawned = Vec::with_capacity(specs.len());
         for spec in specs {
-            match self.spawn_with_fallback(spec) {
+            match self.spawn(spec) {
                 Ok(session) => spawned.push((session, spec)),
                 Err(spawn_error) => {
                     let mut cleanup_errors = Vec::new();
                     for (session, spawned_spec) in spawned.iter().rev() {
-                        if let Err(cleanup_error) = self.stop(session) {
+                        if let Err(cleanup_error) =
+                            Self::kill_in_project(&spawned_spec.ao_project, session)
+                        {
                             cleanup_errors.push(SpawnBatchCleanupFailure {
                                 session: session.0.clone(),
                                 bead_id: spawned_spec.bead_id.clone(),
@@ -6379,7 +11404,16 @@ impl Sessions for CliSessions {
     /// verbatim in telemetry a human reads, so the message names the branch
     /// and bead explicitly instead of a generic "not found".
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError> {
-        self.attach_within(branch, bead_id, 30)
+        self.attach_in_project(branch, bead_id, &self.project)
+    }
+
+    fn attach_in_project(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        project: &str,
+    ) -> Result<SessionId, DaemonError> {
+        self.attach_within_in_project(branch, bead_id, project, 30)
     }
 
     /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded `attach` — the
@@ -6392,7 +11426,46 @@ impl Sessions for CliSessions {
         bead_id: &str,
         timeout_secs: u64,
     ) -> Result<SessionId, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], timeout_secs)?;
+        self.attach_within_in_project(branch, bead_id, &self.project_for_branch(branch)?, timeout_secs)
+    }
+
+    fn attach_within_in_project(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        project: &str,
+        timeout_secs: u64,
+    ) -> Result<SessionId, DaemonError> {
+        if is_go_ao() {
+            let conn = open_go_ao_db()?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM sessions WHERE project_id = ?1 AND branch = ?2 AND is_terminated = 0 ORDER BY num DESC LIMIT 1",
+                )
+                .map_err(|e| DaemonError::Tool {
+                    tool: "go-ao-sqlite".to_string(),
+                    rc: 1,
+                    stderr: format!("failed to prepare session id query: {e}"),
+                })?;
+            let mut rows = stmt.query([project, branch]).map_err(|e| DaemonError::Tool {
+                tool: "go-ao-sqlite".to_string(),
+                rc: 1,
+                stderr: format!("failed to query session id: {e}"),
+            })?;
+            if let Some(row) = rows.next().map_err(|e| {
+                DaemonError::Parse(format!("failed to iterate session id rows: {e}"))
+            })? {
+                let id: String = row.get(0).map_err(|e| {
+                    DaemonError::Parse(format!("failed to read session id: {e}"))
+                })?;
+                return Ok(SessionId(id));
+            }
+            return Err(DaemonError::SessionNotFound {
+                branch: branch.to_string(),
+                bead_id: bead_id.to_string(),
+            });
+        }
+        let out = run_tool("ao", &["status", "-p", project, "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6401,12 +11474,74 @@ impl Sessions for CliSessions {
     }
 
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError> {
-        run_tool("ao", &["session", "kill", &id.0], 30)?;
+        let project = self
+            .spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id.0)
+            .cloned()
+            .ok_or_else(|| {
+                DaemonError::Config(format!(
+                    "AO project ownership for session {} is unavailable; refusing unscoped cleanup",
+                    id.0
+                ))
+            })?;
+        Self::kill_in_project(&project, id)?;
+        self.spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id.0);
+        Ok(())
+    }
+
+    fn stop_in_project(&self, id: &SessionId, project: &str) -> Result<(), DaemonError> {
+        Self::kill_in_project(project, id)?;
+        self.spawned_session_projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id.0);
         Ok(())
     }
 
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], 30)?;
+        self.is_quiescent_in_project(id, &self.project_for_session(id)?)
+    }
+
+    fn is_quiescent_in_project(&self, id: &SessionId, project: &str) -> Result<bool, DaemonError> {
+        if is_go_ao() {
+            let conn = open_go_ao_db()?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT activity_state, is_terminated FROM sessions WHERE id = ?1 AND project_id = ?2",
+                )
+                .map_err(|e| DaemonError::Tool {
+                    tool: "go-ao-sqlite".to_string(),
+                    rc: 1,
+                    stderr: format!("failed to prepare is_quiescent query: {e}"),
+                })?;
+            let mut rows = stmt.query([&id.0, project]).map_err(|e| DaemonError::Tool {
+                tool: "go-ao-sqlite".to_string(),
+                rc: 1,
+                stderr: format!("failed to query is_quiescent: {e}"),
+            })?;
+            if let Some(row) = rows.next().map_err(|e| {
+                DaemonError::Parse(format!("failed to iterate is_quiescent rows: {e}"))
+            })? {
+                let activity_state: Option<String> = row.get(0).map_err(|e| {
+                    DaemonError::Parse(format!("failed to decode activity_state: {e}"))
+                })?;
+                let is_terminated: i64 = row
+                    .get::<_, Option<i64>>(1)
+                    .map_err(|e| DaemonError::Parse(format!("failed to decode is_terminated: {e}")))?
+                    .unwrap_or(0);
+                let quiescent = is_terminated != 0
+                    || activity_state.as_deref() == Some("idle")
+                    || activity_state.as_deref() == Some("exited");
+                return Ok(quiescent);
+            }
+            return Ok(false);
+        }
+        let out = run_tool("ao", &["status", "-p", project, "--json"], 30)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6424,7 +11559,15 @@ impl Sessions for CliSessions {
         &self,
         id: &SessionId,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        self.session_activity_within(id, 30)
+        self.session_activity_in_project(id, &self.project)
+    }
+
+    fn session_activity_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<crate::tools::SessionActivity, DaemonError> {
+        self.session_activity_within_in_project(id, project, 30)
     }
 
     /// Bead jleechan-zeij / issue #322 r4 P2: budget-bounded
@@ -6434,7 +11577,52 @@ impl Sessions for CliSessions {
         id: &SessionId,
         timeout_secs: u64,
     ) -> Result<crate::tools::SessionActivity, DaemonError> {
-        let out = run_tool("ao", &["status", "-p", &self.project, "--json"], timeout_secs)?;
+        self.session_activity_within_in_project(id, &self.project_for_session(id)?, timeout_secs)
+    }
+
+    fn session_activity_within_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+        timeout_secs: u64,
+    ) -> Result<crate::tools::SessionActivity, DaemonError> {
+        if is_go_ao() {
+            let conn = open_go_ao_db()?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT activity_state, is_terminated FROM sessions WHERE id = ?1 AND project_id = ?2",
+                )
+                .map_err(|e| DaemonError::Tool {
+                    tool: "go-ao-sqlite".to_string(),
+                    rc: 1,
+                    stderr: format!("failed to prepare session activity query: {e}"),
+                })?;
+            let mut rows = stmt.query([&id.0, project]).map_err(|e| DaemonError::Tool {
+                tool: "go-ao-sqlite".to_string(),
+                rc: 1,
+                stderr: format!("failed to query session activity: {e}"),
+            })?;
+            if let Some(row) = rows.next().map_err(|e| {
+                DaemonError::Parse(format!("failed to iterate session activity rows: {e}"))
+            })? {
+                let activity_state: Option<String> = row.get(0).map_err(|e| {
+                    DaemonError::Parse(format!("failed to decode activity_state: {e}"))
+                })?;
+                let is_terminated: i64 = row
+                    .get::<_, Option<i64>>(1)
+                    .map_err(|e| DaemonError::Parse(format!("failed to decode is_terminated: {e}")))?
+                    .unwrap_or(0);
+                if is_terminated != 0 || activity_state.as_deref() == Some("exited") {
+                    return Ok(crate::tools::SessionActivity::Terminal);
+                } else if activity_state.as_deref() == Some("idle") {
+                    return Ok(crate::tools::SessionActivity::Idle);
+                } else {
+                    return Ok(crate::tools::SessionActivity::Running);
+                }
+            }
+            return Ok(crate::tools::SessionActivity::NotFound);
+        }
+        let out = run_tool("ao", &["status", "-p", project, "--json"], timeout_secs)?;
         let json_start = out.find('[').unwrap_or(0);
         let data: serde_json::Value = serde_json::from_str(&out[json_start..]).map_err(|e| {
             DaemonError::Parse(format!("failed to parse ao status: {e}"))
@@ -6459,7 +11647,23 @@ impl Sessions for CliSessions {
     /// callers only ever reject a dispatch on a *positive* mismatch, never
     /// on an inability to check.
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
-        let out = match run_tool("ao", &["status", "-p", &self.project, "--json"], 30) {
+        let project = match self.project_for_session(id) {
+            Ok(project) => project,
+            Err(_) => return Ok(None),
+        };
+        self.session_branch_in_project(id, &project)
+    }
+
+    fn session_branch_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<Option<String>, DaemonError> {
+        if is_go_ao() {
+            let (_, branch) = go_ao_session_workspace_and_branch(&id.0);
+            return Ok(branch);
+        }
+        let out = match run_tool("ao", &["status", "-p", project, "--json"], 30) {
             Ok(o) => o,
             Err(_) => return Ok(None),
         };
@@ -6475,6 +11679,30 @@ impl Sessions for CliSessions {
                         .get("branch")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn session_pr_number_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let out = match run_tool("ao", &["status", "-p", project, "--json"], 30) {
+            Ok(o) => o,
+            Err(_) => return Ok(None),
+        };
+        let json_start = out.find('[').unwrap_or(0);
+        let data: serde_json::Value = match serde_json::from_str(&out[json_start..]) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        if let Some(arr) = data.as_array() {
+            for entry in arr {
+                if entry.get("name").and_then(|v| v.as_str()) == Some(&id.0) {
+                    return Ok(entry.get("prNumber").and_then(|v| v.as_u64()));
                 }
             }
         }
@@ -7074,7 +12302,7 @@ mod active_session_count_tests {
 
 #[cfg(test)]
 mod worktree_remote_url_tests {
-    use super::{gh_env_test_lock, CliSessions};
+    use super::CliSessions;
     use crate::tools::{SessionId, Sessions};
 
     fn record_workspace(
@@ -7278,7 +12506,7 @@ mod worktree_remote_url_tests {
     /// one from the factory branch.
     #[test]
     fn worktree_remote_url_reads_real_git_remote() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -7331,7 +12559,7 @@ mod worktree_remote_url_tests {
     /// get-url --push` fix.
     #[test]
     fn worktree_remote_url_reports_pushurl_when_distinct_from_fetch_url() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -7392,7 +12620,7 @@ mod worktree_remote_url_tests {
 
     #[test]
     fn worktree_remote_url_fails_closed_for_unconfigured_remote_name() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -7427,7 +12655,7 @@ mod worktree_remote_url_tests {
 
 #[cfg(test)]
 mod worktree_transcript_last_activity_epoch_tests {
-    use super::{gh_env_test_lock, CliSessions};
+    use super::CliSessions;
     use crate::tools::Sessions;
 
     fn record_workspace(
@@ -7466,7 +12694,7 @@ mod worktree_transcript_last_activity_epoch_tests {
     /// remote branch.
     #[test]
     fn reports_latest_jsonl_mtime_from_derived_transcript_dir() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -7516,7 +12744,7 @@ mod worktree_transcript_last_activity_epoch_tests {
     /// the naming convention drifted) is "no evidence", not an error.
     #[test]
     fn no_evidence_when_transcript_dir_missing() {
-        let _guard = gh_env_test_lock()
+        let _guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -7886,20 +13114,12 @@ const FALLBACK_CWD: &str = ".";
 /// does (bead `jleechan-g1k`) — MiniMax is still driving the `claude` CLI, so
 /// it still reads AGENTS.md / `.claude/` from the invocation cwd.
 fn run_minimax_judge(claude_bin: &str, prompt: &str) -> Result<String, DaemonError> {
-    let minimax_key = std::env::var("MINIMAX_API_KEY").map_err(|e| {
-        DaemonError::Tool {
-            tool: "minimax".into(),
-            rc: -1,
-            stderr: format!("MINIMAX_API_KEY not set: {e}"),
-        }
-    })?;
-
     let mut cmd = std::process::Command::new(claude_bin);
     cmd.args(["--print", "--dangerously-skip-permissions", "--setting-sources", "", prompt])
         .current_dir(FALLBACK_CWD)
-        .stdin(std::process::Stdio::null())
-        .env("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
-        .env("ANTHROPIC_API_KEY", minimax_key);
+        .stdin(std::process::Stdio::null());
+
+    crate::account_scope::apply_minimax_scope(&mut cmd)?;
 
     let output = cmd.output().map_err(|e| DaemonError::Tool {
         tool: "minimax".into(),
@@ -8012,6 +13232,139 @@ pub fn ci_success_from_check_buckets(buckets: &[&str], iteration_stub: bool) -> 
             .all(|b| matches!(*b, "pass" | "skipping" | "pending"))
     } else {
         buckets.iter().all(|b| matches!(*b, "pass" | "skipping"))
+    }
+}
+
+#[cfg(test)]
+mod coderabbit_exact_head_tests {
+    use super::{coderabbit_status_for_head, GhAuthor, GhReview, GhReviewCommit};
+
+    fn review(state: &str, oid: Option<&str>) -> GhReview {
+        GhReview {
+            author: GhAuthor {
+                login: "coderabbitai[bot]".to_string(),
+            },
+            state: state.to_string(),
+            commit: oid.map(|oid| GhReviewCommit {
+                oid: Some(serde_json::Value::String(oid.to_string())),
+            }),
+        }
+    }
+
+    #[test]
+    fn exact_head_approval_is_green() {
+        assert_eq!(
+            coderabbit_status_for_head(&[review("APPROVED", Some("head-2"))], "head-2"),
+            "green"
+        );
+    }
+
+    #[test]
+    fn stale_approval_is_unknown() {
+        assert_eq!(
+            coderabbit_status_for_head(&[review("APPROVED", Some("head-1"))], "head-2"),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn approval_without_commit_oid_is_unknown() {
+        assert_eq!(
+            coderabbit_status_for_head(&[review("APPROVED", None)], "head-2"),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn malformed_commit_object_is_fail_soft_unknown() {
+        let malformed: GhReview = serde_json::from_str(
+            r#"{"author":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit":{"oid":123}}"#,
+        )
+        .expect("non-string commit oid should remain deserializable");
+        assert_eq!(coderabbit_status_for_head(&[malformed], "head-2"), "unknown");
+    }
+
+    #[test]
+    fn null_commit_object_is_fail_soft_unknown() {
+        let null_commit: GhReview = serde_json::from_str(
+            r#"{"author":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit":null}"#,
+        )
+        .expect("null commit should remain deserializable");
+        assert_eq!(coderabbit_status_for_head(&[null_commit], "head-2"), "unknown");
+    }
+
+    #[test]
+    fn latest_exact_head_approval_supersedes_old_changes_requested() {
+        assert_eq!(
+            coderabbit_status_for_head(
+                &[
+                    review("CHANGES_REQUESTED", Some("head-1")),
+                    review("APPROVED", Some("head-2")),
+                ],
+                "head-2"
+            ),
+            "green"
+        );
+    }
+
+    #[test]
+    fn malformed_later_approval_does_not_erase_older_changes_requested() {
+        let malformed: GhReview = serde_json::from_str(
+            r#"{"author":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit":{"oid":123}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            coderabbit_status_for_head(
+                &[
+                    review("CHANGES_REQUESTED", Some("head-2")),
+                    malformed,
+                ],
+                "head-2"
+            ),
+            "red"
+        );
+    }
+
+    #[test]
+    fn latest_changes_requested_review_remains_red() {
+        assert_eq!(
+            coderabbit_status_for_head(
+                &[
+                    review("APPROVED", Some("head-2")),
+                    review("CHANGES_REQUESTED", Some("head-2")),
+                ],
+                "head-2"
+            ),
+            "red"
+        );
+    }
+
+    #[test]
+    fn newer_pending_review_does_not_fall_through_to_older_approval() {
+        assert_eq!(
+            coderabbit_status_for_head(
+                &[
+                    review("APPROVED", Some("head-2")),
+                    review("PENDING", Some("head-2")),
+                ],
+                "head-2"
+            ),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn newer_dismissed_review_does_not_fall_through_to_older_approval() {
+        assert_eq!(
+            coderabbit_status_for_head(
+                &[
+                    review("APPROVED", Some("head-2")),
+                    review("DISMISSED", Some("head-2")),
+                ],
+                "head-2"
+            ),
+            "unknown"
+        );
     }
 }
 
@@ -8362,14 +13715,66 @@ mod chain_llm_fallback_argv_tests {
     /// `ChainLlm::judge` window, so a single shared binary mutex is
     /// sufficient even though two tests exist.
     ///
-    /// jleechan-9sl1: delegates to the file-level `gh_env_test_lock()` shared
+    /// jleechan-9sl1: delegates to the crate-wide `test_env_lock()` shared
     /// by every PATH/env-mutating test module in this file -- see that
     /// function's doc comment for why a module-local lock is insufficient
     /// (it only serializes within one module, not across the
     /// `chain_llm_fallback_argv_tests` / `pr_snapshot_checks_fetch_failure_tests`
     /// / `cli_vcs_gh_tests` modules, which all mutate the same global `PATH`).
     fn env_lock() -> &'static Mutex<()> {
-        super::gh_env_test_lock()
+        crate::test_env_lock()
+    }
+
+    struct ScopedChainEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ScopedChainEnv {
+        fn install(dir: &std::path::Path) -> Self {
+            const KEYS: &[&str] = &[
+                "PATH",
+                "HOME",
+                "DARK_FACTORY_CLAUDE_CONFIG_DIR",
+                "CODEX_HOME",
+                "DARK_FACTORY_AGY_HOME",
+                "MINIMAX_API_KEY",
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+            ];
+            let saved: Vec<(&'static str, Option<std::ffi::OsString>)> = KEYS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            let claude_dir = dir.join("synthetic-claude-config");
+            let codex_home = dir.join("synthetic-codex-home");
+            let agy_home = dir.join("synthetic-agy-home");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            std::fs::create_dir_all(&codex_home).unwrap();
+            std::fs::create_dir_all(&agy_home).unwrap();
+            let mut path = std::ffi::OsString::from(dir.join("bin"));
+            if let Some(prior) = saved[0].1.as_ref() {
+                path.push(":");
+                path.push(prior);
+            }
+            std::env::set_var("PATH", path);
+            std::env::set_var("HOME", dir);
+            std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", claude_dir);
+            std::env::set_var("CODEX_HOME", codex_home);
+            std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_home);
+            std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
+            Self { saved }
+        }
+    }
+
+    impl Drop for ScopedChainEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
 
     /// Write an executable shell script at `path` that prints every element
@@ -8384,6 +13789,31 @@ mod chain_llm_fallback_argv_tests {
              for arg in \"$@\"; do\n\
                printf '%s\\n' \"$arg\"\n\
              done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    fn write_failing_shim(path: &std::path::Path) {
+        std::fs::write(path, "#!/usr/bin/env bash\nexit 17\n").unwrap();
+        std::fs::set_permissions(
+            path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    fn write_agy_scope_shim(path: &std::path::Path, log: &std::path::Path) {
+        std::fs::write(
+            path,
+            format!(
+                "#!/usr/bin/env bash\nprintf 'HOME=%s\\nOPENAI_API_KEY=%s\\nANTHROPIC_API_KEY=%s\\nMINIMAX_API_KEY=%s\\n' \"$HOME\" \"${{OPENAI_API_KEY-}}\" \"${{ANTHROPIC_API_KEY-}}\" \"${{MINIMAX_API_KEY-}}\" >> '{}'\nprintf 'agy-ok\\n'\n",
+                log.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(
@@ -8428,45 +13858,20 @@ mod chain_llm_fallback_argv_tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let dir = make_argv_dump_dir(&format!("argv_{nanos}"), "codex");
-        let bin = dir.join("bin");
 
         // Make ChainLlm resolve `codex` from our shim. Other backends
         // (`claude`, `agy`) must NOT be reachable from PATH so the chain
         // stops at the shim — this pins the argv of the FIRST link rather
         // than accidentally exercising the fallback.
-        let prior_path = std::env::var_os("PATH");
-        let mut new_path = std::ffi::OsString::from(bin.to_str().unwrap());
-        if let Some(prior) = prior_path.as_ref() {
-            new_path.push(":");
-            new_path.push(prior);
-        }
         // SAFETY: tests mutate env vars sequentially here. ENV_LOCK above
         // ensures no parallel test from this module can interleave; the
         // per-test temp dir + `nanos` suffix is defense-in-depth in case
         // a future contributor adds a test that does NOT take the lock.
-        unsafe { std::env::set_var("PATH", &new_path) };
-        let prior_home = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", dir.to_str().unwrap()) };
+        let env = ScopedChainEnv::install(&dir);
 
         let result = ChainLlm.judge("hello-router-prompt");
 
-        // Restore env first so a failed assertion leaves the test run
-        // hygienic for the next case. Drop the guard explicitly after
-        // restoration so a panic in the assertions does not skip the
-        // env restore (Drop for MutexGuard would not run, but the
-        // restore is the test's responsibility regardless).
-        unsafe {
-            if let Some(prior) = prior_home {
-                std::env::set_var("HOME", prior);
-            } else {
-                std::env::remove_var("HOME");
-            }
-            if let Some(prior) = prior_path {
-                std::env::set_var("PATH", prior);
-            } else {
-                std::env::remove_var("PATH");
-            }
-        }
+        drop(env);
         drop(_guard);
 
         let captured = result.expect("codex shim should succeed");
@@ -8494,6 +13899,42 @@ mod chain_llm_fallback_argv_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn chain_llm_agy_fallback_is_zero_child_on_invalid_scope_and_scrubs_valid_child() {
+        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = make_argv_dump_dir("agy_scope", "codex");
+        let log = dir.join("agy.log");
+        write_failing_shim(&dir.join("bin/codex"));
+        write_failing_shim(&dir.join("bin/claude"));
+        write_agy_scope_shim(&dir.join("bin/agy"), &log);
+        let _env = ScopedChainEnv::install(&dir);
+
+        // Invalid scope must stop at validation; no AGY child may run.
+        std::env::remove_var("DARK_FACTORY_AGY_HOME");
+        let result = ChainLlm.judge("agy-scope-invalid");
+        assert!(result.is_err());
+        assert!(!log.exists(), "invalid AGY scope must execute zero AGY children");
+        std::env::set_var("DARK_FACTORY_AGY_HOME", dir.join("missing-profile"));
+        assert!(ChainLlm.judge("agy-scope-malformed").is_err());
+        assert!(!log.exists(), "malformed AGY scope must execute zero AGY children");
+
+        // A valid synthetic profile admits exactly one AGY child and proves
+        // child HOME was pinned to DARK_FACTORY_AGY_HOME and inherited provider auth was scrubbed.
+        let agy_home = dir.join("synthetic-agy-home");
+        std::fs::create_dir_all(&agy_home).unwrap();
+        std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_home);
+        std::env::set_var("OPENAI_API_KEY", "SYNTHETIC_PARENT_OPENAI");
+        std::env::set_var("ANTHROPIC_API_KEY", "SYNTHETIC_PARENT_ANTHROPIC");
+        let result = ChainLlm.judge("agy-scope-valid");
+        assert!(result.is_ok(), "valid AGY scope should reach synthetic child: {result:?}");
+        let captured = std::fs::read_to_string(&log).expect("AGY child log");
+        assert!(captured.contains(&format!("HOME={}\n", agy_home.canonicalize().unwrap().display())));
+        assert!(captured.contains("OPENAI_API_KEY=\n"));
+        assert!(captured.contains("ANTHROPIC_API_KEY=\n"));
+        assert!(captured.contains("MINIMAX_API_KEY=\n"));
+    }
+
     /// Pin that the codex shim path does NOT swallow `--yolo` /
     /// `--skip-git-repo-check` into a single argv slot, which is the
     /// structural failure mode that lets a `--dangerously-skip-permissions`
@@ -8514,32 +13955,12 @@ mod chain_llm_fallback_argv_tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let dir = make_argv_dump_dir(&format!("bnd_{nanos}"), "codex");
-        let bin = dir.join("bin");
 
-        let prior_path = std::env::var_os("PATH");
-        let mut new_path = std::ffi::OsString::from(bin.to_str().unwrap());
-        if let Some(prior) = prior_path.as_ref() {
-            new_path.push(":");
-            new_path.push(prior);
-        }
-        unsafe { std::env::set_var("PATH", &new_path) };
-        let prior_home = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", dir.to_str().unwrap()) };
+        let env = ScopedChainEnv::install(&dir);
 
         let result = ChainLlm.judge("boundary-check");
 
-        unsafe {
-            if let Some(prior) = prior_home {
-                std::env::set_var("HOME", prior);
-            } else {
-                std::env::remove_var("HOME");
-            }
-            if let Some(prior) = prior_path {
-                std::env::set_var("PATH", prior);
-            } else {
-                std::env::remove_var("PATH");
-            }
-        }
+        drop(env);
         drop(_guard);
 
         let captured = result.expect("codex shim should succeed");
@@ -8596,14 +14017,14 @@ mod pr_snapshot_checks_fetch_failure_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
-    /// jleechan-9sl1: delegates to the file-level `gh_env_test_lock()` shared
+    /// jleechan-9sl1: delegates to the crate-wide `test_env_lock()` shared
     /// by every PATH/env-mutating test module in this file (previously this
     /// module had its own independent lock, which only serialized against
     /// itself, not against `chain_llm_fallback_argv_tests` or
-    /// `cli_vcs_gh_tests` -- see `gh_env_test_lock`'s doc comment for the
+    /// `cli_vcs_gh_tests` -- see `test_env_lock`'s crate-root docs for the
     /// cross-module race that caused).
     fn env_lock() -> &'static Mutex<()> {
-        super::gh_env_test_lock()
+        crate::test_env_lock()
     }
 
     /// Write a `gh` shim that answers every call `CliScm::pr_snapshot` makes:
@@ -8626,6 +14047,10 @@ mod pr_snapshot_checks_fetch_failure_tests {
         let script = r#"#!/usr/bin/env bash
 set -u
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  if [ "${GH_TEST_FORCE_REST:-}" = "1" ]; then
+    echo "gh: forced REST fallback" >&2
+    exit 1
+  fi
   cat <<'JSON'
 {"mergeable":"MERGEABLE","reviews":[],"headRefOid":"deadbeefcafefeed0123456789abcdef01234567","body":"test body","comments":[],"files":[],"updatedAt":"2026-07-08T12:00:00Z"}
 JSON
@@ -8651,6 +14076,10 @@ if [ "$1" = "api" ]; then
     esac
   done
   case "$url" in
+    *pulls/*/reviews)
+      printf '%s' "${GH_TEST_REST_REVIEWS:-[]}"
+      exit 0
+      ;;
     *pulls/*)
       echo '{"mergeable":true,"head":{"sha":"deadbeefcafefeed0123456789abcdef01234567"},"body":"test body","updated_at":"2026-07-08T12:00:00Z"}'
       exit 0
@@ -8711,6 +14140,7 @@ exit 1
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = super::BreakerSandbox::new("pr_snapshot_fake_gh", _guard);
 
         super::clear_graphql_rate_limited();
 
@@ -8756,10 +14186,91 @@ exit 1
                 std::env::remove_var("GH_TEST_FALLBACK_CHECKS");
             }
         }
-        drop(_guard);
-
         std::fs::remove_dir_all(&dir).ok();
         result
+    }
+
+    /// Force `gh pr view` to fail so `CliScm::pr_snapshot` uses the REST
+    /// fallback, returning a caller-provided review payload from the fake
+    /// `pulls/<n>/reviews` endpoint. This keeps malformed-review coverage on
+    /// the same path that production uses during GraphQL/CLI outages.
+    fn run_pr_snapshot_with_rest_reviews(
+        reviews_json: &str,
+        pr: u64,
+    ) -> Result<crate::tools::PrSnapshot, DaemonError> {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        super::clear_graphql_rate_limited();
+        let dir = make_fake_gh_dir("rest_reviews");
+        let bin = dir.join("bin");
+        let prior_path = std::env::var_os("PATH");
+        let mut new_path = std::ffi::OsString::from(bin.to_str().unwrap());
+        if let Some(prior) = prior_path.as_ref() {
+            new_path.push(":");
+            new_path.push(prior);
+        }
+        let prior_force_rest = std::env::var_os("GH_TEST_FORCE_REST");
+        let prior_reviews = std::env::var_os("GH_TEST_REST_REVIEWS");
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+            std::env::set_var("GH_TEST_FORCE_REST", "1");
+            std::env::set_var("GH_TEST_REST_REVIEWS", reviews_json);
+        }
+
+        let scm = CliScm::new("jleechanorg/dark-factory-test".to_string());
+        let result = scm.pr_snapshot(pr);
+
+        super::clear_graphql_rate_limited();
+        unsafe {
+            if let Some(prior) = prior_path {
+                std::env::set_var("PATH", prior);
+            } else {
+                std::env::remove_var("PATH");
+            }
+            if let Some(prior) = prior_force_rest {
+                std::env::set_var("GH_TEST_FORCE_REST", prior);
+            } else {
+                std::env::remove_var("GH_TEST_FORCE_REST");
+            }
+            if let Some(prior) = prior_reviews {
+                std::env::set_var("GH_TEST_REST_REVIEWS", prior);
+            } else {
+                std::env::remove_var("GH_TEST_REST_REVIEWS");
+            }
+        }
+        drop(_guard);
+        std::fs::remove_dir_all(&dir).ok();
+        result
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rest_reviews_keep_valid_latest_changes_requested_after_malformed_oid() {
+        let reviews = r#"[
+          {"user":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit_id":123},
+          {"user":{"login":"coderabbitai[bot]"},"state":"CHANGES_REQUESTED","commit_id":"deadbeefcafefeed0123456789abcdef01234567"}
+        ]"#;
+        let snapshot = run_pr_snapshot_with_rest_reviews(reviews, 749)
+            .expect("REST fallback review payload should remain parseable");
+        assert_eq!(snapshot.coderabbit_status, "red");
+        assert!(!snapshot.coderabbit_approved);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rest_reviews_ignore_malformed_later_approvals_after_changes_requested() {
+        let reviews = r#"[
+          {"user":{"login":"coderabbitai[bot]"},"state":"CHANGES_REQUESTED","commit_id":"deadbeefcafefeed0123456789abcdef01234567"},
+          {"user":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit_id":null},
+          {"user":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit_id":123},
+          {"user":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit_id":{"oid":"not-a-string"}}
+        ]"#;
+        let snapshot = run_pr_snapshot_with_rest_reviews(reviews, 750)
+            .expect("REST fallback review payload should remain parseable");
+        assert_eq!(snapshot.coderabbit_status, "red");
+        assert!(!snapshot.coderabbit_approved);
     }
 
 
@@ -8843,6 +14354,7 @@ exit 1
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = super::BreakerSandbox::new("primary_checks_trip", _guard);
         super::clear_graphql_rate_limited();
 
         let dir = make_fake_gh_dir("rate_limit_trip");
@@ -8883,8 +14395,11 @@ exit 1
             }
         }
         std::fs::remove_dir_all(&dir).ok();
-        assert!(result.is_err(), "pr_snapshot must return Err when circuit breaker trips on checks rate limit");
-        assert!(result.unwrap_err().is_gh_rate_limit());
+        let snapshot = result.expect(
+            "the REST fallback must preserve a truthful pending snapshot after the GraphQL breaker trips",
+        );
+        assert!(snapshot.ci_pending);
+        assert_eq!(snapshot.ci_status, "unknown");
         assert!(
             tripped_during_call,
             "detect_and_mark_graphql_rate_limit must trip the shared circuit \
@@ -9106,15 +14621,15 @@ mod cli_vcs_gh_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
-    /// jleechan-9sl1: delegates to the file-level `gh_env_test_lock()` shared
+    /// jleechan-9sl1: delegates to the crate-wide `test_env_lock()` shared
     /// by every PATH/env-mutating test module in this file -- a module-local
     /// lock here would only serialize this module's own tests against each
     /// other, not against `chain_llm_fallback_argv_tests` or
     /// `pr_snapshot_checks_fetch_failure_tests`, which mutate the same
-    /// global `PATH`. See `gh_env_test_lock`'s doc comment for the
+    /// global `PATH`. See `test_env_lock`'s crate-root docs for the
     /// cross-module flake this fixes.
     fn env_lock() -> &'static Mutex<()> {
-        super::gh_env_test_lock()
+        crate::test_env_lock()
     }
 
     /// Write a `gh` shim that answers `gh api <path> --jq <filter>` calls for
@@ -9834,7 +15349,7 @@ mod offline_cache_tests {
     /// fixture never bleeds into a sibling test.
     ///
     /// `set_current_dir` is a PROCESS-WIDE mutation, so every test in
-    /// this mod must serialize on the file-level `gh_env_test_lock()`
+    /// this mod must serialize on the crate-wide `test_env_lock()`
     /// (also used by `chain_llm_fallback_argv_tests`,
     /// `pr_snapshot_checks_fetch_failure_tests`, `cli_vcs_gh_tests` for
     /// PATH-env mutations). Without that lock, two parallel tests would
@@ -9852,7 +15367,7 @@ mod offline_cache_tests {
             // other `#[cfg(test)]` mod in this file) can mutate
             // cwd/PATH concurrently with us. Poisoned lock recovery
             // matches the established pattern in this file.
-            let lock = super::gh_env_test_lock()
+            let lock = crate::test_env_lock()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let nanos = std::time::SystemTime::now()
@@ -10192,7 +15707,1156 @@ mod offline_cache_tests {
     }
 }
 
-// Local imports for the offline_cache_tests mod above.
+#[cfg(test)]
+mod go_ao_lifecycle_tests {
+    use super::*;
+    use crate::tools::{SessionActivity, Sessions};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt;
 
+    /// CodeRabbit finding (daemon/src/tools.rs:1327): account-scope validators
+    /// return `DaemonError::Config` for permanent host misconfiguration, but
+    /// `run_tool_with_cwd_scoped` and `run_go_scope_query` used to downcast it
+    /// to `DaemonError::Tool` on the way out. `DaemonError::is_transient()`
+    /// treats `Tool` as retryable and `Config` as terminal, so the
+    /// misconfiguration got requeued every tick until `MAX_TRANSIENT_SPAWN_RETRY`
+    /// exhausted and the bead parked with a generic transient-spawn reason
+    /// instead of the real config error. `validate_claude_config_dir` fails
+    /// before any subprocess is spawned, so this exercises both conversion
+    /// layers (tools.rs's account-scope map_err, then run_go_scope_query's own
+    /// map_err) without depending on an `ao-go` binary being present.
+    #[test]
+    fn run_go_scope_query_preserves_config_error_as_non_transient() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var_os("DARK_FACTORY_CLAUDE_CONFIG_DIR");
+        std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR");
+
+        let result = run_go_scope_query("claude", &["status", "--json"], &[], "status");
+
+        match prior {
+            Some(v) => std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR"),
+        }
+
+        let err = result.expect_err("expected permanent misconfiguration to surface as an error");
+        assert!(
+            matches!(err, DaemonError::Config(_)),
+            "expected DaemonError::Config to survive both conversion layers, got {err:?}"
+        );
+        assert_eq!(err.error_class(), "config");
+        assert!(
+            !err.is_transient(),
+            "a permanent config error must not be classified transient, or dispatch will \
+             requeue-and-exhaust-retry-cap instead of parking immediately"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    struct GoSpawnEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        server: Option<std::process::Child>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl GoSpawnEnv {
+        fn install(root: &std::path::Path, kill_fails: bool) -> Self {
+            const KEYS: &[&str] = &[
+                "PATH",
+                "DARK_FACTORY_AO_ENGINE",
+                "DARK_FACTORY_OPERATOR_HOME",
+                "DARK_FACTORY_AO_CONFIG_PATH",
+                "AO_RUN_FILE",
+                "AO_DATA_DIR",
+                "AO_PORT",
+                "GO_SPAWN_NONZERO",
+                "GO_KILL_FAIL",
+                "GO_SPAWN_NO_SESSION_ID",
+                "DARK_FACTORY_CLAUDE_CONFIG_DIR",
+                "CODEX_HOME",
+                "DARK_FACTORY_AGY_HOME",
+                "MINIMAX_API_KEY",
+                "DARK_FACTORY_CODER_FALLBACK_CHAIN",
+                "TMUX_TMPDIR",
+                "TMUX",
+            ];
+            let saved: Vec<(&'static str, Option<std::ffi::OsString>)> = KEYS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            let mut path = std::ffi::OsString::from(root);
+            if let Some(prior) = saved[0].1.as_ref() {
+                path.push(":");
+                path.push(prior);
+            }
+            std::env::set_var("PATH", path);
+            std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+            std::env::set_var("DARK_FACTORY_OPERATOR_HOME", root.join("operator-home"));
+            std::env::set_var("DARK_FACTORY_AO_CONFIG_PATH", root.join("operator-home/config.yaml"));
+            std::env::set_var("AO_RUN_FILE", root.join("running.json"));
+            std::env::set_var("AO_DATA_DIR", root.join("ao-data"));
+            std::env::set_var("AO_PORT", "7831");
+            std::fs::create_dir_all(root.join("synthetic-claude-config")).unwrap();
+            std::fs::create_dir_all(root.join("synthetic-codex-home")).unwrap();
+            let agy_home = root.join("synthetic-agy-home");
+            std::fs::create_dir_all(&agy_home).unwrap();
+            let tmux_dir = root.join("synthetic-tmux-tmpdir");
+            std::fs::create_dir_all(&tmux_dir).unwrap();
+            #[cfg(unix)]
+            {
+                let _ = std::fs::set_permissions(&tmux_dir, std::fs::Permissions::from_mode(0o700));
+            }
+            std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", root.join("synthetic-claude-config"));
+            std::env::set_var("CODEX_HOME", root.join("synthetic-codex-home"));
+            std::env::set_var("DARK_FACTORY_AGY_HOME", &agy_home);
+            std::env::set_var("TMUX_TMPDIR", &tmux_dir);
+            std::env::remove_var("TMUX");
+            std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_API_KEY");
+            std::env::set_var("GO_SPAWN_NONZERO", "0");
+            std::env::remove_var("GO_SPAWN_NO_SESSION_ID");
+            if kill_fails {
+                std::env::set_var("GO_KILL_FAIL", "1");
+            } else {
+                std::env::remove_var("GO_KILL_FAIL");
+            }
+            std::fs::create_dir_all(root.join("ao-data")).unwrap();
+            Self { saved, server: None }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for GoSpawnEnv {
+        fn drop(&mut self) {
+            if let Some(mut server) = self.server.take() {
+                let _ = server.kill();
+                let _ = server.wait();
+            }
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn init_go_test_repo(path: &std::path::Path, repo: &str, branch: &str) -> String {
+        std::fs::create_dir_all(path).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "-b", branch])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["remote", "add", "origin", &format!("https://github.com/{repo}.git")])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["-c", "user.email=test@example.invalid", "-c", "user.name=synthetic", "commit", "--allow-empty", "-m", "synthetic"])
+            .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+        String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(path)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn make_go_spawn_fixture(tag: &str, kill_fails: bool) -> (std::path::PathBuf, GoSpawnEnv, SpawnSpec, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("df_go_spawn_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("ao-go.log");
+        let status_file = root.join("status.json");
+        let project_file = root.join("project.json");
+        std::fs::write(
+            root.join("ao-go"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{0}'\nif [ \"$1\" = status ]; then printf 'env: AO_RUN_FILE=%s AO_DATA_DIR=%s AO_PORT=%s\\n' \"$AO_RUN_FILE\" \"$AO_DATA_DIR\" \"$AO_PORT\" >> '{0}'; cat '{1}'; exit 0; fi\nif [ \"$1\" = project ] && [ \"$2\" = get ]; then cat '{2}'; exit 0; fi\nif [ \"$1\" = session ]; then\n  printf 'env: AO_RUN_FILE=%s AO_DATA_DIR=%s AO_PORT=%s\\n' \"$AO_RUN_FILE\" \"$AO_DATA_DIR\" \"$AO_PORT\" >> '{0}'\n  if [ \"$GO_KILL_FAIL\" = 1 ]; then echo 'synthetic kill failure' >&2; exit 8; fi\n  exit 0\nfi\nif [ \"$GO_SPAWN_NO_SESSION_ID\" = 1 ]; then\n  printf 'malformed output without session id\\n'\nelse\n  printf 'spawned session go-synthetic\\n'\nfi\nif [ \"$GO_SPAWN_NONZERO\" = 1 ]; then exit 7; fi\n",
+                log.display(), status_file.display(), project_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(root.join("ao-go"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = GoSpawnEnv::install(&root, kill_fails);
+        let repo = "owner/repo";
+        let branch = "factory/go-synthetic-r1";
+        let target = root.join("target");
+        init_go_test_repo(&target, repo, "main");
+        let workspace = root.join("operator-home/.ao/data/worktrees/go-project/go-synthetic");
+        init_go_test_repo(&workspace, repo, branch);
+        let run_file = root.join("running.json");
+        let data_dir = root.join("ao-data");
+        let codex_home = root.join("synthetic-codex-home");
+        let agy_home = root.join("synthetic-agy-home");
+        let listener_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        std::env::set_var("AO_PORT", listener_port.to_string());
+        let ready_file = root.join("listener.ready");
+        let mut server_command = std::process::Command::new("python3");
+        for key in crate::account_scope::SCRUBBED_AUTH_VARS {
+            if *key != "CODEX_HOME" && *key != "HOME" {
+                server_command.env_remove(key);
+            }
+        }
+        server_command.env_remove("TMUX");
+        let tmux_dir = root.join("synthetic-tmux-tmpdir");
+        let server = server_command
+            .arg("-c")
+            .arg("import socket, sys, time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(); open(sys.argv[2], 'w').close(); time.sleep(600)")
+            .arg(listener_port.to_string())
+            .arg(&ready_file)
+            .env("AO_RUN_FILE", &run_file)
+            .env("AO_DATA_DIR", &data_dir)
+            .env("AO_PORT", listener_port.to_string())
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", &agy_home)
+            .env("TMUX_TMPDIR", &tmux_dir)
+            .spawn()
+            .unwrap();
+        let server_pid = server.id();
+        for _ in 0..100 {
+            if ready_file.is_file() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ready_file.is_file(), "synthetic AO server did not bind listener");
+        std::fs::write(
+            &run_file,
+            serde_json::json!({"pid": server_pid, "port": listener_port}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &status_file,
+            serde_json::json!({
+                "state": "ready", "pid": server_pid, "port": listener_port,
+                "runFile": run_file.canonicalize().unwrap(),
+                "dataDir": data_dir.canonicalize().unwrap()
+            }).to_string(),
+        ).unwrap();
+        std::fs::write(
+            &project_file,
+            serde_json::json!({
+                "project": {
+                    "id": "go-project", "path": target.canonicalize().unwrap(),
+                    "repo": format!("https://github.com/{repo}.git"),
+                    "defaultBranch": "main",
+                    "config": {"env": {
+                        "CODEX_HOME": codex_home.canonicalize().unwrap(),
+                        "HOME": agy_home.canonicalize().unwrap()
+                    }}
+                }
+            }).to_string(),
+        ).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["branch", branch])
+            .current_dir(&target)
+            .status();
+        env.server = Some(server);
+        let spec = SpawnSpec {
+            bead_id: "synthetic-go-bead".to_string(),
+            branch: branch.to_string(),
+            prompt: "synthetic go spawn".to_string(),
+            repo: repo.to_string(),
+            ao_project: "go-project".to_string(),
+            remote: "origin".to_string(),
+            local_checkout: Some(target.clone()),
+            expected_revision: Some(
+                String::from_utf8(
+                    std::process::Command::new("git")
+                        .args(["rev-parse", "HEAD"])
+                        .current_dir(&target)
+                        .output()
+                        .unwrap()
+                        .stdout,
+                )
+                .unwrap()
+                .trim()
+                .to_string(),
+            ),
+            managed_checkout: false,
+            expected_cwd: None,
+        };
+        (root, env, spec, log)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_ao_verify_bridge_compatibility_variants() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let (root, env, _spec, log) = make_go_spawn_fixture("compat-variants", false);
+        let status_file = root.join("status.json");
+        let run_file = root.join("running.json");
+        let data_dir = root.join("ao-data");
+        let port: u16 = std::env::var("AO_PORT").unwrap().parse().unwrap();
+        let runfile_content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&run_file).unwrap()).unwrap();
+        let pid = runfile_content["pid"].as_u64().unwrap();
+
+        // 1. health == ok
+        std::fs::write(
+            &status_file,
+            serde_json::json!({
+                "health": "ok",
+                "pid": pid,
+                "port": port,
+                "runFile": run_file.canonicalize().unwrap(),
+                "dataDir": data_dir.canonicalize().unwrap()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(verify_ao_bridge_compatibility("go-project", "antigravity", &[]).is_ok());
+
+        // Verify explicit AO_RUN_FILE, AO_DATA_DIR, AO_PORT on status command
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains(&format!(
+            "env: AO_RUN_FILE={} AO_DATA_DIR={} AO_PORT={}",
+            run_file.display(),
+            data_dir.display(),
+            port
+        )));
+
+        // 2. state == ready
+        std::fs::write(
+            &status_file,
+            serde_json::json!({
+                "state": "ready",
+                "pid": pid,
+                "port": port,
+                "runFile": run_file.canonicalize().unwrap(),
+                "dataDir": data_dir.canonicalize().unwrap()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(verify_ao_bridge_compatibility("go-project", "antigravity", &[]).is_ok());
+
+        // 3. ready == ready
+        std::fs::write(
+            &status_file,
+            serde_json::json!({
+                "ready": "ready",
+                "pid": pid,
+                "port": port,
+                "runFile": run_file.canonicalize().unwrap(),
+                "dataDir": data_dir.canonicalize().unwrap()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(verify_ao_bridge_compatibility("go-project", "antigravity", &[]).is_ok());
+
+        // 4. unhealthy payload
+        std::fs::write(
+            &status_file,
+            serde_json::json!({
+                "health": "degraded",
+                "pid": pid,
+                "port": port,
+                "runFile": run_file.canonicalize().unwrap(),
+                "dataDir": data_dir.canonicalize().unwrap()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let res = verify_ao_bridge_compatibility("go-project", "antigravity", &[]);
+        assert!(matches!(res, Err(DaemonError::Config(_))));
+
+        // 5. scope mismatch (wrong PID in status)
+        std::fs::write(
+            &status_file,
+            serde_json::json!({
+                "health": "ok",
+                "pid": pid + 1,
+                "port": port,
+                "runFile": run_file.canonicalize().unwrap(),
+                "dataDir": data_dir.canonicalize().unwrap()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let res = verify_ao_bridge_compatibility("go-project", "antigravity", &[]);
+        assert!(matches!(res, Err(DaemonError::Config(_))));
+
+        // 6. tool error (exit code != 0)
+        let fail_script = r#"#!/bin/sh
+echo "fatal error" >&2
+exit 1
+"#;
+        std::fs::write(root.join("ao-go"), fail_script).unwrap();
+        let res = verify_ao_bridge_compatibility("go-project", "antigravity", &[]);
+        assert!(matches!(res, Err(DaemonError::Tool { .. })));
+
+        drop(env);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_preflight_invalid_scope_runfile_project_and_source_never_spawns() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Missing scope is rejected before the client is even constructed.
+        let (root, env, spec, log) = make_go_spawn_fixture("missing-scope", false);
+        std::env::remove_var("AO_RUN_FILE");
+        let result = CliSessions::new("owner/repo", "antigravity").run_spawn_process("antigravity", &spec);
+        assert!(result.is_err());
+        assert!(!std::fs::read_to_string(&log).unwrap_or_default().contains("spawn --project"));
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+
+        // Invalid run-file JSON is rejected without an AO spawn.
+        let (root, env, spec, log) = make_go_spawn_fixture("bad-runfile", false);
+        std::fs::write(root.join("running.json"), "not-json").unwrap();
+        let result = CliSessions::new("owner/repo", "antigravity").run_spawn_process("antigravity", &spec);
+        assert!(result.is_err());
+        assert!(!std::fs::read_to_string(&log).unwrap_or_default().contains("spawn --project"));
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+
+        // A wrong PID with matching AO scope variables but no owned listener
+        // must not be trusted merely because ao-go echoes that PID.
+        let (root, env, spec, log) = make_go_spawn_fixture("wrong-pid", false);
+        let run_file = root.join("running.json");
+        let data_dir = root.join("ao-data");
+        let codex_home = root.join("synthetic-codex-home");
+        let port = std::env::var("AO_PORT").unwrap();
+        let mut wrong_command = std::process::Command::new("python3");
+        for key in crate::account_scope::SCRUBBED_AUTH_VARS {
+            wrong_command.env_remove(key);
+        }
+        wrong_command.env_remove("TMUX");
+        let tmux_dir = root.join("synthetic-tmux-tmpdir");
+        let agy_home = root.join("synthetic-agy-home");
+        let mut wrong_pid = wrong_command
+            .args(["-c", "import time; time.sleep(600)"])
+            .env("AO_RUN_FILE", &run_file)
+            .env("AO_DATA_DIR", &data_dir)
+            .env("AO_PORT", &port)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", &agy_home)
+            .env("TMUX_TMPDIR", &tmux_dir)
+            .spawn()
+            .unwrap();
+        let pid = wrong_pid.id();
+        std::fs::write(&run_file, serde_json::json!({"pid": pid, "port": port.parse::<u16>().unwrap()}).to_string()).unwrap();
+        let mut status: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("status.json")).unwrap()).unwrap();
+        status["pid"] = serde_json::json!(pid);
+        std::fs::write(root.join("status.json"), status.to_string()).unwrap();
+        let result = CliSessions::new("owner/repo", "antigravity").run_spawn_process("antigravity", &spec);
+        assert!(result.is_err());
+        assert!(!std::fs::read_to_string(&log).unwrap_or_default().contains("spawn --project"));
+        let _ = wrong_pid.kill();
+        let _ = wrong_pid.wait();
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+
+        // A project identity mismatch is rejected after status but before spawn.
+        let (root, env, spec, log) = make_go_spawn_fixture("bad-project", false);
+        std::fs::write(root.join("project.json"), r#"{"project":{"id":"other-project"}}"#).unwrap();
+        let result = CliSessions::new("owner/repo", "antigravity").run_spawn_process("antigravity", &spec);
+        assert!(result.is_err());
+        assert!(!std::fs::read_to_string(&log).unwrap_or_default().contains("spawn --project"));
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+
+        // A project scope TMUX socket override is rejected before spawn.
+        let (root, env, spec, log) = make_go_spawn_fixture("bad-project-tmux", false);
+        let bad_project = serde_json::json!({
+            "project": {
+                "id": "go-project", "path": root.join("target").canonicalize().unwrap(),
+                "repo": "https://github.com/owner/repo.git",
+                "defaultBranch": "main",
+                "config": {"env": {
+                    "CODEX_HOME": root.join("synthetic-codex-home").canonicalize().unwrap(),
+                    "HOME": root.join("synthetic-agy-home").canonicalize().unwrap(),
+                    "TMUX": "/tmp/tmux-1000/default,3794,0"
+                }}
+            }
+        });
+        std::fs::write(root.join("project.json"), bad_project.to_string()).unwrap();
+        let result = CliSessions::new("owner/repo", "antigravity").run_spawn_process("antigravity", &spec);
+        assert!(result.is_err());
+        assert!(!std::fs::read_to_string(&log).unwrap_or_default().contains("spawn --project"));
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+
+        // A pinned revision that cannot be resolved from the source refs is
+        // rejected before any mutating AO client invocation.
+        let (root, env, mut spec, log) = make_go_spawn_fixture("bad-source", false);
+        spec.expected_revision = Some("0".repeat(40));
+        let result = CliSessions::new("owner/repo", "antigravity").run_spawn_process("antigravity", &spec);
+        assert!(result.is_err());
+        assert!(!std::fs::read_to_string(&log).unwrap_or_default().contains("spawn --project"));
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_preflight_pinned_valid_source_allows_spawn() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, env, spec, log) = make_go_spawn_fixture("valid", false);
+        let result = CliSessions::new("owner/repo", "antigravity").run_spawn_process("antigravity", &spec);
+        assert!(result.is_ok(), "pinned valid Go source should spawn: {result:?}");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(calls.contains("status --json"));
+        assert!(calls.contains("project get go-project --json"));
+        assert!(calls.contains("spawn --project go-project --harness agy"));
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_spawn_rejects_actual_wrong_branch_even_when_metadata_matches() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, env, spec, log) = make_go_spawn_fixture("wrong-actual-branch", true);
+        let workspace = root.join("operator-home/.ao/data/worktrees/go-project/go-synthetic");
+        assert!(std::process::Command::new("git")
+            .args(["-C", workspace.to_str().unwrap(), "checkout", "-b", "actual/wrong"])
+            .status()
+            .unwrap()
+            .success());
+        let db_path = root.join("ao-data/ao.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT, workspace_path TEXT, branch TEXT);
+             INSERT INTO sessions VALUES ('go-synthetic', 'PLACEHOLDER', 'factory/go-synthetic-r1');",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET workspace_path = ?1 WHERE id = 'go-synthetic'",
+            [workspace.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        drop(conn);
+        std::env::set_var("GO_SPAWN_NONZERO", "0");
+        std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", "codex");
+        let result = CliSessions::new("owner/repo", "antigravity").spawn_with_fallback(&spec);
+        assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })), "cleanup failure must be typed: {result:?}");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(calls.matches("spawn --project").count(), 1, "branch rejection must not try fallback vendor: {calls}");
+        assert!(calls.contains("session kill go-synthetic -p go-project"), "branch rejection cleanup missing: {calls}");
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_spawn_nonzero_valid_stdout_cleans_up_before_error() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, spec, log) = make_go_spawn_fixture("nonzero", false);
+        std::env::set_var("GO_SPAWN_NONZERO", "1");
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.run_spawn_process("antigravity", &spec);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(matches!(result, Err(DaemonError::Tool { .. })), "nonzero Go spawn must fail: {result:?}");
+        assert!(calls.contains("spawn --project"));
+        assert!(calls.contains("session kill go-synthetic -p go-project"), "session cleanup missing: {calls}");
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_spawn_cleanup_failure_halts_fallback_contract() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, spec, _log) = make_go_spawn_fixture("cleanup-fail", true);
+        std::env::set_var("GO_SPAWN_NONZERO", "1");
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.run_spawn_process("antigravity", &spec);
+        assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })), "cleanup failure must be typed: {result:?}");
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_spawn_cleanup_failure_does_not_try_next_vendor() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, spec, log) = make_go_spawn_fixture("fallback-stop", true);
+        std::env::set_var("GO_SPAWN_NONZERO", "1");
+        std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", "codex");
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.spawn_with_fallback(&spec);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(matches!(result, Err(DaemonError::SpawnCleanupFailed { .. })), "cleanup failure must halt fallback: {result:?}");
+        assert_eq!(calls.matches("spawn --project").count(), 1, "fallback vendor must not run after cleanup failure: {calls}");
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_spawn_rejects_wrong_origin_and_stale_revision() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, mut spec, log) = make_go_spawn_fixture("identity", false);
+        let target_revision = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["-C", root.join("target").to_str().unwrap(), "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let workspace = root.join("operator-home/.ao/data/worktrees/go-project/go-synthetic");
+        std::fs::write(workspace.join("different.txt"), "stale workspace").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["-C", workspace.to_str().unwrap(), "add", "different.txt"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["-C", workspace.to_str().unwrap(), "-c", "user.email=test@example.invalid", "-c", "user.name=synthetic", "commit", "-m", "stale"])
+            .status()
+            .unwrap()
+            .success());
+        spec.expected_revision = Some(target_revision);
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.run_spawn_process("antigravity", &spec);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(result.is_err(), "stale Go workspace revision must fail closed");
+        assert!(calls.contains("session kill go-synthetic -p go-project"), "identity failure must clean up: {calls}");
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_spawn_rejects_wrong_origin_and_cleans_up_session() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, spec, log) = make_go_spawn_fixture("wrong-origin", false);
+        let workspace = root.join("operator-home/.ao/data/worktrees/go-project/go-synthetic");
+        assert!(std::process::Command::new("git")
+            .args(["-C", workspace.to_str().unwrap(), "remote", "set-url", "origin", "https://github.com/other/repo.git"])
+            .status()
+            .unwrap()
+            .success());
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.run_spawn_process("antigravity", &spec);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(result.is_err(), "wrong-origin Go workspace must fail closed");
+        assert!(calls.contains("session kill go-synthetic -p go-project"), "wrong-origin failure must clean up: {calls}");
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_spawn_no_id_exit0_fails_session_ambiguous_and_no_fallback() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, spec, log) = make_go_spawn_fixture("no-id-exit0", false);
+        std::env::set_var("GO_SPAWN_NO_SESSION_ID", "1");
+        std::env::set_var("GO_SPAWN_NONZERO", "0");
+        std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", "codex");
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.spawn_with_fallback(&spec);
+        assert!(
+            matches!(result, Err(DaemonError::SessionAmbiguous { .. })),
+            "exit 0 with no session ID must fail closed with SessionAmbiguous: {result:?}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            calls.matches("spawn --project").count(),
+            1,
+            "noIDexit0 must yield exactly 1 spawn and no fallback: {calls}"
+        );
+        assert!(
+            !calls.contains("session kill"),
+            "must never pretend cleanup happened without identity: {calls}"
+        );
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_spawn_no_id_nonzero_fails_session_ambiguous_and_no_fallback_no_kill() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, spec, log) = make_go_spawn_fixture("no-id-nonzero", false);
+        std::env::set_var("GO_SPAWN_NO_SESSION_ID", "1");
+        std::env::set_var("GO_SPAWN_NONZERO", "1");
+        std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", "codex");
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.spawn_with_fallback(&spec);
+        assert!(
+            matches!(result, Err(DaemonError::SessionAmbiguous { .. })),
+            "nonzero exit with no session ID must fail closed with SessionAmbiguous: {result:?}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            calls.matches("spawn --project").count(),
+            1,
+            "noIDnonzero must not attempt fallback vendor: {calls}"
+        );
+        assert!(
+            !calls.contains("session kill"),
+            "no kill attempted when identity is unknown: {calls}"
+        );
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_spawn_known_id_cleanup_failure_retains_spawn_cleanup_failed() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _env, spec, log) = make_go_spawn_fixture("known-id-cleanup-fail", true);
+        std::env::set_var("GO_SPAWN_NONZERO", "1");
+        std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", "codex");
+        let sessions = CliSessions::new("owner/repo", "antigravity");
+        let result = sessions.spawn_with_fallback(&spec);
+        assert!(
+            matches!(result, Err(DaemonError::SpawnCleanupFailed { ref session, .. }) if session == "go-synthetic"),
+            "known ID cleanup failure must retain SpawnCleanupFailed: {result:?}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            calls.matches("spawn --project").count(),
+            1,
+            "knownIDcleanupfailure must halt fallback: {calls}"
+        );
+        assert!(
+            calls.contains("session kill go-synthetic -p go-project"),
+            "kill must be attempted for known session ID: {calls}"
+        );
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn go_ao_kill_in_project_invokes_ao_go() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let (root, env, _spec, log) = make_go_spawn_fixture("kill-in-project", false);
+        let run_file = root.join("running.json");
+        let data_dir = root.join("ao-data");
+        let port = std::env::var("AO_PORT").unwrap();
+
+        let session = SessionId("test-session-999".to_string());
+        CliSessions::kill_in_project("go-project", &session).unwrap();
+
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("session kill test-session-999 -p go-project"));
+        assert!(logged.contains(&format!(
+            "env: AO_RUN_FILE={} AO_DATA_DIR={} AO_PORT={}",
+            run_file.display(),
+            data_dir.display(),
+            port
+        )));
+
+        // Requirement 1: Keep cleanup possible even if LLM provider credentials disappear:
+        // termination is a control operation requiring intended live server identity,
+        // not valid AI authentication.
+        std::env::remove_var("MINIMAX_API_KEY");
+        std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR");
+        std::env::remove_var("DARK_FACTORY_AGY_HOME");
+
+        CliSessions::kill_in_project("go-project", &session).unwrap();
+
+        drop(env);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn go_ao_controller_env_preserves_operator_home() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_op_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+
+        let temp_home = std::env::temp_dir().join(format!("df_test_go_ao_op_home_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_home);
+        std::fs::create_dir_all(&temp_home).unwrap();
+
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &temp_home);
+
+        let env = ao_controller_env("some-project").unwrap();
+        let home_val = env.iter().find(|(k, _)| k == "HOME").map(|(_, v)| v.as_str());
+        assert_eq!(home_val, Some(temp_home.to_str().unwrap()));
+
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_op_home {
+            Some(v) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn go_ao_sqlite_database_queries_and_lifecycle() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_op_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+        let prior_data_dir = std::env::var_os("AO_DATA_DIR");
+
+        let temp_home = std::env::temp_dir().join(format!("df_test_go_ao_db_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_home);
+        let ao_data = temp_home.join(".ao/data");
+        std::fs::create_dir_all(&ao_data).unwrap();
+
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &temp_home);
+        std::env::set_var("AO_DATA_DIR", &ao_data);
+
+        let db_path = ao_data.join("ao.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                workspace_path TEXT,
+                branch TEXT,
+                project_id TEXT,
+                is_terminated INTEGER,
+                activity_state TEXT,
+                num INTEGER
+            );
+            INSERT INTO sessions VALUES ('sess-active-1', '/ws/1', 'branch-1', 'proj-a', 0, 'active', 10);
+            INSERT INTO sessions VALUES ('sess-active-2', '/ws/2', 'branch-1', 'proj-a', 0, 'active', 20);
+            INSERT INTO sessions VALUES ('sess-idle', '/ws/idle', 'branch-2', 'proj-a', 0, 'idle', 30);
+            INSERT INTO sessions VALUES ('sess-exited', '/ws/exited', 'branch-3', 'proj-a', 0, 'exited', 40);
+            INSERT INTO sessions VALUES ('sess-term', '/ws/term', 'branch-4', 'proj-a', 1, 'active', 50);
+            INSERT INTO sessions VALUES ('sess-other-proj', '/ws/other', 'branch-1', 'proj-b', 0, 'active', 60);
+            INSERT INTO sessions VALUES ('sess-unknown-state', '/ws/unk', 'branch-5', 'proj-a', 0, 'custom_running', 70);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        // 1. go_ao_session_workspace_and_branch
+        let (ws, br) = go_ao_session_workspace_and_branch("sess-active-1");
+        assert_eq!(ws, Some(std::path::PathBuf::from("/ws/1")));
+        assert_eq!(br, Some("branch-1".to_string()));
+
+        let (ws_none, br_none) = go_ao_session_workspace_and_branch("sess-nonexistent");
+        assert_eq!(ws_none, None);
+        assert_eq!(br_none, None);
+
+        // 2. CliSessions
+        let sessions = CliSessions::new("org/proj-a", "antigravity");
+
+        // active_count: count for proj-a with is_terminated = 0
+        // sess-active-1, sess-active-2, sess-idle, sess-exited, sess-unknown-state -> total 5
+        let count = sessions.active_count().unwrap();
+        assert_eq!(count, 5);
+
+        // 3. is_quiescent_in_project
+        assert!(!sessions.is_quiescent_in_project(&SessionId("sess-active-1".into()), "proj-a").unwrap());
+        assert!(sessions.is_quiescent_in_project(&SessionId("sess-idle".into()), "proj-a").unwrap());
+        assert!(sessions.is_quiescent_in_project(&SessionId("sess-exited".into()), "proj-a").unwrap());
+        assert!(sessions.is_quiescent_in_project(&SessionId("sess-term".into()), "proj-a").unwrap());
+        assert!(!sessions.is_quiescent_in_project(&SessionId("nonexistent".into()), "proj-a").unwrap());
+
+        // 4. session_activity_within_in_project
+        assert_eq!(
+            sessions.session_activity_within_in_project(&SessionId("sess-active-1".into()), "proj-a", 10).unwrap(),
+            SessionActivity::Running
+        );
+        assert_eq!(
+            sessions.session_activity_within_in_project(&SessionId("sess-idle".into()), "proj-a", 10).unwrap(),
+            SessionActivity::Idle
+        );
+        assert_eq!(
+            sessions.session_activity_within_in_project(&SessionId("sess-exited".into()), "proj-a", 10).unwrap(),
+            SessionActivity::Terminal
+        );
+        assert_eq!(
+            sessions.session_activity_within_in_project(&SessionId("sess-term".into()), "proj-a", 10).unwrap(),
+            SessionActivity::Terminal
+        );
+        assert_eq!(
+            sessions.session_activity_within_in_project(&SessionId("sess-unknown-state".into()), "proj-a", 10).unwrap(),
+            SessionActivity::Running
+        );
+        assert_eq!(
+            sessions.session_activity_within_in_project(&SessionId("nonexistent".into()), "proj-a", 10).unwrap(),
+            SessionActivity::NotFound
+        );
+
+        // 5. attach_within_in_project
+        // For proj-a and branch-1, ORDER BY num DESC gives sess-active-2 (num=20 > 10)
+        let attached = sessions.attach_within_in_project("branch-1", "b-1", "proj-a", 10).unwrap();
+        assert_eq!(attached.0, "sess-active-2");
+
+        let attach_missing = sessions.attach_within_in_project("missing-branch", "b-1", "proj-a", 10);
+        assert!(matches!(
+            attach_missing,
+            Err(DaemonError::SessionNotFound { ref branch, ref bead_id })
+            if branch == "missing-branch" && bead_id == "b-1"
+        ));
+
+        // 6. session_branch_in_project
+        let branch = sessions.session_branch_in_project(&SessionId("sess-active-1".into()), "proj-a").unwrap();
+        assert_eq!(branch, Some("branch-1".to_string()));
+
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_op_home {
+            Some(v) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        match prior_data_dir {
+            Some(v) => std::env::set_var("AO_DATA_DIR", v),
+            None => std::env::remove_var("AO_DATA_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn go_ao_session_workspace_fallback_to_worktrees_dir() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_op_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+
+        let temp_home = std::env::temp_dir().join(format!("df_test_go_ao_fallback_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_home);
+
+        let worktrees_dir = temp_home.join(".ao/data/worktrees/proj-x/sess-fallback-123");
+        std::fs::create_dir_all(&worktrees_dir).unwrap();
+
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &temp_home);
+
+        // No database exists, so go_ao_session_workspace_and_branch returns (None, None)
+        let (ws, br) = go_ao_session_workspace_and_branch("sess-fallback-123");
+        assert_eq!(ws, None);
+        assert_eq!(br, None);
+
+        // Simulate fallback logic in run_spawn_process
+        let session = SessionId("sess-fallback-123".to_string());
+        let spec = SpawnSpec {
+            bead_id: "test-bead".to_string(),
+            branch: "factory/test-branch".to_string(),
+            prompt: "test".to_string(),
+            repo: "org/proj-x".to_string(),
+            ao_project: "proj-x".to_string(),
+            remote: String::new(),
+            local_checkout: None,
+            expected_revision: None,
+            managed_checkout: false,
+            expected_cwd: None,
+        };
+
+        let (mut resolved_ws, mut resolved_br) = go_ao_session_workspace_and_branch(&session.0);
+        if resolved_ws.is_none() {
+            if let Ok(home) = operator_home().or_else(|_| std::env::var("HOME").map_err(|e| e.to_string())) {
+                let fallback = std::path::Path::new(&home)
+                    .join(".ao/data/worktrees")
+                    .join(&spec.ao_project)
+                    .join(&session.0);
+                if fallback.is_dir() {
+                    resolved_ws = Some(fallback);
+                }
+            }
+        }
+        if resolved_br.is_none() {
+            resolved_br = Some(spec.branch.clone());
+        }
+
+        assert_eq!(resolved_ws, Some(worktrees_dir));
+        assert_eq!(resolved_br, Some("factory/test-branch".to_string()));
+
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_op_home {
+            Some(v) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn go_ao_attach_within_in_project_returns_session_not_found_when_no_session() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prior_op_home = std::env::var_os("DARK_FACTORY_OPERATOR_HOME");
+        let prior_ao_data = std::env::var_os("AO_DATA_DIR");
+
+        let temp_home = std::env::temp_dir().join(format!("df_test_go_ao_not_found_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_home);
+        let ao_data = temp_home.join(".ao/data");
+        std::fs::create_dir_all(&ao_data).unwrap();
+
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+        std::env::set_var("DARK_FACTORY_OPERATOR_HOME", &temp_home);
+        std::env::set_var("AO_DATA_DIR", &ao_data);
+
+        let db_path = ao_data.join("ao.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                workspace_path TEXT,
+                branch TEXT,
+                project_id TEXT,
+                is_terminated INTEGER,
+                activity_state TEXT,
+                num INTEGER
+            );
+            INSERT INTO sessions VALUES ('sess-term', '/ws/term', 'feature/terminated', 'proj-a', 1, 'active', 10);
+            INSERT INTO sessions VALUES ('sess-other', '/ws/other', 'feature/other-branch', 'proj-b', 0, 'active', 20);
+            INSERT INTO sessions VALUES ('sess-live', '/ws/live', 'feature/live', 'proj-a', 0, 'active', 30);
+            INSERT INTO sessions VALUES ('sess-idle', '/ws/idle', 'feature/idle', 'proj-a', 0, 'idle', 31);
+            INSERT INTO sessions VALUES ('sess-null', '/ws/null', 'feature/null-act', 'proj-a', 0, NULL, 32);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let sessions = CliSessions::new("org/proj-a", "antigravity");
+
+        // 1. Positive match: live branch attaches successfully and counts active workers
+        let res_live = sessions.attach_within_in_project("feature/live", "bead-live-0", "proj-a", 10);
+        assert_eq!(res_live.unwrap(), SessionId("sess-live".to_string()));
+        assert_eq!(sessions.active_count().unwrap(), 3); // sess-live, sess-idle, sess-null
+
+        // Legitimate nullable activity_state: NULL activity_state defaults to Running
+        let act_null = sessions.session_activity_within_in_project(&SessionId("sess-null".to_string()), "proj-a", 10).unwrap();
+        assert_eq!(act_null, crate::tools::SessionActivity::Running);
+
+        // Explicit idle activity_state
+        let act_idle = sessions.session_activity_within_in_project(&SessionId("sess-idle".to_string()), "proj-a", 10).unwrap();
+        assert_eq!(act_idle, crate::tools::SessionActivity::Idle);
+
+        // Explicit terminated
+        let act_term = sessions.session_activity_within_in_project(&SessionId("sess-term".to_string()), "proj-a", 10).unwrap();
+        assert_eq!(act_term, crate::tools::SessionActivity::Terminal);
+
+        // 2. Only successful query with NO row proves SessionNotFound / NotFound
+        let res_missing = sessions.attach_within_in_project("feature/absent", "bead-absent-1", "proj-a", 10);
+        assert!(matches!(
+            res_missing,
+            Err(DaemonError::SessionNotFound { ref branch, ref bead_id })
+            if branch == "feature/absent" && bead_id == "bead-absent-1"
+        ));
+
+        // Branch exists only for another project -> SessionNotFound
+        let res_other_proj = sessions.attach_within_in_project("feature/other-branch", "bead-other-2", "proj-a", 10);
+        assert!(matches!(
+            res_other_proj,
+            Err(DaemonError::SessionNotFound { ref branch, ref bead_id })
+            if branch == "feature/other-branch" && bead_id == "bead-other-2"
+        ));
+
+        // Branch exists in project but is terminated -> SessionNotFound
+        let res_term = sessions.attach_within_in_project("feature/terminated", "bead-term-3", "proj-a", 10);
+        assert!(matches!(
+            res_term,
+            Err(DaemonError::SessionNotFound { ref branch, ref bead_id })
+            if branch == "feature/terminated" && bead_id == "bead-term-3"
+        ));
+
+        // Non-existent session activity -> NotFound
+        let act_none = sessions.session_activity_within_in_project(&SessionId("sess-nonexistent".to_string()), "proj-a", 10).unwrap();
+        assert_eq!(act_none, crate::tools::SessionActivity::NotFound);
+
+        // 3. Legitimate empty table: active_count returns Ok(0), attach returns SessionNotFound
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("DELETE FROM sessions", []).unwrap();
+        drop(conn);
+        assert_eq!(sessions.active_count().unwrap(), 0);
+        let res_empty = sessions.attach_within_in_project("feature/live", "bead-empty", "proj-a", 10);
+        assert!(matches!(res_empty, Err(DaemonError::SessionNotFound { .. })));
+
+        // 4. Missing DB file: MUST NOT return SessionNotFound / NotFound / Ok(0); propagates typed Config error
+        let _ = std::fs::remove_file(&db_path);
+        let res_no_db = sessions.attach_within_in_project("feature/any", "bead-no-db-4", "proj-a", 10);
+        assert!(matches!(res_no_db, Err(DaemonError::Config(_))), "expected DaemonError::Config, got: {res_no_db:?}");
+        let count_no_db = sessions.active_count();
+        assert!(matches!(count_no_db, Err(DaemonError::Config(_))), "expected DaemonError::Config, got: {count_no_db:?}");
+        let act_no_db = sessions.session_activity_within_in_project(&SessionId("sess-live".to_string()), "proj-a", 10);
+        assert!(matches!(act_no_db, Err(DaemonError::Config(_))), "expected DaemonError::Config, got: {act_no_db:?}");
+
+        // 5. Corrupt DB file: propagates Tool/Parse error, never false-positive NotFound or active_count 0
+        std::fs::write(&db_path, "not a valid sqlite database file").unwrap();
+        let res_corrupt = sessions.attach_within_in_project("feature/any", "bead-corrupt", "proj-a", 10);
+        assert!(res_corrupt.is_err() && !matches!(res_corrupt, Err(DaemonError::SessionNotFound { .. })));
+        let count_corrupt = sessions.active_count();
+        assert!(count_corrupt.is_err());
+        let act_corrupt = sessions.session_activity_within_in_project(&SessionId("sess-live".to_string()), "proj-a", 10);
+        assert!(act_corrupt.is_err() && !matches!(act_corrupt, Ok(crate::tools::SessionActivity::NotFound)));
+
+        // 6. Wrong schema: column missing or wrong type must fail closed rather than defaulting to Running or 0
+        let _ = std::fs::remove_file(&db_path);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                unrelated_col TEXT
+            );
+            INSERT INTO sessions VALUES ('sess-bad-schema', 'data');",
+        ).unwrap();
+        drop(conn);
+        let res_wrong = sessions.attach_within_in_project("feature/any", "bead-wrong", "proj-a", 10);
+        assert!(res_wrong.is_err() && !matches!(res_wrong, Err(DaemonError::SessionNotFound { .. })));
+        let count_wrong = sessions.active_count();
+        assert!(count_wrong.is_err());
+        let act_wrong = sessions.session_activity_within_in_project(&SessionId("sess-bad-schema".to_string()), "proj-a", 10);
+        assert!(act_wrong.is_err() && !matches!(act_wrong, Ok(crate::tools::SessionActivity::NotFound)));
+
+        match prior_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prior_op_home {
+            Some(v) => std::env::set_var("DARK_FACTORY_OPERATOR_HOME", v),
+            None => std::env::remove_var("DARK_FACTORY_OPERATOR_HOME"),
+        }
+        match prior_ao_data {
+            Some(v) => std::env::set_var("AO_DATA_DIR", v),
+            None => std::env::remove_var("AO_DATA_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+}
 
 // PR #666 — bead jleechan-nfdl (pr-655-finding-3) anchor for Evidence Gate re-trigger

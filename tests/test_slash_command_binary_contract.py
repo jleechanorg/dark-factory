@@ -315,7 +315,7 @@ def test_f_defaults_reviewer_calibration_on() -> None:
         "--head-sha <full-40-hex-sha>",
         "--task-file <path>",
         "--output-dir <dir>",
-        "--backend <backend>",
+        "--backend codex",
         "controller-receipt.json",
         "SHA-256 of the controller receipt",
         "prompt SHA-256",
@@ -482,7 +482,7 @@ def test_dark_factory_preflight_warn_adds_backend_arg_when_absent(tmp_path: path
     ]
 
 
-def test_dark_factory_preflight_warn_review_subcommand_inserts_backend_after_review(tmp_path: pathlib.Path) -> None:
+def test_dark_factory_preflight_warn_review_subcommand_keeps_codex_backend(tmp_path: pathlib.Path) -> None:
     workdir = tmp_path
     task_file = workdir / "task.md"
     output_dir = workdir / "review-output"
@@ -513,11 +513,11 @@ def test_dark_factory_preflight_warn_review_subcommand_inserts_backend_after_rev
         },
     )
     assert result.returncode == 0
-    assert "codex missing; falling back to claude" in result.stderr
+    assert "codex missing; review keeps the requested backend (no fallback)" in result.stderr
     calls = _read_fake_runner_calls(call_log)
     runner_calls = [call for call in calls if call[:2] == ["-m", "runner"]]
     assert runner_calls[0][2] == "review"
-    assert runner_calls[0][3:5] == ["--backend", "claude"]
+    assert runner_calls[0][3:5] == ["--base-sha", "a" * 40]
 
 
 def test_df_healer_preflight_warn_replaces_or_adds_backend_arg(tmp_path: pathlib.Path) -> None:
@@ -538,4 +538,3 @@ def test_df_healer_preflight_warn_replaces_or_adds_backend_arg(tmp_path: pathlib
     calls = _read_fake_runner_calls(call_log)
     healer_calls = [call for call in calls if call[:2] == ["-m", "runner.healer"]]
     assert healer_calls[0][2:] == ["--backend", "echo"]
-

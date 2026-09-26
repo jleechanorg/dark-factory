@@ -56,11 +56,19 @@ Operational rules:
    token budget on adversarial validation, it is probably under-testing.
 6. Treat `.dot` graphs as the durable process code. Runner code is disposable;
    graph shape, specs, holdouts, and scoring contracts are the important assets.
-7. **Deprecate human interactive hat**: All coding LLM work must be shifted to the auto-factory. Humans only define intent (create GitHub issues/beads) and write comments on PRs for feedback. The auto-factory autonomously processes and drives branches to green without human-interactive coding sessions.
+7. **Deprecate human interactive hat**: All coding LLM work must be shifted to the auto-factory. Humans only define intent (create GitHub issues/beads) and write comments on PRs for feedback. The auto-factory autonomously processes and drives branches to green without human-interactive coding sessions (exception: explicitly authorized factory infrastructure repair missions may diagnose and repair factory infrastructure in separate worktrees/branches, but product/pilot branches remain strictly autonomous).
 
-## /af — ZERO direct work; monitoring only (operator hard rule)
+## `/af` product runs — ZERO direct work; monitoring only
 
-When the operator directs work through /af (or sets an /af goal), the session
+When the requested object is to make `/af` work, that is a factory-infrastructure
+repair mission, not a product run through `/af`. The repair request authorizes
+normal scoped coding, testing, and deployment of factory infrastructure,
+including direct or delegated coding as needed. Keep intake quiesced, isolate
+the repair in its own worktree/branch, and do not count repair evidence as pilot
+evidence. This boundary does not authorize hand-driving selected product or
+pilot branches.
+
+During ordinary intake (or when an `/af` goal directs product work), the session
 does **ZERO direct work** — no product code, no factory code, no hand-fixes,
 no coding sub-agent lanes. The session's ONLY jobs:
 
@@ -75,6 +83,30 @@ no coding sub-agent lanes. The session's ONLY jobs:
    myself" is the forbidden move: it hides factory gaps and makes the
    label→merge E2E proof unfalsifiable (2026-07-11/12 incidents: hand-driven
    PRs masked a dead coder loop for a full day).
+
+**Factory Infrastructure Repair Exception**:
+When the operator explicitly authorizes a factory repair mission (a natural-language goal to make /af work counts as explicit authorization), the session is permitted to diagnose and repair factory infrastructure/harness code in a separate worktree and branch. Operational rules for repair missions:
+- Strictly isolate infrastructure repairs from selected pilot/product PR branches; never hand-drive pilot PRs.
+- Preserve existing logs and telemetry; create and hash backups before modifying files.
+- Independently validate all repairs, then deploy only through the canonical Linux workflow (`jeff-ubuntu` via SSH).
+- After deployment, resume a clean, real /af pilot to prove end-to-end operation.
+- Infrastructure changes never count as autonomous pilot evidence.
+- Safety invariants remain absolute: existing repository-specific merge authorization gates remain unchanged, and AO code writes still require verbatim `AO CODE APPROVED`.
+
+**Interactive Developer Override**: This zero-direct-work constraint applies strictly
+to hands-off autonomous `/af` goal runs. When the operator directly commands you
+to code, repair, unpark beads, re-run gates, drive verifications, or finish tasks
+(e.g., "you are coding", "keep going and finish 1-4", "repair this"), you are in
+active engineering mode. Act with full authority to diagnose, unpark, fix, run
+evidence commands, and drive the task to completion. Never refuse a direct
+interactive coding instruction by misclassifying it as a hands-off `/af` run.
+
+**Outside /af** (ad hoc repo work, audits, reviews), follow
+`~/.claude/skills/parallelize-to-ceiling/SKILL.md`: fan out independent
+read-only and audit work concurrently, and route actual coding to subagents or
+cheaper-tier lanes rather than the main session. **Inside /af**, that policy is
+superseded — no in-session coding sub-agent lanes; all coding routes through
+the external bead → daemon → AO pipeline per the ZERO-direct-work rule above.
 
 ## Factory host placement (Linux-only)
 
@@ -127,7 +159,7 @@ dot -Tpng pipelines/factory/gates.dot -o gates.png
 Prefer **`dark-factory`** / **`df-healer`** on PATH for `/f` and `/factory`.
 Legacy dev-only: `.venv/bin/python -m runner ...` from `$DARK_FACTORY_HOME`.
 
-When `--pipeline` is omitted, `/f` and `/factory` default to `pipelines/slim/two_node.dot` (generic worker + controller cold reviewer). Pass explicit `--pipeline <name>` to opt into non-default pipelines (see [docs/pipeline-selection.md](docs/pipeline-selection.md)).
+When `--pipeline` is omitted, `/f` and `/factory` default to `pipelines/slim/two_node.dot` (generic worker + fresh fully tooled Codex reviewer with verbatim feedback). Pass explicit `--pipeline <name>` to opt into non-default pipelines (see [docs/pipeline-selection.md](docs/pipeline-selection.md)).
 
 ## Architecture
 
@@ -236,3 +268,33 @@ Each node emits `ENTER` on visit and `EXIT` with classified outcome (`success`, 
    `tool` nodes when separating coder and reviewer/evaluator CLIs.
 6. Use `model_stylesheet="path.model.css"` when a graph needs CSS-like
    backend/model routing without cluttering every node.
+
+## CLI account scoping — mandatory policy for every AI CLI launch
+
+This is a mandatory launch policy, not a claim that every current runtime path
+already enforces it. `Command::new` inherits the daemon environment unless the
+launch code explicitly removes inherited variables and builds a scoped child
+environment. A launch is compliant only when its account/provider scope is
+validated before the process starts.
+
+Every direct Claude launch (`claude` or `claude-sonnet`) MUST validate
+`DARK_FACTORY_CLAUDE_CONFIG_DIR` as an existing project-scoped directory, pass
+that directory to the child as `CLAUDE_CONFIG_DIR`, and scrub inherited Claude
+and provider authentication variables. Keep this environment construction and
+provider scrubbing centralized; do not rely on a bare host `~/.claude` account.
+
+MiniMax is a separate provider lane. It MUST require a nonblank
+`MINIMAX_API_KEY`, pin `ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic` and
+`ANTHROPIC_MODEL=MiniMax-M3`, and remove Claude account state/configuration from
+the child environment. A MiniMax launch must never inherit `CLAUDE_CONFIG_DIR`
+or another host Claude login as an implicit credential.
+
+Every Codex launch, including `codex exec`, MUST use an intended existing
+`CODEX_HOME` or an explicitly supported provider credential/configuration such
+as `OPENAI_API_KEY` or `CODEX_ACCESS_TOKEN` where that launch mode supports it.
+Do not let Codex silently fall back to the operator's default `~/.codex`
+account.
+
+Unscoped or unsupported dispatch MUST fail closed. Fallback is allowed only to
+another lane that has its own explicit, validated scope; never fall back to an
+unscoped Claude, MiniMax, or Codex process.

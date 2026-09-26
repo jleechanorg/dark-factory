@@ -275,7 +275,7 @@ Additional floors and optimizations are enforced:
 
 #### 4.2.8 Safety Envelope & Cumulative Time-Box
 All existing operator policies bind the daemon:
-*   **AO spawn cap:** **≤ 30 concurrent workers**, batches ≤ 15 (operator ao-spawn-safety policy aligned to these values 2026-07-03).
+*   **AO spawn cap:** **≤ 40 concurrent workers**, batches ≤ 15 (operator ao-spawn-safety policy aligned to these values 2026-07-03).
 *   **Autonomy time-box:** Wall-clock autonomous processing time accumulates across a bead's entire chain. When the cumulative clock exceeds 3 hours, the bead enters HUMAN_HELD. Nothing on the automated path resets the clock.
 *   **Token expenditure monitoring:** Per-bead token spend is tracked in CXDB as a monitoring metric (sum of coder tokens + reviewer chain tokens across all attempts). The daemon emits a warning to telemetry at 80% of a configurable per-bead token budget. This is a **monitoring-only** metric in Stage 1/2; it does not gate execution, since the 3hr time-box and circuit-breaker already bound runaway cost. The metric exists to inform budget decisions and detect cost anomalies before they become operator surprises.
 *   **Force-push: never.** Re-rolls create fresh branches.

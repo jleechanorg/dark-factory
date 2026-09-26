@@ -11,6 +11,172 @@ pub const EVT_GH_CIRCUIT_BREAKER_OPENED: &str = "GH_CIRCUIT_BREAKER_OPENED";
 pub const EVT_GH_CIRCUIT_BREAKER_EXTENDED: &str = "GH_CIRCUIT_BREAKER_EXTENDED";
 pub const EVT_GH_CIRCUIT_BREAKER_CLOSED: &str = "GH_CIRCUIT_BREAKER_CLOSED";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiSurface {
+    Graphql,
+    GraphqlMutation,
+    RestRead,
+    RestMutation,
+}
+
+impl ApiSurface {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Graphql => "graphql",
+            Self::GraphqlMutation => "graphql_mutation",
+            Self::RestRead => "rest_read",
+            Self::RestMutation => "rest_mutation",
+        }
+    }
+}
+
+fn request_phase(args: &[&str]) -> String {
+    match args.first() {
+        Some(&"api") => {
+            let mut skip_value = false;
+            let endpoint = args.iter().skip(1).find(|arg| {
+                if skip_value {
+                    skip_value = false;
+                    return false;
+                }
+                if matches!(
+                    **arg,
+                    "--method" | "-X" | "-f" | "-F" | "--field" | "--raw-field" | "--header" | "-H"
+                ) {
+                    skip_value = true;
+                    return false;
+                }
+                !arg.starts_with('-')
+            });
+            match endpoint {
+                Some(&"graphql") => "gh_api_graphql".to_string(),
+                Some(endpoint) => {
+                    format!("gh_api_{}", endpoint.split('/').next().unwrap_or("rest"))
+                }
+                None => "gh_api_rest".to_string(),
+            }
+        }
+        _ => match (args.first(), args.get(1)) {
+            (Some(group), Some(action)) => format!("gh_{group}_{action}"),
+            (Some(group), None) => format!("gh_{group}"),
+            _ => "gh_unknown".to_string(),
+        },
+    }
+}
+
+fn graphql_document_is_mutation(query: &str) -> bool {
+    let mut remaining = query.trim_start_matches('\u{feff}');
+    loop {
+        remaining = remaining.trim_start();
+        if let Some(comment) = remaining.strip_prefix('#') {
+            remaining = comment
+                .split_once(['\n', '\r'])
+                .map(|(_, tail)| tail)
+                .unwrap_or("");
+            continue;
+        }
+        return remaining.starts_with("mutation")
+            && remaining["mutation".len()..]
+                .chars()
+                .next()
+                .is_none_or(|ch| ch.is_whitespace() || matches!(ch, '{' | '('));
+    }
+}
+
+fn graphql_query_field_is_mutation(value: &str) -> bool {
+    value.strip_prefix("query=").is_some_and(|query| {
+        // `gh api graphql -f query=@file.graphql` defers the document bytes
+        // to a file that admission cannot safely inspect here. Treat that
+        // unresolved document as a mutation rather than granting read-only
+        // admission to a possible write.
+        query.trim_start().starts_with('@') || graphql_document_is_mutation(query)
+    })
+}
+
+pub fn classify_gh_request(args: &[&str]) -> ApiSurface {
+    if args.first() == Some(&"api") {
+        if args.get(1) == Some(&"graphql") {
+            let mut previous_was_query_field = false;
+            for arg in args.iter().skip(2) {
+                if *arg == "--input"
+                    || arg.starts_with("--input=")
+                    || arg.starts_with("--field=")
+                    || arg.starts_with("--raw-field=")
+                {
+                    return ApiSurface::GraphqlMutation;
+                }
+                if arg
+                    .strip_prefix("-f")
+                    .or_else(|| arg.strip_prefix("-F"))
+                    .filter(|value| !value.is_empty())
+                    .is_some_and(graphql_query_field_is_mutation)
+                {
+                    return ApiSurface::GraphqlMutation;
+                }
+                let value = if previous_was_query_field {
+                    previous_was_query_field = false;
+                    Some(*arg)
+                } else if matches!(*arg, "-f" | "-F" | "--field" | "--raw-field") {
+                    previous_was_query_field = true;
+                    None
+                } else {
+                    Some(*arg)
+                };
+                if value.is_some_and(graphql_query_field_is_mutation) {
+                    return ApiSurface::GraphqlMutation;
+                }
+            }
+            return ApiSurface::Graphql;
+        }
+        let mut mutation = false;
+        for (idx, arg) in args.iter().enumerate() {
+            if matches!(*arg, "--method" | "-X") {
+                mutation = args
+                    .get(idx + 1)
+                    .is_some_and(|method| !method.eq_ignore_ascii_case("GET"));
+            }
+            if let Some(method) = arg
+                .strip_prefix("--method=")
+                .or_else(|| arg.strip_prefix("-X="))
+                .or_else(|| arg.strip_prefix("-X"))
+            {
+                if !method.is_empty() && !method.eq_ignore_ascii_case("GET") {
+                    mutation = true;
+                }
+            }
+            if matches!(*arg, "-f" | "--field" | "-F" | "--raw-field" | "--input")
+                || arg.starts_with("--field=")
+                || arg.starts_with("--raw-field=")
+                || arg.starts_with("--input=")
+            {
+                mutation = true;
+            }
+        }
+        return if mutation {
+            ApiSurface::RestMutation
+        } else {
+            ApiSurface::RestRead
+        };
+    }
+    match (args.first(), args.get(1)) {
+        (Some(&"issue"), Some(&("list" | "status" | "view")))
+        | (Some(&"pr"), Some(&("checks" | "diff" | "list" | "status" | "view"))) => {
+            ApiSurface::Graphql
+        }
+        (Some(&"auth"), Some(&"status"))
+        | (Some(&"label"), Some(&"list"))
+        | (Some(&"release"), Some(&("download" | "list" | "view")))
+        | (Some(&"repo"), Some(&("list" | "view")))
+        | (Some(&"run"), Some(&("list" | "view" | "watch")))
+        | (Some(&"secret"), Some(&"list"))
+        | (Some(&"workflow"), Some(&("list" | "view"))) => ApiSurface::Graphql,
+        // Fail closed for every unrecognized high-level command. The gh CLI
+        // regularly adds mutating namespaces (label, secret, variable, ...);
+        // an allowlist of writes silently becomes unsafe as the CLI evolves.
+        _ => ApiSurface::RestMutation,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateLimitSignal {
     pub is_secondary: bool,
@@ -54,7 +220,8 @@ pub fn parse_retry_after(text: &str) -> Option<Duration> {
                 if let Ok(secs) = clean_num.parse::<u64>() {
                     if secs > 0 {
                         if let Some(unit) = parts.next() {
-                            let clean_unit = unit.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+                            let clean_unit =
+                                unit.trim_matches(|c: char| !c.is_ascii_alphanumeric());
                             if clean_unit.starts_with("min") || clean_unit == "m" {
                                 return Some(Duration::from_secs(secs * 60));
                             }
@@ -79,7 +246,8 @@ pub fn parse_retry_after(text: &str) -> Option<Duration> {
                 if let Ok(val) = clean_num.parse::<u64>() {
                     if val > 0 {
                         if let Some(unit) = parts.next() {
-                            let clean_unit = unit.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+                            let clean_unit =
+                                unit.trim_matches(|c: char| !c.is_ascii_alphanumeric());
                             if clean_unit.starts_with("min") || clean_unit == "m" {
                                 return Some(Duration::from_secs(val * 60));
                             }
@@ -185,7 +353,9 @@ pub fn default_telemetry_log_path() -> PathBuf {
             .join("Library/Logs/dark-factory")
             .join("daemon.jsonl");
     }
-    std::env::temp_dir().join("dark-factory").join("daemon.jsonl")
+    std::env::temp_dir()
+        .join("dark-factory")
+        .join("daemon.jsonl")
 }
 
 fn emit_transition_telemetry(
@@ -245,7 +415,7 @@ impl GhCircuitBreaker {
         cb
     }
 
-    pub fn check_admission(&mut self) -> Result<(), DaemonError> {
+    pub fn check_admission(&mut self, surface: ApiSurface) -> Result<(), DaemonError> {
         let now = SystemTime::now();
         if let Some(deadline) = self.deadline {
             if now < deadline {
@@ -263,8 +433,8 @@ impl GhCircuitBreaker {
                     tool: "gh".to_string(),
                     rc: 403,
                     stderr: format!(
-                        "gh call suppressed by rate limit circuit breaker (cooldown active for {}s until epoch {}, suppressed_calls={})",
-                        remaining_secs, deadline_epoch, self.suppressed_calls
+                        "gh {} call suppressed by rate limit circuit breaker (cooldown active for {}s until epoch {}, suppressed_calls={})",
+                        surface.as_str(), remaining_secs, deadline_epoch, self.suppressed_calls
                     ),
                 });
             }
@@ -272,7 +442,12 @@ impl GhCircuitBreaker {
         Ok(())
     }
 
-    pub fn record_result(&mut self, result: &Result<String, DaemonError>) {
+    pub fn record_result(
+        &mut self,
+        surface: ApiSurface,
+        resumed_phase: &str,
+        result: &Result<String, DaemonError>,
+    ) {
         let now = SystemTime::now();
         let now_epoch = now
             .duration_since(UNIX_EPOCH)
@@ -300,7 +475,10 @@ impl GhCircuitBreaker {
                                 "consecutive_trips": 0
                             }),
                             serde_json::json!({
+                                "api_surface": surface.as_str(),
+                                "credential_scope": credential_scope(),
                                 "resumed_at_epoch": now_epoch,
+                                "resumed_phase": resumed_phase,
                                 "total_suppressed": total_suppressed
                             }),
                         );
@@ -312,7 +490,8 @@ impl GhCircuitBreaker {
                     if tool == "gh" {
                         if let Some(signal) = parse_rate_limit_error(stderr, *rc) {
                             let was_open = self.deadline.map(|d| now < d).unwrap_or(false);
-                            let cooldown = compute_cooldown(self.consecutive_trips, signal.retry_after);
+                            let cooldown =
+                                compute_cooldown(self.consecutive_trips, signal.retry_after);
                             let cooldown_secs = cooldown.as_secs();
                             let new_deadline = now + cooldown;
                             let new_deadline_epoch = new_deadline
@@ -341,6 +520,8 @@ impl GhCircuitBreaker {
                                     "suppressed_calls": self.suppressed_calls
                                 }),
                                 serde_json::json!({
+                                    "api_surface": surface.as_str(),
+                                    "credential_scope": credential_scope(),
                                     "reason": signal.reason,
                                     "deadline_epoch": new_deadline_epoch,
                                     "retry_after_secs": signal.retry_after.map(|d| d.as_secs()),
@@ -426,29 +607,96 @@ impl GhCircuitBreaker {
     }
 }
 
-fn global_cb() -> &'static Mutex<GhCircuitBreaker> {
+fn global_graphql_cb() -> &'static Mutex<GhCircuitBreaker> {
     static CB: OnceLock<Mutex<GhCircuitBreaker>> = OnceLock::new();
     CB.get_or_init(|| Mutex::new(GhCircuitBreaker::new()))
 }
 
-pub fn admit_or_suppress(cmd: &str) -> Result<(), DaemonError> {
+fn rest_state_path(path: PathBuf) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("gh_circuit_breaker");
+    path.with_file_name(format!("{stem}_rest.json"))
+}
+
+fn global_rest_cb() -> &'static Mutex<GhCircuitBreaker> {
+    static CB: OnceLock<Mutex<GhCircuitBreaker>> = OnceLock::new();
+    CB.get_or_init(|| {
+        // Construct the REST breaker without first loading the GraphQL state.
+        // Loading via `new()` and then swapping paths can leak a GraphQL
+        // cooldown into REST when the REST state file does not exist.
+        let mut cb = GhCircuitBreaker {
+            deadline: None,
+            consecutive_trips: 0,
+            suppressed_calls: 0,
+            last_reason: None,
+            last_retry_after: None,
+            state_file_path: Some(rest_state_path(default_state_file_path())),
+            telemetry_log_path: None,
+        };
+        cb.load_from_disk();
+        Mutex::new(cb)
+    })
+}
+
+fn credential_scope() -> &'static str {
+    if std::env::var_os("GH_TOKEN").is_some() || std::env::var_os("GITHUB_TOKEN").is_some() {
+        "environment_token"
+    } else {
+        "host_auth"
+    }
+}
+
+fn cb_for_surface(surface: ApiSurface) -> &'static Mutex<GhCircuitBreaker> {
+    match surface {
+        ApiSurface::Graphql | ApiSurface::GraphqlMutation => global_graphql_cb(),
+        ApiSurface::RestRead | ApiSurface::RestMutation => global_rest_cb(),
+    }
+}
+
+pub fn admit_or_suppress(cmd: &str, args: &[&str]) -> Result<(), DaemonError> {
     if cmd == "gh" {
-        let mut cb = global_cb().lock().unwrap();
-        cb.check_admission()
+        let surface = classify_gh_request(args);
+        if matches!(
+            surface,
+            ApiSurface::RestMutation | ApiSurface::GraphqlMutation
+        ) {
+            global_graphql_cb()
+                .lock()
+                .unwrap()
+                .check_admission(ApiSurface::Graphql)?;
+            return global_rest_cb()
+                .lock()
+                .unwrap()
+                .check_admission(ApiSurface::RestMutation);
+        }
+        cb_for_surface(surface)
+            .lock()
+            .unwrap()
+            .check_admission(surface)
     } else {
         Ok(())
     }
 }
 
-pub fn record_result(cmd: &str, result: &Result<String, DaemonError>) {
+pub fn record_result(cmd: &str, args: &[&str], result: &Result<String, DaemonError>) {
     if cmd == "gh" {
-        let mut cb = global_cb().lock().unwrap();
-        cb.record_result(result);
+        let surface = classify_gh_request(args);
+        let phase = request_phase(args);
+        cb_for_surface(surface)
+            .lock()
+            .unwrap()
+            .record_result(surface, &phase, result);
     }
 }
 
 pub fn is_rate_limited() -> bool {
-    let cb = global_cb().lock().unwrap();
+    is_surface_rate_limited(ApiSurface::Graphql)
+}
+
+pub fn is_surface_rate_limited(surface: ApiSurface) -> bool {
+    let cb = cb_for_surface(surface).lock().unwrap();
     if let Some(deadline) = cb.deadline {
         if SystemTime::now() < deadline {
             return true;
@@ -458,7 +706,11 @@ pub fn is_rate_limited() -> bool {
 }
 
 pub fn trip(cooldown: Duration, reason: &str) {
-    let mut cb = global_cb().lock().unwrap();
+    trip_surface(ApiSurface::Graphql, cooldown, reason);
+}
+
+pub fn trip_surface(surface: ApiSurface, cooldown: Duration, reason: &str) {
+    let mut cb = cb_for_surface(surface).lock().unwrap();
     let now = SystemTime::now();
     let was_open = cb.deadline.map(|d| now < d).unwrap_or(false);
     cb.consecutive_trips += 1;
@@ -487,47 +739,58 @@ pub fn trip(cooldown: Duration, reason: &str) {
             "suppressed_calls": cb.suppressed_calls
         }),
         serde_json::json!({
+            "api_surface": surface.as_str(),
+            "credential_scope": credential_scope(),
             "reason": reason,
             "deadline_epoch": deadline_epoch
         }),
     );
 }
 
+pub fn suppressed_call_count_for(surface: ApiSurface) -> u64 {
+    cb_for_surface(surface).lock().unwrap().suppressed_calls
+}
+
 pub fn reset() {
-    let mut cb = global_cb().lock().unwrap();
-    cb.deadline = None;
-    cb.consecutive_trips = 0;
-    cb.suppressed_calls = 0;
-    cb.last_reason = None;
-    cb.last_retry_after = None;
-    cb.save_to_disk();
+    for mutex in [global_graphql_cb(), global_rest_cb()] {
+        let mut cb = mutex.lock().unwrap();
+        cb.deadline = None;
+        cb.consecutive_trips = 0;
+        cb.suppressed_calls = 0;
+        cb.last_reason = None;
+        cb.last_retry_after = None;
+        cb.save_to_disk();
+    }
 }
 
 pub fn suppressed_call_count() -> u64 {
-    global_cb().lock().unwrap().suppressed_calls
+    global_graphql_cb().lock().unwrap().suppressed_calls
 }
 
 pub fn consecutive_trips() -> u32 {
-    global_cb().lock().unwrap().consecutive_trips
+    global_graphql_cb().lock().unwrap().consecutive_trips
 }
 
 pub fn current_deadline() -> Option<SystemTime> {
-    global_cb().lock().unwrap().deadline
+    global_graphql_cb().lock().unwrap().deadline
 }
 
 pub fn set_state_file_path(path: Option<PathBuf>) {
-    let mut cb = global_cb().lock().unwrap();
-    cb.state_file_path = path;
+    global_graphql_cb().lock().unwrap().state_file_path = path.clone();
+    global_rest_cb().lock().unwrap().state_file_path = Some(
+        path.map(rest_state_path)
+            .unwrap_or_else(|| rest_state_path(default_state_file_path())),
+    );
 }
 
 pub fn set_telemetry_log_path(path: Option<PathBuf>) {
-    let mut cb = global_cb().lock().unwrap();
-    cb.telemetry_log_path = path;
+    global_graphql_cb().lock().unwrap().telemetry_log_path = path.clone();
+    global_rest_cb().lock().unwrap().telemetry_log_path = path;
 }
 
 pub fn reload() {
-    let mut cb = global_cb().lock().unwrap();
-    cb.load_from_disk();
+    global_graphql_cb().lock().unwrap().load_from_disk();
+    global_rest_cb().lock().unwrap().load_from_disk();
 }
 
 #[cfg(test)]
@@ -557,6 +820,126 @@ mod tests {
     }
 
     #[test]
+    fn classifies_graphql_rest_reads_and_mutations_independently() {
+        assert_eq!(
+            classify_gh_request(&["api", "graphql", "-f", "query=x"]),
+            ApiSurface::Graphql
+        );
+        assert_eq!(
+            classify_gh_request(&["api", "repos/o/r/pulls/1"]),
+            ApiSurface::RestRead
+        );
+        assert_eq!(
+            classify_gh_request(&["api", "repos/o/r/issues/1", "-f", "state=closed"]),
+            ApiSurface::RestMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["api", "--method=DELETE", "repos/o/r/git/refs/x"]),
+            ApiSurface::RestMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["api", "-XPOST", "repos/o/r/issues"]),
+            ApiSurface::RestMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["api", "graphql", "-f", "query=mutation { x }"]),
+            ApiSurface::GraphqlMutation
+        );
+        assert_eq!(
+            classify_gh_request(&[
+                "api",
+                "graphql",
+                "-f",
+                "query=# audit comment\nmutation { x }",
+            ]),
+            ApiSurface::GraphqlMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["api", "graphql", "--input", "payload.json"]),
+            ApiSurface::GraphqlMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["pr", "view", "1"]),
+            ApiSurface::Graphql
+        );
+        assert_eq!(
+            classify_gh_request(&["pr", "comment", "1", "--body", "x"]),
+            ApiSurface::RestMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["pr", "brand-new-write-command", "1"]),
+            ApiSurface::RestMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["label", "create", "urgent"]),
+            ApiSurface::RestMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["secret", "set", "TOKEN"]),
+            ApiSurface::RestMutation
+        );
+        assert_eq!(
+            request_phase(&[
+                "api",
+                "--method",
+                "POST",
+                "repos/o/r/git/refs",
+                "-f",
+                "ref=x"
+            ]),
+            "gh_api_repos"
+        );
+    }
+
+    #[test]
+    fn classifies_attached_graphql_mutation_flags() {
+        assert_eq!(
+            classify_gh_request(&["api", "graphql", "--field=query=x"]),
+            ApiSurface::GraphqlMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["api", "graphql", "--raw-field=query=x"]),
+            ApiSurface::GraphqlMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["api", "graphql", "--input=payload.json"]),
+            ApiSurface::GraphqlMutation
+        );
+        for args in [
+            ["api", "graphql", "-fquery=@mutation.graphql"],
+            ["api", "graphql", "-Fquery=@mutation.graphql"],
+        ] {
+            assert_eq!(classify_gh_request(&args), ApiSurface::GraphqlMutation);
+        }
+    }
+
+    #[test]
+    fn classifies_file_backed_graphql_query_fields_fail_closed() {
+        for args in [
+            ["api", "graphql", "-f", "query=@mutation.graphql"],
+            ["api", "graphql", "-F", "query=@mutation.graphql"],
+        ] {
+            assert_eq!(classify_gh_request(&args), ApiSurface::GraphqlMutation);
+        }
+    }
+
+    #[test]
+    fn classifies_attached_rest_mutation_flags() {
+        assert_eq!(
+            classify_gh_request(&["api", "repos/o/r/issues/1", "--field=state=closed"]),
+            ApiSurface::RestMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["api", "repos/o/r/issues/1", "--raw-field=state=closed"]),
+            ApiSurface::RestMutation
+        );
+        assert_eq!(
+            classify_gh_request(&["api", "repos/o/r/issues/1", "--input=payload.json"]),
+            ApiSurface::RestMutation
+        );
+    }
+
+    #[test]
     fn test_generic_forbidden_is_not_rate_limit() {
         let stderr = "HTTP 403 Forbidden: repository access denied";
         assert!(parse_rate_limit_error(stderr, 403).is_none());
@@ -565,7 +948,8 @@ mod tests {
     #[test]
     fn test_parse_secondary_rate_limit() {
         let stderr = "HTTP 403: You have exceeded a secondary rate limit. Please wait a few minutes before you try again.";
-        let signal = parse_rate_limit_error(stderr, 403).expect("should parse secondary rate limit");
+        let signal =
+            parse_rate_limit_error(stderr, 403).expect("should parse secondary rate limit");
         assert!(signal.is_secondary);
         assert_eq!(signal.reason, "secondary_rate_limit");
     }
@@ -573,7 +957,8 @@ mod tests {
     #[test]
     fn test_parse_retry_after_header() {
         let stderr = "HTTP 403 Forbidden\nRetry-After: 120\nAPI rate limit exceeded";
-        let signal = parse_rate_limit_error(stderr, 403).expect("should parse signal with retry after");
+        let signal =
+            parse_rate_limit_error(stderr, 403).expect("should parse signal with retry after");
         assert_eq!(signal.retry_after, Some(Duration::from_secs(120)));
     }
 

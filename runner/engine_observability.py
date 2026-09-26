@@ -570,6 +570,102 @@ def _format_uncommitted_for_log(state: dict[str, str]) -> str:
     return f"uncommitted={files} files +{ins}/-{dele} staged={staged}"
 
 
+# dark-factory#828: the real incident's run summary gave zero indication a
+# write occurred ("uncommitted_files": "0" was technically true because
+# `fix` had already committed AND pushed). `_capture_run_base_state` snap-
+# shots the workdir's HEAD SHA and upstream-ref SHA *before* any node runs;
+# `_collect_commit_push_state` diffs against that snapshot at run_end to
+# report `commits_created` / `refs_pushed` — the fields that would have
+# caught the incident even with `uncommitted_files: 0`.
+def _capture_run_base_state(workdir: Optional[pathlib.Path]) -> dict[str, str]:
+    """Best-effort HEAD + upstream SHA snapshot, taken before any node runs.
+
+    Empty strings when `workdir` is falsy, not a git repo, or the git
+    subprocess is unavailable — mirrors `_collect_uncommitted_state`'s
+    fail-silent contract (observability must never break a run).
+    """
+    empty = {"_df_run_base_sha": "", "_df_run_base_upstream_sha": ""}
+    if not workdir:
+        return empty
+    try:
+        wd = str(workdir)
+        head = subprocess.run(
+            ["git", "-C", wd, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10, check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        base_sha = head.stdout.strip() if head.returncode == 0 else ""
+        upstream = subprocess.run(
+            ["git", "-C", wd, "rev-parse", "@{u}"],
+            capture_output=True, text=True, timeout=10, check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        base_upstream_sha = upstream.stdout.strip() if upstream.returncode == 0 else ""
+        return {"_df_run_base_sha": base_sha, "_df_run_base_upstream_sha": base_upstream_sha}
+    except Exception:
+        return empty
+
+
+def _collect_commit_push_state(
+    workdir: Optional[pathlib.Path],
+    base_sha: str,
+    base_upstream_sha: str,
+) -> dict[str, str]:
+    """Diff current git state against the run-start snapshot.
+
+    Returns ``commits_created`` (count of new commits on HEAD since
+    `base_sha`) and ``refs_pushed`` ("1" if the upstream ref's SHA changed
+    since `base_upstream_sha`, "0" if unchanged, "" if undeterminable —
+    e.g. no upstream configured, or `base_sha`/`base_upstream_sha` was
+    never captured). Both are "" (not "0") when undeterminable so a caller
+    doesn't mistake "we couldn't check" for "confirmed zero".
+    """
+    empty = {"commits_created": "", "refs_pushed": ""}
+    if not workdir:
+        return empty
+    try:
+        wd = str(workdir)
+        result = dict(empty)
+        if base_sha:
+            count = subprocess.run(
+                ["git", "-C", wd, "rev-list", "--count", f"{base_sha}..HEAD"],
+                capture_output=True, text=True, timeout=10, check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            if count.returncode == 0 and count.stdout.strip().isdigit():
+                result["commits_created"] = count.stdout.strip()
+        if base_upstream_sha:
+            upstream = subprocess.run(
+                ["git", "-C", wd, "rev-parse", "@{u}"],
+                capture_output=True, text=True, timeout=10, check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            if upstream.returncode == 0:
+                current_upstream_sha = upstream.stdout.strip()
+                result["refs_pushed"] = "0" if current_upstream_sha == base_upstream_sha else "1"
+        return result
+    except Exception:
+        return empty
+
+
+def _format_commit_push_for_log(state: dict[str, str]) -> str:
+    """Compact human-readable fragment for the RUN_END log line.
+
+    Returns "" when both fields are undeterminable/zero, so the caller can
+    choose whether to append anything at all.
+    """
+    commits = state.get("commits_created", "")
+    pushed = state.get("refs_pushed", "")
+    if (not commits or commits == "0") and (not pushed or pushed == "0"):
+        return ""
+    parts = []
+    if commits:
+        parts.append(f"commits_created={commits}")
+    if pushed:
+        parts.append(f"refs_pushed={pushed}")
+    return " ".join(parts)
+
+
 def _perf_node_enter(ctx: Context, node: Node, seq: int, visit: int) -> None:
     perf_log.node_enter(
         getattr(ctx, "perf_run", None),

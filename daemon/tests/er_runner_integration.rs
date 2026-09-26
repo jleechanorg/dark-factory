@@ -307,6 +307,7 @@ impl StateStore for StoreMock {
 
 fn test_cfg() -> Config {
     Config {
+        task_bead_id: None,
         target_repo: "owner/repo".into(),
         ao_project: None,
         base_branch: "main".into(),
@@ -363,8 +364,10 @@ fn attested_overlay(bead_id: &str, pr: u64) -> BeadOverlay {
         pr_number: Some(pr),
         branch: Some(format!("factory/{bead_id}-r1")),
         session_id: Some("s1".into()),
+        session_ao_project: None,
         is_adopted: false,
         spawn_failure_count: 0,
+        transient_error_count: 0,
             pre_session_head_sha: None,
             park_reason: None,
             target_repo: None,

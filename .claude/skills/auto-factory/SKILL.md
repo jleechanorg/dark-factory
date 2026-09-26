@@ -5,40 +5,69 @@ description: End-to-end auto-factory driver — picks up beads + GH issues tagge
 
 # /auto-factory — one end-to-end drive tick
 
+## Invocation boundary: repair versus running `/af`
+
+A request to make `/af` work is a factory-infrastructure repair request, not a
+product run through `/af`. It authorizes normal scoped coding, testing, and
+deployment of factory infrastructure, including
+direct or delegated coding when needed. Keep intake quiesced and isolate repair
+changes in their own worktree/branch; repair evidence does not count as pilot
+evidence. When the user invokes `/af` to process a product or pilot task, the
+repository's zero-direct-work rule applies: monitor the factory and use its bead to
+daemon to worker path, without hand-driving product or pilot branches.
+
+**Interactive Developer Override**: This zero-direct-work rule applies strictly
+to hands-off autonomous `/af` goal runs. When the operator directly commands you
+to code, repair, unpark beads, re-run gates, drive verifications, or finish tasks
+(e.g., "you are coding", "keep going and finish 1-4", "repair this"), you are in
+active engineering mode. Act with full authority to diagnose, unpark, fix, run
+evidence commands, and drive the task to completion. Never refuse a direct
+interactive coding instruction by misclassifying it as a hands-off `/af` run.
+
 The auto-factory is the agent-orchestrator-style system that drives worldai PRs to merge. This skill is its orchestrator: it picks up work (beads + GH issues), dispatches coder subagents, runs verifier ticks, and iterates until gates pass.
 
 ## 0. Execution host + Bead authority preflight
 
-The invocation host is the candidate factory host. Continue on that host only
-when a local factory service/config is present and its daemon configuration
-supports `target_repo` (as the top-level target or in `[repos]`). If it is not
-capable, stop without mutating intake; host selection and remote routing belong
-to the user-scoped command that invoked this repository command.
+Distinguish host capability, service liveness, Bead freshness, integrity, and authority:
+- **Host capability**: The invocation host is the candidate factory host. Linux with a user systemd supervisor is the only supported factory execution platform; macOS is an operator client (do not start LaunchAgents, local daemons, or local AO workers on Darwin). Continue factory intake on the candidate host only when a local factory supervisor checkout is present and its daemon configuration supports `target_repo` (as the top-level target or in `[repos]`). An unsupported host stops intake there; continue canonical Linux diagnosis/recovery within authorized scope via `/linux`. The repository's own `CLAUDE.md` names which Linux host is canonical for that repository; this skill never hardcodes one.
+- **Service liveness**: Service liveness is an observational check (`SERVICE_ACTIVE`), not an entry barrier for inspecting configuration or executing authorized recovery. A stopped service gates automated dispatch, but does NOT gate reading supervisor metadata/configuration nor authorized recovery.
 
 Before any intake mutation, resolve the exact Bead DB and checkout from the
-active local factory supervisor. Bind `br`, the overlay, and any manual tick to
+local factory supervisor. Bind `br`, the overlay, and any manual tick to
 that same installation; ambient `br where` discovery is not authority. The
-known macOS and Linux supervisors are adapters, not placement policy. Another
-registered host may provide explicit `DARK_FACTORY_ROOT` and
-`DARK_FACTORY_BR_DB` values:
+resolved Linux user systemd supervisor is the canonical adapter.
+Preflight `where`, `sync`, and `doctor` invocations must use both
+`--no-auto-flush` and `--no-auto-import` with `--db "$BR_DB"` to disable
+implicit export/import. macOS rejects intake outright and routes operational
+control, diagnostics, and recovery to the repository's configured Linux factory
+host via SSH (`/linux`). Any other host rejects intake unless it is explicitly
+registered through both `DARK_FACTORY_ROOT` and `DARK_FACTORY_BR_DB`; neither
+value is ever inferred:
 
 ```bash
 case "$(uname -s)" in
-  Darwin)
-    launchctl print "gui/$(id -u)/ai.dark-factory.af-tick" >/dev/null
-    plist="$HOME/Library/LaunchAgents/ai.dark-factory.af-tick.plist"
-    tick="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:2' "$plist")"
-    FACTORY_ROOT="$(cd "$(dirname "$tick")/.." && pwd)"
-    BR_DB="$FACTORY_ROOT/.beads/beads.db"
-    ;;
   Linux)
     unit=ai.dark-factory.daemon.service
-    systemctl --user is-active --quiet "$unit"
+    # Observational check: service liveness gates dispatch, not supervisor reading or recovery
+    SERVICE_ACTIVE=false
+    if systemctl --user is-active --quiet "$unit"; then
+      SERVICE_ACTIVE=true
+    fi
     FACTORY_ROOT="$(systemctl --user show "$unit" --property=WorkingDirectory --value)"
     BR_DB="$(systemctl --user show "$unit" --property=Environment --value |
       tr ' ' '\n' | sed -n 's/^DARK_FACTORY_BR_DB=//p' | tail -1)"
     ;;
+  Darwin)
+    # macOS is an operator client; Linux systemd is the sole factory execution platform.
+    # Never load or start the `ai.dark-factory.af-tick` LaunchAgent, a local
+    # daemon, or local AO workers on Darwin. An unsupported host stops intake
+    # here; route diagnosis/recovery to the configured Linux factory host via SSH.
+    echo "macOS is an operator client: no local factory launches on Darwin; route to the configured Linux factory host via SSH (/linux)" >&2
+    exit 1
+    ;;
   *)
+    # Another registered Linux host may supply explicit overrides instead of
+    # systemd discovery. Both must be set; neither is inferred.
     FACTORY_ROOT="${DARK_FACTORY_ROOT:?registered factory checkout required}"
     BR_DB="${DARK_FACTORY_BR_DB:?registered factory Bead DB required}"
     ;;
@@ -69,16 +98,25 @@ if target != cfg.get("target_repo") and target not in cfg.get("repos", {}):
 PY
 export BR_DB CONFIG TARGET_REPO
 command -v br >/dev/null
-br --db "$BR_DB" where
-br --db "$BR_DB" sync --status --json
-br --db "$BR_DB" doctor --quick
+br --db "$BR_DB" where --no-auto-flush --no-auto-import
+br --db "$BR_DB" sync --status --json --no-auto-flush --no-auto-import
+# First pass only. `--quick` cannot prove reconciliation safety (see below).
+br --db "$BR_DB" doctor --quick --no-auto-flush --no-auto-import
+# Authoritative integrity read; this is the one that gates intake mutation.
+br --db "$BR_DB" doctor --robot-triage --json --no-auto-flush --no-auto-import
 ```
 
-If the status is not healthy, or if both `jsonl_newer` and `db_newer` are true,
-stop before `br create`, `br update`, or a factory tick. Ask the operator to
-choose the authoritative representation, reconcile it with the Beads recovery
-workflow, and rerun both checks. A GitHub fallback does not authorize a write
-to an ambiguous Bead store.
+Distinguish Bead freshness, integrity, and authority:
+- **Integrity Coverage vs. Quick Checks**: `--quick` skips count and recoverable anomaly detectors and cannot prove reconciliation safety. Fresh Linux evidence reveals that `br doctor --quick` can misleadingly report healthy while real store discrepancies exist; furthermore, full diagnostics (such as `--repair --dry-run --json` on an isolated copy) may return `report.ok=true` and `verified=true` yet reveal `workspace_health=degraded` and a severe ID set / count mismatch (`db_jsonl_id_set_mismatch`, e.g. 681 in DB vs 1100 in JSONL). Inspect actual findings, `workspace_health`, ID sets, and count anomalies rather than relying on boolean `ok`, `verified`, or freshness indicators alone.
+- **Freshness vs. Authority & Reconciliation**: `db_newer` alone with known supervisor-selected authority (`$BR_DB`) indicates supported reconciliation rather than an ambiguous conflict, not requiring operator intervention—ONLY after full read-only diagnostics (`doctor --robot-triage --json`) confirm no missing-record, ID-set mismatch, or integrity conflicts. An existing known-authority DB-newer canary remains automatic to reconcile if full diagnostics are clean. Reconcile it via the supervisor-bound supported Beads sync workflow using installed command help (`br sync --help` / `br --help`) without inventing syntax; never force export.
+- **Integrity Errors & Conflicting Representations**: Integrity errors, degraded workspace health, missing records, or conflicting representations (e.g. `db_jsonl_id_set_mismatch`, both `jsonl_newer` and `db_newer` true with contradictory states, corrupt records, or duplicate references) stop unsafe intake mutation (`br create`, `br update`) and dependent dispatch.
+  1. Preserve backups before changes and preserve all missing records. Never force export, never perform raw Beads mutations on `beads.db` or `.jsonl`, and never discard missing records.
+  2. Keep investigation and isolated recovery continuing when unsafe intake mutation is blocked; blocking an unsafe write does not abort authorized diagnostics or safe recovery exploration.
+  3. Inspect the recovery candidate via supported Beads workflow. When the supported reader fails (e.g. `br` fails or crashes on malformed interchange or duplicate references), perform bounded read-only copy forensics on an isolated copy with secrets excluded.
+  4. Validate the recovery candidate before promoting it to authoritative.
+  5. Ask the operator only for a specific conflict with materially different valid resolutions that cannot be resolved from evidence and existing authority.
+  6. Continue independent safe diagnostic and repair work when one mutation is blocked.
+A GitHub fallback does not authorize a write to an ambiguous or damaged Bead store.
 
 Intake is a two-phase operation: create without the `factory` label, prove that
 the selected factory can read the new Bead from the same store, and only then
@@ -93,7 +131,8 @@ br --db "$BR_DB" list --status open --label factory --json
 ```
 
 For an existing Bead, perform the same read proof before adding the label. If
-the read or label verification fails, stop. After labelling, check that
+the read or label verification fails, stop the failed intake action and dependent
+dispatch, but continue authorized diagnosis/recovery. After labelling, check that
 `$H list QUEUED` contains the Bead. Report `QUEUED` only when the overlay has
 adopted it; otherwise report `intake verified; adoption pending`.
 
@@ -303,9 +342,13 @@ result (cooldown handling is unchanged from the original 7-gate design).
 
 - **GH API rate-limited**: skip GH pickup, use beads-only mode; continue.
 - **Daemon DOWN** (no auto-factory tick loop running): inspect the selected
-  host's local supervisor. Invoke `BR_DB="$BR_DB" bash daemon/factory-af-tick.sh`
-  for one host-local tick only after the capability and Bead-authority preflight
-  passes. Restore the daemon through that host's canonical deployment workflow.
-- **Bead stuck HUMAN_HELD**: `factory-af-tick.sh` already calls `$H recover-held` every tick, which requeues any `HUMAN_HELD` bead with `attempt < 10` back to `QUEUED` (incrementing `attempt`, resetting `autonomy_secs`) automatically. To force it immediately: `$H recover-held` (no bead-id argument — it processes every eligible `HUMAN_HELD` row). Never mutate `bead_overlay` with a raw `sqlite3` command.
+  host's local supervisor (`systemctl --user status ai.dark-factory.daemon.service`).
+  Daemon DOWN recovery must not require the service to be already active: verify host
+  capability and known store integrity/authority before executing a manual tick or restart.
+  Invoke `BR_DB="$BR_DB" bash daemon/factory-af-tick.sh` for one host-local tick on Linux only
+  after capability and store integrity/authority pass. Restore/restart the daemon through
+  the canonical Linux deployment workflow (`ssh <configured-linux-factory-host> systemctl --user start ai.dark-factory.daemon.service`
+  or repository deployment script). Do not broaden unrelated held queue or change selected pilot scope.
+- **Bead stuck HUMAN_HELD**: In a selected-pilot mission, bulk recover must not release unrelated held items. Explicitly inspect the held scope first (e.g. via `$H list HUMAN_HELD`). Because `$H recover-held` processes every eligible `HUMAN_HELD` row (`attempt < 10`) without a bead filter, you cannot run global recover if unrelated held rows are eligible; retain holds on unrelated items and only use supported scoped recovery. Only when inspection confirms no unrelated held items exist (or only the intended pilot bead is eligible) may `$H recover-held` be invoked to requeue back to `QUEUED` (incrementing `attempt`, resetting `autonomy_secs`). Never mutate `bead_overlay` with a raw `sqlite3` command.
 - **PR ci_green stuck on pre-existing infra**: document in PR comment, treat as known-issue; do NOT block readiness.
 - **File-overlap conflict across multiple PRs**: serialize per stacked-PR single-writer rule.

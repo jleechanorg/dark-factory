@@ -40,6 +40,7 @@ Order of operations (each step is fail-closed over fail-open):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -74,6 +75,160 @@ from runner.skeptic_gate import (
 # Hard upper bound on the diff we will hand to the reviewer. We do NOT
 # silently truncate — a partial review cannot satisfy the gate.
 MAX_DIFF_BYTES = 1024 * 1024  # 1 MiB
+
+# Linux's MAX_ARG_STRLEN kernel constant caps a SINGLE argv element at
+# 131072 bytes (128 KiB) -- unrelated to the larger combined-argv+environ
+# ARG_MAX limit. `agy` has no stdin-based prompt delivery (verified: its
+# `--print` flag requires the prompt as an argv value; a bare `--print`
+# with piped stdin and no positional value errors immediately, it never
+# reads stdin for a plain-text prompt), so its prompt is embedded directly
+# in argv and can hit E2BIG on the real Linux factory host once the diff
+# approaches this limit (`MAX_DIFF_BYTES` above is 1 MiB, well over 128
+# KiB, so this is reachable). A conservative safety margin below the hard
+# 131072-byte kernel limit, to leave room for the rest of `agy`'s argv
+# (binary path, flags) sharing the same limit (round-10 /advice, Opus).
+AGY_ARGV_PROMPT_SAFETY_LIMIT_BYTES = 120 * 1024
+
+# PR #819 round-11 /advice finding (Codex, HIGH): claudem/minimax/claude/
+# agy/cursor-agent(+cursor/agentf aliases) all run with full write access
+# (--dangerously-skip-permissions / -f) IN THE TARGET CHECKOUT being
+# reviewed, invoked via a plain `subprocess.run` with no `cwd=` override
+# (so they inherit the current process's working directory -- the coder's
+# worktree). Unlike codex (`--sandbox=read-only`) and gemini (`-s` +
+# `--approval-mode=default`), none of these five vendor names has any
+# sandboxing at all. Since the reviewer is fed a PR-controlled diff/prompt
+# and has full write permissions in the very tree it is grading, a
+# maliciously-crafted diff could in principle induce the reviewer to alter
+# the tree (e.g. "fix" a failing test, delete evidence, plant a passing
+# marker) BEFORE it reports its verdict -- undermining the SHA-bound
+# reviewer contract this whole gate exists to enforce. Fixed by
+# fingerprinting the checkout immediately before and after invoking any of
+# these five vendors and failing closed (discarding the reviewer's output
+# entirely, regardless of what it claims, and restoring the checkout) if
+# the checkout was mutated. Mirrors `checkout_fingerprint()` in
+# `${HOME}/.claude/skills/advice/scripts/run_primary_pair.py`, which
+# already does exactly this for its own (out-of-process) reviewer runs.
+WRITE_ACCESS_REVIEWER_VENDORS = frozenset(
+    {"claudem", "minimax", "claude", "agy", "cursor-agent", "cursor", "agentf"}
+)
+
+
+class _CheckoutFingerprintError(Exception):
+    """Raised when `_checkout_fingerprint` cannot prove the checkout's
+    state (git failure, unreadable file, etc). round-12 /advice finding
+    (Codex + Opus, both independently demonstrated real exploits): the
+    original version of this function's callers treated "cannot compute
+    a fingerprint" as equivalent to "no mutation" (fail OPEN) -- a
+    reviewer with write access can trivially trigger this (e.g. drop an
+    unreadable file, per Opus's reproduced exploit) to defeat the entire
+    guard. Every caller must now treat this exception as PROOF OF
+    MUTATION (fail CLOSED), matching the sibling contract in
+    `runner/handler_codergen.py` (`:1358-1363`, `:1550`), which already
+    treats an unobtainable fingerprint as `mutated = True`.
+    """
+
+
+def _checkout_fingerprint(repo: pathlib.Path, *, timeout: int = 30) -> str:
+    """Hash HEAD, tracked-file diff, and untracked file content.
+
+    Same shape as `checkout_fingerprint()` in the /advice skill's
+    `run_primary_pair.py` -- a git-aware content fingerprint used to
+    detect whether a reviewer subprocess mutated the checkout it was
+    only supposed to inspect. Raises `_CheckoutFingerprintError` (never
+    silently returns a placeholder) if the fingerprint cannot be proven
+    -- round-12 /advice: a wedged `git` (e.g. `index.lock` contention
+    with a concurrent reviewer) must not hang the gate indefinitely, and
+    an unreadable file must not silently make the fingerprint agree with
+    itself on both sides.
+    """
+
+    def _git(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=True,
+        ).stdout
+
+    try:
+        digest = hashlib.sha256()
+        digest.update(_git("rev-parse", "HEAD"))
+        digest.update(_git("diff", "--binary", "HEAD", "--"))
+        untracked = _git("ls-files", "--others", "--exclude-standard", "-z")
+        for raw_path in sorted(filter(None, untracked.split(b"\0"))):
+            digest.update(raw_path)
+            path = repo / os.fsdecode(raw_path)
+            if path.is_symlink():
+                digest.update(b"symlink\0" + os.fsencode(os.readlink(path)))
+            elif path.is_file():
+                digest.update(path.read_bytes())
+        return digest.hexdigest()
+    except Exception as exc:
+        raise _CheckoutFingerprintError(str(exc)) from exc
+
+
+def _checkout_head_sha(repo: pathlib.Path, *, timeout: int = 30) -> str:
+    """The exact commit `_restore_checkout` resets back to."""
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=True,
+    ).stdout.decode("utf-8", errors="replace").strip()
+
+
+def _checkout_changed_files(repo: pathlib.Path) -> str:
+    """Best-effort short description of what changed, for the failure message."""
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+            check=False,
+        ).stdout.decode("utf-8", errors="replace")
+    except Exception as exc:
+        return f"(could not enumerate changed files: {exc})"
+    lines = [line for line in status.splitlines() if line.strip()]
+    return "; ".join(lines[:10]) if lines else "(no porcelain status -- binary/ignored-file change?)"
+
+
+def _restore_checkout(repo: pathlib.Path, head_sha: str) -> bool:
+    """Discard any mutation a compromised reviewer subprocess left behind.
+
+    round-12 /advice finding (Opus, demonstrated exploit): `git checkout
+    -- .` only restores tracked files from the INDEX, not HEAD, so a
+    reviewer that `git add`s its own mutation survives "restoration"
+    untouched. Uses `git reset --hard <head_sha>` instead, which resets
+    BOTH the index and the working tree to the exact pre-review commit
+    (captured before the reviewer ran), then removes untracked files the
+    same way the fingerprint itself scoped them (`--exclude-standard`,
+    i.e. respecting .gitignore -- NOT `-x`, so legitimate gitignored
+    build artifacts the reviewer didn't touch are left alone). Returns
+    True only if the restore is independently verified to have actually
+    converged (re-fingerprinted and compared) -- round-12 /advice: the
+    original version used `check=False` and never verified success, so a
+    failed restore (index lock, permissions) was invisible and the
+    poisoned tree was silently handed to the next chain-walk vendor.
+    """
+    reset = subprocess.run(
+        ["git", "-C", str(repo), "reset", "--quiet", "--hard", head_sha],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    clean = subprocess.run(
+        ["git", "-C", str(repo), "clean", "--quiet", "-fd", "--"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    return reset.returncode == 0 and clean.returncode == 0
+
 
 # Default reviewer list. Both must PASS.
 DEFAULT_REVIEWERS_JSON = '[["codex", ""], ["gemini", "gemini-3.7-pro"]]'
@@ -150,6 +305,33 @@ REVIEWER_ENV_BASE_ALLOWLIST = {
 REVIEWER_ENV_PROVIDER_ALLOWLIST = {
     "codex": {"OPENAI_API_KEY"},
     "gemini": {"GOOGLE_API_KEY"},
+    "claudem": {"MINIMAX_API_KEY"},
+    "minimax": {"MINIMAX_API_KEY"},
+    # agy and cursor-agent authenticate via a keychain/config-file
+    # session (see the agy-pair-coder/cursor-pair-coder agent
+    # definitions: "Auth is durable in macOS Keychain"), not a single
+    # env-var API key like codex/gemini/claudem. `daemon/src/tick.rs
+    # ::dispatch_reviewer`'s `"agy"` and `"cursor-agent" | "cursor" |
+    # "agentf"` arms both use the plain `run_tool` (full, unsandboxed
+    # env inheritance) — that daemon path never needed a narrow
+    # allowlist entry for these two vendors.
+    #
+    # This Python CI-invoked path is different: it explicitly hard-
+    # denies HOME (and USER/SHELL/etc.) for every reviewer via
+    # REVIEWER_SECRET_ENV_DENY below, checked before this allowlist —
+    # a deliberate security boundary for a PR-diff-driven subprocess
+    # running on shared CI infrastructure, not an oversight. Neither
+    # agy nor cursor-agent has a verified, narrowly-scoped (non-HOME)
+    # credential env var in this codebase, so there is currently no
+    # allowlist entry that would both (a) actually let these two
+    # vendors authenticate in this sandboxed CI path and (b) respect
+    # the HOME deny. Do not add "agy"/"cursor-agent": {"HOME"} here —
+    # REVIEWER_SECRET_ENV_DENY silently defeats it, which is worse
+    # than no entry at all (it looks fixed but isn't). See
+    # test_reviewer_env_allowlist_entries_are_never_shadowed_by_deny_list
+    # for the regression guard, and PR #819 round-3 discussion for the
+    # open question of what these two vendors actually need on the
+    # self-hosted CI runners this gate targets.
 }
 
 
@@ -456,8 +638,12 @@ def _build_reviewer_cmd(
     reviewer: str,
     model: str,
     *,
+    prompt: str = "",
     codex_bin: str = "",
     gemini_bin: str = "",
+    claude_bin: str = "",
+    agy_bin: str = "",
+    cursor_bin: str = "",
 ) -> list[str]:
     """Sandbox-mode argv for a reviewer CLI.
 
@@ -484,7 +670,70 @@ def _build_reviewer_cmd(
     reviewer binary (defense against mutable PATH — see post-audit
     comment 4953064910). When empty, the bare name is used (the
     workflow's PATH is reduced to a minimal set).
+
+    ``claudem``/``minimax``, ``agy``, and ``cursor-agent`` (plus the
+    ``cursor``/``agentf`` aliases) are the live chain-walk fallback
+    vendors from ``skeptic_reviewer_priority()``
+    (``config/skeptic_reviewer_priority.json``). Their argv mirrors the
+    daemon's already-working table (`daemon/src/tick.rs::dispatch_reviewer`)
+    for flags, but PR #819 round-10 corrected a wrong claim in this
+    docstring: `claude`/`claudem`/`minimax` and `cursor-agent` (plus its
+    `cursor`/`agentf` aliases) DO read the prompt from stdin when no
+    positional prompt value is given (verified by direct invocation:
+    `claude --print` and `cursor-agent -f -p` both consume piped stdin;
+    `cursor-agent` errors with "No prompt provided for print mode" only
+    when stdin is empty, proving it genuinely reads it). Embedding the
+    full prompt+diff (up to `MAX_DIFF_BYTES` = 1 MiB) as a single argv
+    element exceeds Linux's 131072-byte `MAX_ARG_STRLEN` kernel limit
+    for any diff over ~128 KiB, causing `execve` to fail with `E2BIG` —
+    a silent total-outage bug (round-10 /advice, Opus). These four
+    vendor names now mirror codex/gemini's stdin delivery exactly; only
+    `prompt` itself is omitted from their argv here (the caller,
+    ``invoke_reviewer``, supplies it via ``stdin_input``).
+
+    `agy` is the one exception: verified it has NO stdin-based prompt
+    delivery for plain-text prompts (`--print` requires the prompt as
+    an argv value; a bare `--print` with piped stdin and no positional
+    value errors immediately without ever reading stdin). `agy` does
+    support a `--input-format stream-json` NDJSON-over-stdin mode, but
+    adopting it would require restructuring both the request envelope
+    and the output parser to a different contract — out of proportion
+    for closing an argv-size edge case on a vendor that is separately,
+    already documented as unable to authenticate in this CI-sandboxed
+    path at all (see ``REVIEWER_ENV_PROVIDER_ALLOWLIST`` above). `agy`
+    keeps its prompt in argv but is now guarded by an explicit
+    pre-flight size check in ``invoke_reviewer`` (fails loud with a
+    clear message before ``subprocess.run`` would otherwise crash with
+    an opaque OS-level `E2BIG`), rather than a silent outage.
+
+    PR #819 round-2 finding, still true: the previous version only knew
+    `codex`/`gemini`, so a chain-walk fallback to any of these vendors
+    raised `RuntimeError` instead of advancing the queue.
     """
+    if reviewer in ("claudem", "minimax"):
+        return [
+            claude_bin or "claude",
+            "--print",
+            "--dangerously-skip-permissions",
+            "--setting-sources",
+            "",
+            "--effort",
+            "high",
+            "--model",
+            "MiniMax-M3",
+        ]
+    if reviewer == "claude":
+        return [
+            claude_bin or "claude",
+            "--print",
+            "--dangerously-skip-permissions",
+            "--setting-sources",
+            "",
+        ]
+    if reviewer == "agy":
+        return [agy_bin or "agy", "--dangerously-skip-permissions", "--print", prompt]
+    if reviewer in ("cursor-agent", "cursor", "agentf"):
+        return [cursor_bin or "cursor-agent", "-f"]
     if reviewer == "codex":
         cmd = [
             codex_bin or "codex",
@@ -559,6 +808,9 @@ def invoke_reviewer(
     timeout: int = 900,
     codex_bin: str = "",
     gemini_bin: str = "",
+    claude_bin: str = "",
+    agy_bin: str = "",
+    cursor_bin: str = "",
 ) -> Tuple[Optional[str], Optional[str]]:
     """Run the reviewer CLI; return (stdout, error_message).
 
@@ -592,18 +844,54 @@ def invoke_reviewer(
         return fake_stdout, None
 
     cmd = _build_reviewer_cmd(
-        reviewer, model, codex_bin=codex_bin, gemini_bin=gemini_bin
+        reviewer,
+        model,
+        prompt=prompt,
+        codex_bin=codex_bin,
+        gemini_bin=gemini_bin,
+        claude_bin=claude_bin,
+        agy_bin=agy_bin,
+        cursor_bin=cursor_bin,
     )
     stdin_input = prompt
-    if reviewer == "gemini" and cmd and cmd[0].endswith("gemini"):
+    if reviewer == "agy":
+        # PR #819 round-10: `agy` is the one vendor with no stdin-based
+        # plain-text prompt delivery (verified directly — see
+        # `_build_reviewer_cmd`'s docstring), so its prompt stays in argv
+        # (already embedded in `cmd` above). Guard it explicitly here: a
+        # prompt over the Linux single-argv-element limit would otherwise
+        # make `subprocess.run` below crash with an opaque OS-level
+        # `E2BIG` — fail loud with an actionable message instead.
+        prompt_bytes = len(prompt.encode("utf-8"))
+        if prompt_bytes > AGY_ARGV_PROMPT_SAFETY_LIMIT_BYTES:
+            return None, (
+                f"prompt is too large for agy's argv-only prompt delivery: "
+                f"{prompt_bytes} bytes > {AGY_ARGV_PROMPT_SAFETY_LIMIT_BYTES} "
+                f"(agy has no stdin fallback for plain-text prompts; split "
+                f"the PR or use a different reviewer for this diff size)"
+            )
+        stdin_input = None
+    elif reviewer in ("claudem", "minimax", "claude", "cursor-agent", "cursor", "agentf"):
+        # PR #819 round-10: these CLIs DO read the prompt from stdin when
+        # no positional prompt value is given (verified directly — see
+        # `_build_reviewer_cmd`'s docstring). `cmd` above already omits
+        # `prompt` from argv for these vendors, so deliver it via stdin
+        # exactly like codex/gemini already do, avoiding the Linux argv
+        # single-element size limit entirely (round-10 /advice, Opus).
+        stdin_input = prompt
+    elif reviewer == "gemini" and cmd and cmd[0].endswith("gemini"):
         cmd = [
             gemini_bin or "agy",
-            "--model",
-            model,
             "--dangerously-skip-permissions",
+            "--print-timeout",
+            f"{timeout}s",
+            "--effort",
+            "medium",
             "--print",
             prompt,
         ]
+        if model:
+            cmd.extend(["--model", model])
         stdin_input = None
     elif reviewer == "codex" and cmd:
         if "--sandbox" in cmd:
@@ -620,7 +908,106 @@ def invoke_reviewer(
         parent_env if parent_env is not None else os.environ, reviewer
     )
     if reviewer == "gemini":
-        env["HOME"] = "/tmp"
+        env["HOME"] = os.path.expanduser("~")
+    elif reviewer in ("claudem", "minimax"):
+        # bashrc `claudem()`: MiniMax via the Claude Code CLI. Env is
+        # applied to this child only so a sibling `agy`/`codex` reviewer
+        # thread never inherits MiniMax's ANTHROPIC_BASE_URL. Mirrors
+        # `daemon/src/tick.rs::dispatch_reviewer`'s "claudem" | "minimax" arm.
+        minimax_key = env.get("MINIMAX_API_KEY", "")
+        env["CLAUDEM_MODE"] = "1"
+        env["ANTHROPIC_BASE_URL"] = "https://api.minimax.io/anthropic"
+        env["ANTHROPIC_AUTH_TOKEN"] = minimax_key
+        env["ANTHROPIC_API_KEY"] = minimax_key
+        env["ANTHROPIC_MODEL"] = "MiniMax-M3"
+        env["ANTHROPIC_SMALL_FAST_MODEL"] = "MiniMax-M3"
+        env["CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL"] = "0"
+
+    # PR #819 round-11/-12 /advice findings (Codex + Opus, HIGH, both
+    # independently reproduced real exploits): the five vendors in
+    # WRITE_ACCESS_REVIEWER_VENDORS run with full write access in this
+    # process's cwd (the target checkout being reviewed -- `subprocess.run`
+    # below has no `cwd=` override, so the child inherits it), with no
+    # sandboxing (unlike codex/gemini above). Fingerprint the checkout
+    # immediately before and after the reviewer subprocess and fail closed
+    # if it was mutated (or if mutation cannot be disproven), so a
+    # PR-controlled diff cannot induce the reviewer to alter the tree
+    # before reporting a (now-untrustworthy) verdict.
+    #
+    # round-12: three concrete bypasses Opus demonstrated against
+    # round-11's version, all fixed here:
+    #   1. Any exception while fingerprinting (before OR after) now fails
+    #      CLOSED (raises `_CheckoutFingerprintError`, treated as proof
+    #      of mutation), not open. A reviewer that drops one unreadable
+    #      file used to sail through with a trusted verdict.
+    #   2. The post-check now runs on EVERY exit path from the subprocess
+    #      call (timeout, FileNotFoundError, normal return), not just the
+    #      success path -- `subprocess.run(..., timeout=...)` kills the
+    #      child before raising `TimeoutExpired`, so it is safe to
+    #      fingerprint immediately after. Previously a timed-out reviewer
+    #      that mutated the tree first went undetected AND unrestored,
+    #      poisoning the NEXT chain-walk vendor's own "before" baseline.
+    #   3. `_restore_checkout` now resets to the exact pre-review HEAD sha
+    #      (not `checkout -- .`, which only restores from the index and
+    #      leaves a `git add`ed mutation in place) and its success is
+    #      independently re-verified by re-fingerprinting; if the tree is
+    #      STILL not back to the pre-review fingerprint after restore, the
+    #      error says so explicitly instead of silently handing a
+    #      possibly-still-poisoned tree to the next vendor.
+    checkout_repo: Optional[pathlib.Path] = None
+    fingerprint_before: Optional[str] = None
+    head_sha_before: Optional[str] = None
+    if reviewer in WRITE_ACCESS_REVIEWER_VENDORS:
+        checkout_repo = pathlib.Path.cwd()
+        try:
+            fingerprint_before = _checkout_fingerprint(checkout_repo)
+            head_sha_before = _checkout_head_sha(checkout_repo)
+        except Exception as exc:
+            # Cannot establish a baseline for a write-access vendor ->
+            # refuse to grant it write access on an unfingerprintable
+            # checkout at all (fail closed, matches the sibling contract
+            # in handler_codergen.py). This is the vendor's own
+            # unavailability, not a crash: the chain-walk advances past
+            # it exactly like a launch failure.
+            return None, (
+                f"cannot establish a checkout baseline for write-access "
+                f"reviewer '{reviewer}' ({exc}); refusing to grant it "
+                f"write access without an immutability proof"
+            )
+
+    def _post_review_mutation_check() -> Optional[str]:
+        """Returns an error string if a mutation was found (and
+        could not be safely restored), else None. No-op (returns None
+        immediately) for reviewers not in WRITE_ACCESS_REVIEWER_VENDORS."""
+        if checkout_repo is None or fingerprint_before is None or head_sha_before is None:
+            return None
+        try:
+            fingerprint_after = _checkout_fingerprint(checkout_repo)
+        except Exception as exc:
+            fingerprint_after = f"<unprovable: {exc}>"  # never equals a real hash
+        if fingerprint_after == fingerprint_before:
+            return None
+        changed = _checkout_changed_files(checkout_repo)
+        restored = _restore_checkout(checkout_repo, head_sha_before)
+        if restored:
+            try:
+                verify = _checkout_fingerprint(checkout_repo)
+            except Exception:
+                verify = None
+            restored = verify == fingerprint_before
+        if restored:
+            return (
+                f"reviewer '{reviewer}' mutated the target checkout during "
+                f"review -- discarding its verdict regardless of content; "
+                f"checkout restored and re-verified clean (changed: {changed})"
+            )
+        return (
+            f"reviewer '{reviewer}' mutated the target checkout during "
+            f"review AND restore did not converge back to the pre-review "
+            f"state -- discarding its verdict; the checkout may still be "
+            f"compromised, treat this run as unsafe to continue "
+            f"(changed: {changed})"
+        )
 
     try:
         proc = subprocess.run(
@@ -633,9 +1020,20 @@ def invoke_reviewer(
             check=False,
         )
     except FileNotFoundError as exc:
+        mutation_err = _post_review_mutation_check()
+        if mutation_err is not None:
+            return None, mutation_err
         return None, f"reviewer binary not found: {exc}"
     except subprocess.TimeoutExpired:
+        mutation_err = _post_review_mutation_check()
+        if mutation_err is not None:
+            return None, mutation_err
         return None, f"reviewer timed out after {timeout}s"
+
+    mutation_err = _post_review_mutation_check()
+    if mutation_err is not None:
+        return None, mutation_err
+
     if proc.returncode != 0:
         return proc.stdout, (
             f"reviewer rc={proc.returncode}: {proc.stderr.strip()[:300]}"

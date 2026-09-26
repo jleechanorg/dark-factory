@@ -383,7 +383,7 @@ pub fn resolve_pytest(python_bin: Option<&Path>) -> PytestLocation {
     if let Some(p) = python_bin {
         let candidate = p.parent().map(|d| d.join("pytest"));
         if let Some(c) = candidate {
-            if c.is_file() {
+            if is_executable_file(&c) {
                 return PytestLocation::Found(c);
             }
         }
@@ -394,11 +394,32 @@ pub fn resolve_pytest(python_bin: Option<&Path>) -> PytestLocation {
 fn which_pytest_on_path() -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for entry in std::env::split_paths(&path_var) {
-        if entry.join("pytest").is_file() {
+        if is_executable_file(&entry.join("pytest")) {
             return Some(PathBuf::new()); // bare-name hit on PATH
         }
     }
     None
+}
+
+/// Check the capability signal without spawning an unbounded subprocess at
+/// daemon startup. A regular executable bit check rejects stale/non-runnable
+/// pytest files while keeping startup non-fatal for Rust-only hosts.
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Bounded recursive Python manifest search (mirrors
@@ -640,13 +661,20 @@ fn python_fn_body_index(source: &str) -> std::collections::HashMap<String, Strin
             }
             if indent <= decl_indent
                 && (trimmed_local.starts_with("def ")
-                    || trimmed_local.starts_with("async def "))
+                    || trimmed_local.starts_with("async def ")
+                    || trimmed_local.starts_with('@'))
             {
                 break;
             }
             body_end += 1;
         }
-        let body = lines[body_start..body_end].join("\n");
+        // Ignore separator whitespace before the next function.  Otherwise
+        // merely appending a new test function changes the preceding
+        // function's captured body and falsely marks it as modified.
+        let body = lines[body_start..body_end]
+            .join("\n")
+            .trim_end()
+            .to_string();
         out.insert(name.to_string(), body);
         i = body_end;
     }
@@ -763,6 +791,8 @@ pub fn check_red_green_with_manifest(
     // into the language; pytest uses `@pytest.mark.skip` which is a
     // future-extension seam).
     let mut targeted: BTreeSet<String> = BTreeSet::new();
+    let mut pytest_targets: Vec<PytestTarget> = Vec::new();
+    let mut cargo_targets: Vec<CargoTarget> = Vec::new();
     let mut skipped: Vec<TestFnInfo> = Vec::new();
     for path in &test_files {
         let head_src = std::fs::read_to_string(path).map_err(|e| {
@@ -783,9 +813,24 @@ pub fn check_red_green_with_manifest(
             skipped.push(info);
         }
         for name in added_or_modified {
+            if backend == Backend::Pytest {
+                pytest_targets.push(PytestTarget {
+                    path: path.clone(),
+                    name: name.clone(),
+                });
+            } else if backend == Backend::Cargo {
+                cargo_targets.push(CargoTarget {
+                    path: path.clone(),
+                    name: name.clone(),
+                });
+            }
             targeted.insert(name);
         }
     }
+    pytest_targets.sort_by(|a, b| a.path.cmp(&b.path).then(a.name.cmp(&b.name)));
+    pytest_targets.dedup();
+    cargo_targets.sort_by(|a, b| a.path.cmp(&b.path).then(a.name.cmp(&b.name)));
+    cargo_targets.dedup();
     let targeted_tests: Vec<String> = targeted.iter().cloned().collect();
 
     // Phase (a) — green-on-PR-head. If the targeted tests don't pass
@@ -793,14 +838,13 @@ pub fn check_red_green_with_manifest(
     let head_pass = match backend {
         Backend::Cargo => run_cargo_tests(
             repo_root,
-            &test_files,
-            &targeted_tests,
+            &cargo_targets,
             resolved_manifest.as_deref(),
             cargo_loc.clone(),
         )?,
         Backend::Pytest => run_pytest_tests(
             repo_root,
-            &test_files,
+            &pytest_targets,
             &targeted_tests,
             resolved_manifest.as_deref(),
             pytest_loc.clone(),
@@ -829,15 +873,14 @@ pub fn check_red_green_with_manifest(
         Backend::Cargo => run_baseline_check(
             repo_root,
             base_ref,
-            &test_files,
-            &targeted_tests,
+            &cargo_targets,
             resolved_manifest.as_deref(),
             cargo_loc.clone(),
         )?,
         Backend::Pytest => run_pytest_baseline_check(
             repo_root,
             base_ref,
-            &test_files,
+            &pytest_targets,
             &targeted_tests,
             resolved_manifest.as_deref(),
             pytest_loc.clone(),
@@ -875,14 +918,13 @@ pub fn check_red_green_with_manifest(
     let revert_outcome = match backend {
         Backend::Cargo => run_cargo_tests(
             repo_root,
-            &test_files,
-            &targeted_tests,
+            &cargo_targets,
             resolved_manifest.as_deref(),
             cargo_loc.clone(),
         ),
         Backend::Pytest => run_pytest_tests(
             repo_root,
-            &test_files,
+            &pytest_targets,
             &targeted_tests,
             resolved_manifest.as_deref(),
             pytest_loc.clone(),
@@ -1378,6 +1420,21 @@ struct CargoOutcome {
     compile_errored: bool,
 }
 
+/// A pytest node keeps its file association. Names alone are insufficient:
+/// two changed files may both define `test_parse`, and executing a Cartesian
+/// product can report one passing file while silently missing the other.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PytestTarget {
+    path: PathBuf,
+    name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CargoTarget {
+    pub path: PathBuf,
+    pub name: String,
+}
+
 impl CargoOutcome {
     fn all_passed(&self) -> bool {
         // A compile failure on the reverted tree is the strongest
@@ -1482,6 +1539,57 @@ pub fn find_cargo_manifest_recursive(repo_root: &Path, max_depth: usize) -> Opti
     None
 }
 
+/// Resolve `bare_name` (the identifier `discover_test_fns_with_skip` parsed
+/// after `fn `) to the fully-qualified name cargo's test harness actually
+/// registers for `--exact` filtering. Integration tests declared inside a
+/// `mod foo { ... }` block compile to `foo::bare_name`, not `bare_name` —
+/// our source scanner does not track module nesting, so a naive
+/// `--exact bare_name` silently selects zero tests and the caller records a
+/// false `NEVER_RAN` (CodeRabbit finding 4, issue #387 r7).
+///
+/// Lists the target's tests via `cargo test --test <basename> -- --list`
+/// and matches `bare_name` first exactly, then as the suffix after `::`.
+/// Falls back to `bare_name` unchanged when the list can't be obtained or
+/// no match is found, preserving today's (still fail-closed) behavior.
+fn resolve_cargo_test_name(
+    cargo_bin: &Path,
+    repo_root: &Path,
+    basename: &str,
+    manifest: Option<&Path>,
+    bare_name: &str,
+) -> String {
+    let mut args: Vec<String> = vec!["test".to_string(), "--test".to_string(), basename.to_string()];
+    if let Some(m) = manifest {
+        args.push("--manifest-path".to_string());
+        args.push(m.to_string_lossy().into_owned());
+    }
+    args.push("--".to_string());
+    args.push("--list".to_string());
+
+    let Ok(out) = Command::new(cargo_bin)
+        .current_dir(repo_root)
+        .args(&args)
+        .output()
+    else {
+        return bare_name.to_string();
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let suffix = format!("::{bare_name}");
+    let mut suffix_match: Option<String> = None;
+    for line in stdout.lines() {
+        let Some(name) = line.strip_suffix(": test") else {
+            continue;
+        };
+        if name == bare_name {
+            return name.to_string();
+        }
+        if suffix_match.is_none() && name.ends_with(&suffix) {
+            suffix_match = Some(name.to_string());
+        }
+    }
+    suffix_match.unwrap_or_else(|| bare_name.to_string())
+}
+
 /// Run cargo test against the working tree (or a worktree under
 /// `baseline_root` for the baseline-main phase) using the resolved
 /// manifest. Issue #387 r5 finding 3: `--manifest-path` is required
@@ -1498,14 +1606,17 @@ pub fn find_cargo_manifest_recursive(repo_root: &Path, max_depth: usize) -> Opti
 /// directory` (the previous failure mode).
 fn run_cargo_tests(
     repo_root: &Path,
-    test_files: &[PathBuf],
-    targeted_tests: &[String],
+    cargo_targets: &[CargoTarget],
     manifest: Option<&Path>,
     cargo_loc: CargoLocation,
 ) -> Result<CargoOutcome, RedGreenError> {
-    if targeted_tests.is_empty() {
+    if cargo_targets.is_empty() {
         return Ok(CargoOutcome {
-            failing: vec![],
+            // No cargo process ran, so this cannot prove a green test. Keep
+            // the same explicit marker used when a named target is not
+            // collected, rather than allowing an empty target list to look
+            // like a successful phase.
+            failing: vec!["<no-cargo-targets>:NEVER_RAN".to_string()],
             compile_errored: false,
         });
     }
@@ -1526,15 +1637,31 @@ fn run_cargo_tests(
     let mut failing: Vec<String> = Vec::new();
     let mut compile_errored = false;
 
-    for tf in test_files {
-        let basename = tf
+    for target in cargo_targets {
+        let basename = target
+            .path
             .file_stem()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| RedGreenError::Git(format!("bad test file path: {}", tf.display())))?;
+            .ok_or_else(|| RedGreenError::Git(format!("bad test file path: {}", target.path.display())))?;
+
+        if basename == "mod" {
+            // Helper modules under tests/ are not Cargo integration-test
+            // targets. Record that this target was never executed so a PR
+            // containing only mod.rs discoveries cannot earn a green phase.
+            failing.push(format!("{}:NEVER_RAN", target.name));
+            continue;
+        }
+
+        let resolved_name = resolve_cargo_test_name(
+            &cargo_bin,
+            repo_root,
+            basename,
+            manifest,
+            &target.name,
+        );
 
         let mut args: Vec<String> = vec![
             "test".to_string(),
-            "--quiet".to_string(),
             "--test".to_string(),
             basename.to_string(),
         ];
@@ -1542,11 +1669,9 @@ fn run_cargo_tests(
             args.push("--manifest-path".to_string());
             args.push(m.to_string_lossy().into_owned());
         }
-        for name in targeted_tests {
-            args.push("--".to_string());
-            args.push(name.clone());
-            args.push("--exact".to_string());
-        }
+        args.push("--".to_string());
+        args.push(resolved_name.clone());
+        args.push("--exact".to_string());
 
         let out = Command::new(&cargo_bin)
             .current_dir(repo_root)
@@ -1561,10 +1686,6 @@ fn run_cargo_tests(
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
 
-        // Cargo surfaces compile errors as `error[E0...]:` on stderr or
-        // stdout. If we see one AND exit was non-zero AND no per-test PASS
-        // lines were emitted, the test never compiled — which is the
-        // strongest possible "production code is being exercised" signal.
         if !out.status.success()
             && (stderr.contains("error[E") || stdout.contains("error[E"))
             && !stdout.contains(" ... ok")
@@ -1572,22 +1693,23 @@ fn run_cargo_tests(
             compile_errored = true;
         }
 
-        // Parse cargo test's per-test PASS/FAIL summary lines.
-        for name in targeted_tests {
-            let passed_marker = format!("test {name} ... ok");
-            let failed_marker = format!("test {name} ... FAILED");
-            let ignored_marker = format!("test {name} ... ignored");
-            if stdout.contains(&failed_marker) || stderr.contains(&failed_marker) {
-                failing.push(name.clone());
-            } else if !(stdout.contains(&passed_marker) || stdout.contains(&ignored_marker)) {
-                // If neither PASS nor FAIL nor IGNORED is present, the test
-                // didn't run at all — treat that as a hard fail signal so
-                // the gate doesn't accidentally approve a test that was
-                // skipped. Issue #387 r5 finding 3: this used to be
-                // treated as a real pass on the dark-factory layout when
-                // --manifest-path was omitted.
-                failing.push(format!("{name}:NEVER_RAN"));
-            }
+        // Report failures keyed by the diff-scanned bare name (matches
+        // `targeted_tests` elsewhere in the report) even though matching
+        // against cargo's own output uses the resolved, module-qualified
+        // name.
+        let name = &target.name;
+        let passed_marker = format!("test {resolved_name} ... ok");
+        let failed_marker = format!("test {resolved_name} ... FAILED");
+        let ignored_marker = format!("test {resolved_name} ... ignored");
+        if stdout.contains(&failed_marker) || stderr.contains(&failed_marker) {
+            failing.push(name.clone());
+        } else if stdout.contains(&ignored_marker) {
+            // Cargo's default test mode reports #[ignore] tests as
+            // "ignored" without executing their assertions. They therefore
+            // cannot establish either head-green or red-on-revert evidence.
+            failing.push(format!("{name}:NEVER_RAN"));
+        } else if !stdout.contains(&passed_marker) {
+            failing.push(format!("{name}:NEVER_RAN"));
         }
     }
 
@@ -1606,8 +1728,7 @@ fn run_cargo_tests(
 fn run_baseline_check(
     repo_root: &Path,
     base_ref: &str,
-    test_files: &[PathBuf],
-    targeted_tests: &[String],
+    cargo_targets: &[CargoTarget],
     manifest: Option<&Path>,
     cargo_loc: CargoLocation,
 ) -> Result<CargoOutcome, RedGreenError> {
@@ -1642,19 +1763,89 @@ fn run_baseline_check(
         )));
     }
 
-    // Resolve the manifest path relative to the worktree root if the
-    // caller passed a relative manifest — manifests passed in are
-    // typically repo-relative (e.g. "daemon/Cargo.toml"), and the
-    // worktree uses the same relative layout.
-    let baseline_manifest = manifest.map(|m| {
-        if m.is_absolute() {
-            m.to_path_buf()
-        } else {
-            tmp.join(m)
-        }
-    });
+    // `cargo_targets` paths are resolved against the PR target worktree
+    // (`repo_root`). Rebase them into the detached baseline before
+    // materializing/running — mirrors `run_pytest_baseline_check`, which
+    // hit the same problem first (issue #387 r7 / CodeRabbit finding 5).
+    let baseline_targets: Vec<CargoTarget> = cargo_targets
+        .iter()
+        .map(|target| CargoTarget {
+            path: rebase_worktree_path(repo_root, &tmp, &target.path),
+            name: target.name.clone(),
+        })
+        .collect();
 
-    let result = run_cargo_tests(&tmp, test_files, targeted_tests, baseline_manifest.as_deref(), cargo_loc);
+    // Unlike the pytest analogue, Cargo targets that are genuinely ADDED by
+    // this PR (the fn name has no counterpart anywhere in the base-side
+    // file — whether because the whole test file is new, or the fn was
+    // added to an existing file) cannot simply be copied into the baseline
+    // and executed: Rust is statically compiled, so a test that exercises a
+    // production symbol the PR *also* introduces (the overwhelmingly common
+    // "add a fn + add its test" shape) fails to compile against base
+    // production code with an unresolved-symbol error — not because the
+    // test was "already broken", but because the symbol it needs is itself
+    // part of this PR. Forcing execution here would turn every ordinary
+    // TDD-style PR into a false `BaselineFailed`. Python's dynamic imports
+    // don't hit this: an unused symbol only errors if actually called.
+    //
+    // There is also nothing meaningful to check for an added fn: baseline
+    // exists to answer "was this test already failing before the PR",
+    // which presupposes the test already existed. So added targets are
+    // skipped rather than materialized — they trivially satisfy the
+    // baseline phase.
+    //
+    // MODIFIED targets (fn name already present in the base-side file) need
+    // no materialization at all: `git worktree add --detach base_ref`
+    // already checked out that file's true base body/imports/helpers, so
+    // rebasing the path is sufficient for `run_cargo_tests` to exercise the
+    // real base state.
+    let mut runnable_targets: Vec<CargoTarget> = Vec::new();
+    for (target, baseline_target) in cargo_targets.iter().zip(&baseline_targets) {
+        let rel = relative_repo_path(repo_root, &target.path);
+        let base_src = rel.and_then(|path| read_base_blob(repo_root, base_ref, &path));
+        let base_names: BTreeSet<String> = base_src
+            .as_deref()
+            .map(discover_test_fns)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if base_names.contains(&target.name) {
+            runnable_targets.push(baseline_target.clone());
+        }
+    }
+
+    // Rebase the manifest into the detached worktree the same way
+    // `run_pytest_baseline_check` does (`rebase_worktree_path`), not the
+    // former `m.is_absolute() => passthrough` shortcut: `repo_root` is an
+    // absolute path in production (the daemon always resolves an absolute
+    // PR worktree), so `find_cargo_manifest`/`find_cargo_manifest_recursive`
+    // return an absolute manifest too. The passthrough case therefore fired
+    // on every real invocation, pointing `--manifest-path` straight back at
+    // the live PR worktree's Cargo.toml/src instead of the detached base —
+    // silently defeating the entire baseline phase. `rebase_worktree_path`
+    // strips the `repo_root` prefix before falling back to passthrough, so
+    // it only keeps an external absolute path (e.g. a manifest genuinely
+    // outside the repo) untouched.
+    let baseline_manifest = manifest
+        .map(|m| rebase_worktree_path(repo_root, &tmp, m))
+        .filter(|p| p.is_file());
+
+    // An empty `runnable_targets` here means every target was genuinely
+    // added (skipped above), not that discovery found nothing — the
+    // top-level `head_pass` phase already rejected a truly-empty
+    // `cargo_targets` before baseline ever runs. Skip spawning cargo
+    // entirely rather than routing through `run_cargo_tests`'s empty-input
+    // guard, which exists for that different (real "nothing to check")
+    // case and would incorrectly report `<no-cargo-targets>:NEVER_RAN`
+    // here.
+    let result = if runnable_targets.is_empty() {
+        Ok(CargoOutcome {
+            failing: Vec::new(),
+            compile_errored: false,
+        })
+    } else {
+        run_cargo_tests(&tmp, &runnable_targets, baseline_manifest.as_deref(), cargo_loc)
+    };
 
     // Always clean up the worktree, even on error. We swallow cleanup
     // errors — the test outcome is the primary signal; a stale /tmp
@@ -1682,7 +1873,7 @@ fn run_baseline_check(
 /// failed" (pytest's equivalent of a Rust compile error).
 fn run_pytest_tests(
     repo_root: &Path,
-    test_files: &[PathBuf],
+    pytest_targets: &[PytestTarget],
     targeted_tests: &[String],
     manifest: Option<&Path>,
     pytest_loc: PytestLocation,
@@ -1716,14 +1907,31 @@ fn run_pytest_tests(
     // `<file>::<test_name>` nodes directly. Multiple files in
     // a single pytest invocation is fine; pytest collects them
     // all.
+    // Pytest reports node IDs relative to the effective project root. For a
+    // nested pyproject, that root is the manifest's parent rather than the
+    // daemon target-worktree root; selectors and parsing must use the same
+    // coordinate system.
+    let pytest_root = manifest
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.eq_ignore_ascii_case("pyproject.toml"))
+                .unwrap_or(false)
+        })
+        .and_then(Path::parent)
+        .unwrap_or(repo_root);
     let mut selector_args: Vec<String> = Vec::new();
-    for tf in test_files {
-        let rel = relative_repo_path(repo_root, tf).unwrap_or_else(|| {
-            tf.to_string_lossy().into_owned()
+    for target in pytest_targets {
+        // Selectors and pytest's verbose node IDs share the manifest-root
+        // coordinate system.  Passing a nested-project path such as
+        // `mvp_site/tests/test_value.py` while running from the repository
+        // root makes pytest report `tests/test_value.py::...`, so the
+        // parser would classify a passing target as NEVER_RAN.  Construct
+        // the selector relative to the same root used for output parsing.
+        let rel = relative_repo_path(pytest_root, &target.path).unwrap_or_else(|| {
+            target.path.to_string_lossy().into_owned()
         });
-        for name in targeted_tests {
-            selector_args.push(format!("{rel}::{name}"));
-        }
+        selector_args.push(format!("{rel}::{}", target.name));
     }
 
     let mut args: Vec<String> = vec![
@@ -1765,7 +1973,10 @@ fn run_pytest_tests(
     args.extend(selector_args);
 
     let out = Command::new(&pytest_bin)
-        .current_dir(repo_root)
+        // A nested pyproject is a standalone pytest project.  Running from
+        // its manifest parent makes the repo-relative selectors above valid
+        // across pytest versions while preserving root-level behavior.
+        .current_dir(pytest_root)
         .args(&args)
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
@@ -1779,18 +1990,17 @@ fn run_pytest_tests(
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // Pytest surfaces collection failures as `ERROR <file>` /
-    // `ERROR collecting <file>` on stderr. If we see those AND exit
-    // was non-zero AND no per-test PASS lines were emitted, the test
-    // never collected — the strongest possible "production code is
-    // being exercised" signal (the import chain must have failed).
-    // With `-v`, pytest emits per-test lines, so the "no PASSED
-    // lines" check is the right compile-equivalent signal.
-    if !out.status.success()
-        && (stderr.contains("ERROR collecting") || stderr.contains("ERROR "))
-        && !stdout.contains("PASSED")
-    {
+    // Any non-zero pytest exit is a hard failure, even when one target's
+    // stdout line says PASSED. This catches collection/import errors in a
+    // sibling target and prevents a same-name test in another file from
+    // masking it.
+    if !out.status.success() {
         compile_errored = true;
+        failing.push(format!(
+            "pytest process failed (rc={}): {}",
+            out.status.code().unwrap_or(-1),
+            stderr.lines().next().unwrap_or("unknown pytest error")
+        ));
     }
 
     // Parse pytest's per-test PASS/FAIL summary lines. pytest's
@@ -1798,13 +2008,17 @@ fn run_pytest_tests(
     //   `tests/test_scenario.py::test_classify_high PASSED`
     //   `tests/test_scenario.py::test_classify_high FAILED`
     //   `tests/test_scenario.py::test_classify_high SKIPPED`
-    for name in targeted_tests {
-        let passed = stdout.contains(&format!("::{name} PASSED"));
-        let failed = stdout.contains(&format!("::{name} FAILED"));
-        let skipped = stdout.contains(&format!("::{name} SKIPPED"));
-        let errored = stdout.contains(&format!("::{name} ERROR"));
+    for target in pytest_targets {
+        let rel = relative_repo_path(pytest_root, &target.path).unwrap_or_else(|| {
+            target.path.to_string_lossy().into_owned()
+        });
+        let node = format!("{rel}::{}", target.name);
+        let passed = pytest_output_has_status(&stdout, &node, "PASSED");
+        let failed = pytest_output_has_status(&stdout, &node, "FAILED");
+        let skipped = pytest_output_has_status(&stdout, &node, "SKIPPED");
+        let errored = pytest_output_has_status(&stdout, &node, "ERROR");
         if failed || errored {
-            failing.push(name.clone());
+            failing.push(format!("{node}:FAILED"));
         } else if !passed && !skipped {
             // If neither PASS nor FAIL nor SKIP is recorded, the
             // test was not collected by pytest (e.g. the file
@@ -1813,13 +2027,50 @@ fn run_pytest_tests(
             // signal — issue #387 r5 finding 3 (cargo analogue):
             // NEVER_RAN must NOT be silently counted as a real
             // pass.
-            failing.push(format!("{name}:NEVER_RAN"));
+            failing.push(format!("{node}:NEVER_RAN"));
         }
     }
 
     Ok(CargoOutcome {
         failing,
         compile_errored,
+    })
+}
+
+/// Match a pytest verbose result for one exact selected function.  Pytest
+/// appends parameter IDs (`node[param] STATUS`) for parametrized tests; the
+/// suffix must be accepted without relaxing file/function association (so
+/// `test_x` cannot match `test_xyz`).
+fn pytest_output_has_status(stdout: &str, node: &str, status: &str) -> bool {
+    stdout.lines().any(|line| {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix(node) else {
+            return false;
+        };
+
+        let has_status = |candidate: &str| {
+            let candidate = candidate.trim_start();
+            let Some(tail) = candidate.strip_prefix(status) else {
+                return false;
+            };
+            tail.is_empty()
+                || tail
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_whitespace())
+        };
+
+        if rest.starts_with('[') {
+            // The progress suffix (`[ 33%]`) can contain a later closing
+            // bracket than the parameter ID.  Accept the bracket whose
+            // following token is the requested terminal status instead of
+            // blindly taking the last `]`.
+            return rest
+                .char_indices()
+                .filter(|(_, character)| *character == ']')
+                .any(|(close, _)| has_status(&rest[close + 1..]));
+        }
+        has_status(rest)
     })
 }
 
@@ -1830,7 +2081,7 @@ fn run_pytest_tests(
 fn run_pytest_baseline_check(
     repo_root: &Path,
     base_ref: &str,
-    test_files: &[PathBuf],
+    pytest_targets: &[PytestTarget],
     targeted_tests: &[String],
     manifest: Option<&Path>,
     pytest_loc: PytestLocation,
@@ -1863,17 +2114,91 @@ fn run_pytest_baseline_check(
         )));
     }
 
-    let baseline_manifest = manifest.map(|m| {
-        if m.is_absolute() {
-            m.to_path_buf()
-        } else {
-            tmp.join(m)
+    // `test_files` and `manifest` are resolved against the PR target
+    // worktree. Rebase them into the detached baseline before invoking
+    // pytest; retaining absolute head paths here would silently execute the
+    // PR checkout during the baseline phase and invalidate red/green's
+    // baseline contract.
+    let baseline_targets: Vec<PytestTarget> = pytest_targets
+        .iter()
+        .map(|target| PytestTarget {
+            path: rebase_worktree_path(repo_root, &tmp, &target.path),
+            name: target.name.clone(),
+        })
+        .collect();
+    let mut materialized_test_modules = BTreeSet::new();
+    for (target, baseline_target) in pytest_targets.iter().zip(&baseline_targets) {
+        // Newly added test files do not exist in the detached base. Copy only
+        // that HEAD test source into the baseline so the phase can execute it
+        // against base production/configuration; existing test files remain
+        // the base revision, preserving genuine red/green semantics.
+        if !baseline_target.path.exists() && target.path.is_file() {
+            if let Some(parent) = baseline_target.path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    RedGreenError::BaselineFailed(format!(
+                        "create baseline test parent {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+            std::fs::copy(&target.path, &baseline_target.path).map_err(|e| {
+                RedGreenError::BaselineFailed(format!(
+                    "copy new head test {} into baseline {}: {e}",
+                    target.path.display(),
+                    baseline_target.path.display()
+                ))
+            })?;
+        } else if baseline_target.path.is_file() && target.path.is_file() {
+            // A newly added test function in an existing module is absent from
+            // the detached base file even though the file itself exists.  If
+            // we leave it untouched, pytest reports "not found" and the
+            // baseline phase becomes BaselineFailed -> Green, bypassing gate
+            // 8.  Its fixtures, helpers, decorators, and imports may also be
+            // newly added, so appending just the function is insufficient.
+            // Materialize the complete HEAD test module once; pytest still
+            // invokes only the explicitly targeted new/changed node IDs
+            // against baseline production/configuration.
+            let rel = relative_repo_path(repo_root, &target.path);
+            let base_src = rel.and_then(|path| read_base_blob(repo_root, base_ref, &path));
+            let head_src = std::fs::read_to_string(&target.path).map_err(|e| {
+                RedGreenError::BaselineFailed(format!(
+                    "read head pytest module {}: {e}",
+                    target.path.display()
+                ))
+            })?;
+            let base_names: BTreeSet<String> = base_src
+                .as_deref()
+                .map(discover_python_test_fns)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            if !base_names.contains(&target.name) {
+                extract_python_test_fn(&head_src, &target.name).ok_or_else(|| {
+                    RedGreenError::BaselineFailed(format!(
+                        "cannot materialize added pytest function {} from {}",
+                        target.name,
+                        target.path.display()
+                    ))
+                })?;
+                if materialized_test_modules.insert(baseline_target.path.clone()) {
+                    std::fs::write(&baseline_target.path, head_src).map_err(|e| {
+                        RedGreenError::BaselineFailed(format!(
+                            "materialize head pytest module {} into baseline {}: {e}",
+                            target.path.display(),
+                            baseline_target.path.display()
+                        ))
+                    })?;
+                }
+            }
         }
-    });
+    }
+    let baseline_manifest = manifest
+        .map(|path| rebase_worktree_path(repo_root, &tmp, path))
+        .filter(|path| path.is_file());
 
     let result = run_pytest_tests(
         &tmp,
-        test_files,
+        &baseline_targets,
         targeted_tests,
         baseline_manifest.as_deref(),
         pytest_loc,
@@ -1896,18 +2221,69 @@ fn run_pytest_baseline_check(
     result
 }
 
+/// Extract one top-level pytest function, including immediately preceding
+/// decorators, from a module. This deliberately stays line-oriented like the
+/// discovery scanner above; pytest itself remains the parser of record.
+fn extract_python_test_fn(source: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut fn_index = None;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let Some(declaration) = trimmed
+            .strip_prefix("async def ")
+            .or_else(|| trimmed.strip_prefix("def "))
+        else {
+            continue;
+        };
+        let candidate = declaration
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or_default();
+        if candidate == name && line.len() == trimmed.len() {
+            fn_index = Some(index);
+            break;
+        }
+    }
+    let fn_index = fn_index?;
+    let mut start = fn_index;
+    while start > 0 {
+        let previous = lines[start - 1].trim_start();
+        if previous.starts_with('@') {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let mut end = fn_index + 1;
+    while end < lines.len() {
+        let line = lines[end];
+        let trimmed = line.trim_start();
+        if !trimmed.is_empty() && line.len() == trimmed.len() {
+            break;
+        }
+        end += 1;
+    }
+    Some(lines[start..end].join("\n"))
+}
+
+/// Rebase a path resolved in `repo_root` into a detached worktree. Relative
+/// paths are interpreted from the repository root; absolute paths outside the
+/// repository are preserved because callers may intentionally pass an
+/// external interpreter/configuration path.
+fn rebase_worktree_path(repo_root: &Path, worktree: &Path, path: &Path) -> PathBuf {
+    if let Ok(relative) = path.strip_prefix(repo_root) {
+        worktree.join(relative)
+    } else if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        worktree.join(path)
+    }
+}
+
 // Tiny smoke test — the integration suite under `tests/` is the real proof.
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-
-    // Serializes tests that mutate the process-wide PATH/CARGO_HOME env
-    // vars. Rust runs tests in parallel by default, so without this lock
-    // a sibling test adding `.cargo/bin` to PATH races with a test
-    // trying to assert PATH is empty — the resolution result is then
-    // a coin-flip. The NOTIFY_ENV_LOCK pattern in main.rs uses the same
-    // idea.
-    static PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn discovers_plain_test_fn() {
@@ -2247,6 +2623,527 @@ fn b() {
         assert!(found.ends_with("Cargo.toml"));
     }
 
+    #[test]
+    fn pytest_baseline_rebases_head_paths_into_detached_worktree() {
+        // This fixture intentionally has different head imports/configuration
+        // from base. Only the detached base worktree can collect and pass the
+        // test; using the original absolute head paths must fail.
+        let dir = tempdir_unique("pytest-baseline-rebase");
+        std::fs::create_dir_all(dir.join("src/pkg")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname='baseline-rebase'\n\n[tool.pytest.ini_options]\npythonpath=['src']\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/pkg/__init__.py"), "").unwrap();
+        std::fs::write(dir.join("src/pkg/value.py"), "def value():\n    return 'base'\n").unwrap();
+        std::fs::write(
+            dir.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_value():\n    assert value() == 'base'\n",
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new(args[0])
+                .current_dir(&dir)
+                .args(&args[1..])
+                .output()
+                .expect("spawn fixture command");
+            assert!(
+                out.status.success(),
+                "fixture command {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["git", "init", "-q", "-b", "main"]);
+        run(&["git", "config", "user.email", "pytest@example.com"]);
+        run(&["git", "config", "user.name", "pytest"]);
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        // Head deliberately changes both pytest configuration and the test
+        // import/assertion. It is not expected to pass; the regression calls
+        // only the baseline phase and must use the detached base files.
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname='baseline-rebase-head'\n\n[tool.pytest.ini_options]\npythonpath=['.']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tests/test_value.py"),
+            "from pkg.value import value\n\ndef test_value():\n    assert value() == 'head'\n",
+        )
+        .unwrap();
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "head"]);
+
+        let pytest_targets = vec![PytestTarget {
+            path: dir.join("tests/test_value.py"),
+            name: "test_value".to_owned(),
+        }];
+        let manifest = dir.join("pyproject.toml");
+        let result = run_pytest_baseline_check(
+            &dir,
+            &base,
+            &pytest_targets,
+            &["test_value".to_owned()],
+            Some(&manifest),
+            PytestLocation::OnPath,
+        )
+        .expect("detached baseline pytest should run");
+        assert!(
+            result.all_passed(),
+            "detached base test must pass after path rebasing: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pytest_baseline_materializes_added_fn_in_existing_module() {
+        // The base already contains this test module, while the PR adds a
+        // second function to it.  The added function must be copied into the
+        // detached baseline; otherwise pytest reports "not found" and the
+        // verifier would map BaselineFailed to Green.
+        let dir = tempdir_unique("pytest-baseline-added-fn");
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname='added-fn'\n\n[tool.pytest.ini_options]\npythonpath=['.']\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(dir.join("pkg/value.py"), "def value():\n    return 'base'\n").unwrap();
+        std::fs::write(
+            dir.join("tests/test_value.py"),
+            "import pytest\nfrom pkg.value import value\n\ndef test_existing():\n    assert value() == 'base'\n",
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new(args[0])
+                .current_dir(&dir)
+                .args(&args[1..])
+                .output()
+                .expect("spawn fixture command");
+            assert!(
+                out.status.success(),
+                "fixture command {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["git", "init", "-q", "-b", "main"]);
+        run(&["git", "config", "user.email", "pytest@example.com"]);
+        run(&["git", "config", "user.name", "pytest"]);
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        std::fs::write(dir.join("pkg/value.py"), "def value():\n    return 'head'\n").unwrap();
+        std::fs::write(
+            dir.join("tests/test_value.py"),
+            "import pytest\nfrom pkg.value import value\n\ndef test_existing():\n    assert value() == 'base'\n\n@pytest.fixture\ndef added_fixture():\n    return 4\n\n@pytest.mark.skipif(False, reason='regression')\n@pytest.mark.regression\ndef test_added_vacuous(added_fixture):\n    assert added_fixture == 4\n",
+        )
+        .unwrap();
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "head"]);
+
+        let changed = vec![
+            (dir.join("pkg/value.py"), FileClass::Production),
+            (dir.join("tests/test_value.py"), FileClass::Test),
+        ];
+        let report = check_red_green_with_manifest(
+            &dir,
+            &base,
+            &changed,
+            Some(&dir.join("pyproject.toml")),
+        )
+        .expect("pytest detector should execute");
+        assert_eq!(
+            report.verdict,
+            Verdict::Vacuous,
+            "added function must run on baseline, not become BaselineFailed: {report:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pytest_targets_keep_file_association_and_fail_on_sibling_collection_error() {
+        let dir = tempdir_unique("pytest-target-association");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("pyproject.toml"), "[project]\nname='association'\n").unwrap();
+        std::fs::write(
+            dir.join("tests/test_valid.py"),
+            "def test_same():\n    assert True\n",
+        )
+        .unwrap();
+        // Same test name, but invalid syntax. A name-only Cartesian matcher
+        // would see the valid file's PASSED line and incorrectly accept both.
+        std::fs::write(
+            dir.join("tests/test_invalid.py"),
+            "def test_same(:\n    assert True\n",
+        )
+        .unwrap();
+        let targets = vec![
+            PytestTarget {
+                path: dir.join("tests/test_valid.py"),
+                name: "test_same".to_owned(),
+            },
+            PytestTarget {
+                path: dir.join("tests/test_invalid.py"),
+                name: "test_same".to_owned(),
+            },
+        ];
+        let outcome = run_pytest_tests(
+            &dir,
+            &targets,
+            &["test_same".to_owned()],
+            Some(&dir.join("pyproject.toml")),
+            PytestLocation::OnPath,
+        )
+        .expect("pytest should spawn for association fixture");
+        assert!(
+            !outcome.all_passed(),
+            "sibling collection failure must fail closed: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .failing
+                .iter()
+                .any(|failure| failure.contains("pytest process failed")
+                    || failure.contains("test_invalid.py::test_same")),
+            "failure must identify process/invalid target, not be masked by same-name pass: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_targets_without_executable_tests_fail_closed_as_never_ran() {
+        let empty_outcome = run_cargo_tests(Path::new("."), &[], None, CargoLocation::OnPath)
+            .expect("empty cargo targets should classify without spawning cargo");
+        assert!(!empty_outcome.all_passed());
+        assert_eq!(
+            empty_outcome.failing,
+            vec!["<no-cargo-targets>:NEVER_RAN".to_string()]
+        );
+
+        let mod_targets = vec![CargoTarget {
+            path: PathBuf::from("tests/common/mod.rs"),
+            name: "setup".to_string(),
+        }];
+        let mod_outcome =
+            run_cargo_tests(Path::new("."), &mod_targets, None, CargoLocation::OnPath)
+                .expect("mod.rs should classify without spawning cargo");
+        assert!(!mod_outcome.all_passed());
+        assert_eq!(
+            mod_outcome.failing,
+            vec!["setup:NEVER_RAN".to_string()]
+        );
+    }
+
+    #[test]
+    fn cargo_ignored_test_does_not_prove_an_executed_assertion() {
+        // Use a real, dependency-free Cargo integration-test fixture so the
+        // assertion is pinned at the cargo output boundary. Cargo reports an
+        // #[ignore] test as "ignored" with exit 0, but its body never runs.
+        let dir = tempdir_unique("cargo-ignored");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"cargo-ignored-fixture\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+        std::fs::write(
+            dir.join("tests/scenario.rs"),
+            "#[test]\n#[ignore = \"fixture only\"]\nfn ignored_case() { assert_eq!(2 + 2, 4); }\n",
+        )
+        .unwrap();
+
+        let cargo_loc = resolve_cargo(cargo_home_from_env().as_deref());
+        assert_ne!(
+            cargo_loc,
+            CargoLocation::NotFound,
+            "cargo is required for this fixture"
+        );
+        let outcome = run_cargo_tests(
+            &dir,
+            &[CargoTarget {
+                path: dir.join("tests/scenario.rs"),
+                name: "ignored_case".to_string(),
+            }],
+            Some(&dir.join("Cargo.toml")),
+            cargo_loc,
+        )
+        .expect("cargo fixture should execute");
+
+        assert!(
+            !outcome.all_passed(),
+            "ignored tests must not count as green: {outcome:?}"
+        );
+        assert_eq!(outcome.failing, vec!["ignored_case:NEVER_RAN".to_string()]);
+    }
+
+    #[test]
+    fn cargo_module_qualified_test_name_is_resolved_before_exact_filter() {
+        // CodeRabbit finding 4 (issue #387 r7): `discover_test_fns_with_skip`
+        // only captures the bare fn identifier, so a test declared inside a
+        // `mod nested { ... }` block — which cargo registers internally as
+        // `nested::qualified_case` — was never matched by
+        // `--exact qualified_case`, and the output parser looked for
+        // `test qualified_case ... ok`, which cargo never prints. Both sides
+        // must use the resolved, module-qualified name.
+        let dir = tempdir_unique("cargo-qualified-name");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"cargo-qualified-fixture\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+        std::fs::write(
+            dir.join("tests/scenario.rs"),
+            "mod nested {\n    #[test]\n    fn qualified_case() { assert_eq!(2 + 2, 4); }\n}\n",
+        )
+        .unwrap();
+
+        let cargo_loc = resolve_cargo(cargo_home_from_env().as_deref());
+        assert_ne!(
+            cargo_loc,
+            CargoLocation::NotFound,
+            "cargo is required for this fixture"
+        );
+        let outcome = run_cargo_tests(
+            &dir,
+            &[CargoTarget {
+                path: dir.join("tests/scenario.rs"),
+                name: "qualified_case".to_string(),
+            }],
+            Some(&dir.join("Cargo.toml")),
+            cargo_loc,
+        )
+        .expect("cargo fixture should execute");
+
+        assert!(
+            outcome.all_passed(),
+            "module-qualified test must be resolved and actually executed, not NEVER_RAN: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_baseline_skips_head_only_added_target_instead_of_never_ran() {
+        // CodeRabbit finding 5 (issue #387 r7): `run_baseline_check` detaches
+        // `base_ref` into a temp worktree but (pre-fix) never accounted for
+        // HEAD-only Cargo targets. A test file added by the PR (with no base
+        // counterpart) is missing from the detached worktree, so
+        // `run_cargo_tests` cannot find `--test <basename>` and records
+        // NEVER_RAN, which the caller maps to a spurious BaselineFailed.
+        //
+        // The fix does NOT copy the added file in and force cargo to run it
+        // (unlike the pytest analogue): Rust needs the file to actually
+        // compile, and an added test very often exercises a production
+        // symbol this same PR also introduces, which doesn't exist at base.
+        // Forcing that compile would turn ordinary "add a fn + add its
+        // test" PRs into false BaselineFailed verdicts. There is also
+        // nothing meaningful to check — a test that never existed at base
+        // cannot have been "already broken". So added targets are skipped;
+        // this fixture's single target is entirely new (base has no
+        // `tests/` dir at all), so the whole baseline phase trivially
+        // passes rather than reporting NEVER_RAN.
+        let dir = tempdir_unique("cargo-baseline-new-file");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"cargo-baseline-new-file-fixture\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+
+        let run = |args: &[&str]| {
+            let out = Command::new(args[0])
+                .current_dir(&dir)
+                .args(&args[1..])
+                .output()
+                .expect("spawn fixture command");
+            assert!(
+                out.status.success(),
+                "fixture command {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["git", "init", "-q", "-b", "main"]);
+        run(&["git", "config", "user.email", "cargo-baseline@ci.invalid"]);
+        run(&["git", "config", "user.name", "cargo-baseline"]);
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        // HEAD adds a brand-new integration test file. Base has no
+        // `tests/` directory at all.
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("tests/new_scenario.rs"),
+            "#[test]\nfn new_case() { assert_eq!(2 + 2, 4); }\n",
+        )
+        .unwrap();
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "head"]);
+
+        let cargo_loc = resolve_cargo(cargo_home_from_env().as_deref());
+        assert_ne!(
+            cargo_loc,
+            CargoLocation::NotFound,
+            "cargo is required for this fixture"
+        );
+        let cargo_targets = vec![CargoTarget {
+            path: dir.join("tests/new_scenario.rs"),
+            name: "new_case".to_string(),
+        }];
+        let result = run_baseline_check(
+            &dir,
+            &base,
+            &cargo_targets,
+            Some(&dir.join("Cargo.toml")),
+            cargo_loc,
+        )
+        .expect("detached baseline should skip the head-only target cleanly");
+
+        assert!(
+            result.all_passed(),
+            "HEAD-only new test file must be skipped (trivially baseline-passing), not NEVER_RAN/BaselineFailed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn cargo_baseline_runs_true_base_body_for_modified_test() {
+        // Companion to the skip test above: for a MODIFIED target (the fn
+        // name already existed at base), `run_baseline_check` must actually
+        // exercise base's own test body/production code via the rebased
+        // path — not the live PR worktree's HEAD content. Base asserts
+        // `value() == 1` against base's `value() -> 1` (passes); HEAD
+        // changes `value()` to return 99 (a production regression this
+        // target isn't reverting/checking) and edits the test body just
+        // enough (an added trivial assertion) to count as "modified" while
+        // preserving the original assertion. If baseline leaked HEAD state
+        // (e.g. an unrebased/passthrough manifest pointing at the live
+        // worktree, the bug this fix replaces), it would evaluate
+        // `value() == 1` against HEAD's `value() == 99` and fail.
+        let dir = tempdir_unique("cargo-baseline-modified");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"cargo-baseline-modified-fixture\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+        std::fs::write(
+            dir.join("tests/scenario.rs"),
+            "#[test]\nfn modified_case() { assert_eq!(cargo_baseline_modified_fixture::value(), 1); }\n",
+        )
+        .unwrap();
+
+        let run = |args: &[&str]| {
+            let out = Command::new(args[0])
+                .current_dir(&dir)
+                .args(&args[1..])
+                .output()
+                .expect("spawn fixture command");
+            assert!(
+                out.status.success(),
+                "fixture command {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["git", "init", "-q", "-b", "main"]);
+        run(&["git", "config", "user.email", "cargo-baseline@ci.invalid"]);
+        run(&["git", "config", "user.name", "cargo-baseline"]);
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        // HEAD: production regresses (99, unrelated to this target's own
+        // revert phase), and the test body picks up a trivial byte-level
+        // change (extra `assert!(true)`) so it classifies as "modified"
+        // while its core assertion is untouched.
+        std::fs::write(dir.join("src/lib.rs"), "pub fn value() -> u8 { 99 }\n").unwrap();
+        std::fs::write(
+            dir.join("tests/scenario.rs"),
+            "#[test]\nfn modified_case() { assert!(true); assert_eq!(cargo_baseline_modified_fixture::value(), 1); }\n",
+        )
+        .unwrap();
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-q", "-m", "head"]);
+
+        let cargo_loc = resolve_cargo(cargo_home_from_env().as_deref());
+        assert_ne!(
+            cargo_loc,
+            CargoLocation::NotFound,
+            "cargo is required for this fixture"
+        );
+        let cargo_targets = vec![CargoTarget {
+            path: dir.join("tests/scenario.rs"),
+            name: "modified_case".to_string(),
+        }];
+        let result = run_baseline_check(
+            &dir,
+            &base,
+            &cargo_targets,
+            Some(&dir.join("Cargo.toml")),
+            cargo_loc,
+        )
+        .expect("detached baseline should run the modified target against true base state");
+
+        assert!(
+            result.all_passed(),
+            "baseline must evaluate the target against base's own body/production code, not HEAD's: {result:?}"
+        );
+    }
+
     /// Create a unique temp directory under `std::env::temp_dir()`. The
     /// directory is NOT auto-cleaned (Rust tests don't share a global
     /// fixture lifetime), but the name encodes the test pid + nanos so
@@ -2287,7 +3184,7 @@ fn b() {
     // Test helper: returns the host PATH stripped of any directory that
     // contains a `cargo` binary. This isolates the resolver from the
     // host's cargo (which would otherwise mask the "missing toolchain"
-    // signal). The PATH_ENV_LOCK guard ensures no sibling test adds a
+    // signal). The crate-wide test environment lock ensures no sibling test adds a
     // cargo directory between the snapshot and the assertion.
     fn path_without_cargo() -> std::ffi::OsString {
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -2299,7 +3196,7 @@ fn b() {
 
     #[test]
     fn resolve_cargo_returns_not_found_when_path_and_cargo_home_both_empty() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // cargo_home pointing at an empty dir + a PATH that has no
         // cargo binary anywhere. Resolver must surface NotFound without
         // requiring PATH mutation (the test pins the resolver, not the
@@ -2323,7 +3220,7 @@ fn b() {
 
     #[test]
     fn resolve_cargo_finds_cargo_in_cargo_home_bin_when_path_is_empty() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // Reproduce the systemd-unit failure mode: PATH without cargo,
         // but `~/.cargo/bin/cargo` exists. The resolver must find it.
         let fake_home = tempdir_unique("cargo-fallback");
@@ -2353,7 +3250,7 @@ fn b() {
 
     #[test]
     fn resolve_cargo_prefers_path_over_cargo_home() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // When cargo is on PATH AND the cargo_home has a shim, the
         // resolver must prefer PATH (no network/disk dependency for the
         // common case). We strip the cargo from PATH first, then add a
@@ -2392,7 +3289,7 @@ fn b() {
 
     #[test]
     fn resolve_cargo_surfaces_not_found_when_path_is_empty() {
-        let _guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         // Reproduce the systemd-unit failure mode: PATH-stripped (no
         // cargo directories), cargo_home doesn't exist. The resolver
         // must surface NotFound (or Found via rustup which cargo, when
@@ -2640,6 +3537,33 @@ def test_b():
     }
 
     #[test]
+    fn compute_targeted_python_test_fns_does_not_attach_new_decorators_to_predecessor() {
+        let base = "def test_existing():\n    assert True\n";
+        let head = "def test_existing():\n    assert True\n\n@pytest.mark.parametrize('value', [1])\n@pytest.mark.skipif(False, reason='regression')\nasync def test_added(value):\n    assert value == 1\n";
+        let (targeted, _) = compute_targeted_python_test_fns(Some(base), head);
+        assert_eq!(
+            targeted,
+            vec!["test_added".to_string()],
+            "decorators on a new async test must not retarget its unchanged predecessor"
+        );
+    }
+
+    #[test]
+    fn pytest_output_status_accepts_params_and_all_terminal_states_without_prefix_collisions() {
+        let stdout = "tests/test_mod.py::test_x[case] PASSED\n"
+            .to_owned()
+            + "tests/test_mod.py::test_failed[param] FAILED\n"
+            + "tests/test_mod.py::test_skipped SKIPPED\n"
+            + "tests/test_mod.py::test_error[repr] ERROR\n"
+            + "tests/test_mod.py::test_xyz PASSED\n";
+        assert!(pytest_output_has_status(&stdout, "tests/test_mod.py::test_x", "PASSED"));
+        assert!(pytest_output_has_status(&stdout, "tests/test_mod.py::test_failed", "FAILED"));
+        assert!(pytest_output_has_status(&stdout, "tests/test_mod.py::test_skipped", "SKIPPED"));
+        assert!(pytest_output_has_status(&stdout, "tests/test_mod.py::test_error", "ERROR"));
+        assert!(!pytest_output_has_status(&stdout, "tests/test_mod.py::test", "PASSED"));
+    }
+
+    #[test]
     fn backend_detect_picks_cargo_when_both_manifests_present() {
         let dir = tempdir_unique("backend-both");
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
@@ -2705,6 +3629,24 @@ def test_b():
         }
         let loc = resolve_pytest(None);
         assert_eq!(loc, PytestLocation::OnPath);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pytest_location_rejects_non_executable_path_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir_unique("pytest-non-executable");
+        let candidate = dir.join("pytest");
+        std::fs::write(&candidate, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut mode = std::fs::metadata(&candidate).unwrap().permissions();
+        mode.set_mode(0o644);
+        std::fs::set_permissions(&candidate, mode).unwrap();
+        assert!(!is_executable_file(&candidate));
+        let mut executable_mode = std::fs::metadata(&candidate).unwrap().permissions();
+        executable_mode.set_mode(0o755);
+        std::fs::set_permissions(&candidate, executable_mode).unwrap();
+        assert!(is_executable_file(&candidate));
     }
 }
 
