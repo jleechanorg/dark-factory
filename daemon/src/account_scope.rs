@@ -19,6 +19,8 @@ pub const SCRUBBED_AUTH_VARS: &[&str] = &[
     "CODEX_HOME",
     "MINIMAX_API_KEY",
     "GEMINI_API_KEY",
+    "CURSOR_API_KEY",
+    "CURSOR_CONFIG_DIR",
 ];
 
 /// Scrub all inherited AI provider authentication, configuration, and token variables
@@ -36,6 +38,8 @@ pub enum AiProvider {
     MiniMax,
     Codex,
     Antigravity,
+    Cursor,
+    Gemini,
 }
 
 /// Validate that `DARK_FACTORY_CLAUDE_CONFIG_DIR` is set to a non-blank,
@@ -311,6 +315,171 @@ pub fn apply_agy_scope(command: &mut Command) -> Result<(), DaemonError> {
     Ok(())
 }
 
+/// Validate Cursor scoping configuration:
+/// Requires at least one of:
+/// - `CURSOR_API_KEY` set to a non-blank string
+/// - `DARK_FACTORY_CURSOR_CONFIG_DIR` set to an existing directory
+/// - `DARK_FACTORY_CURSOR_HOME` set to an existing directory
+/// Returns validated `(Option<String>, Option<PathBuf>, Option<PathBuf>)`.
+/// Fails closed if none is set, or if specified directories do not exist.
+pub fn validate_cursor_scope() -> Result<(Option<String>, Option<PathBuf>, Option<PathBuf>), DaemonError> {
+    let mut key_opt = None;
+    if let Ok(key) = std::env::var("CURSOR_API_KEY") {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            key_opt = Some(trimmed.to_string());
+        }
+    }
+
+    let mut config_dir_opt = None;
+    if let Ok(raw) = std::env::var("DARK_FACTORY_CURSOR_CONFIG_DIR") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let path = PathBuf::from(trimmed);
+            if !path.exists() {
+                return Err(DaemonError::Config(format!(
+                    "DARK_FACTORY_CURSOR_CONFIG_DIR directory does not exist: {}",
+                    path.display()
+                )));
+            }
+            let canonical = path.canonicalize().map_err(|e| {
+                DaemonError::Config(format!(
+                    "failed to canonicalize DARK_FACTORY_CURSOR_CONFIG_DIR {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if !canonical.is_dir() {
+                return Err(DaemonError::Config(format!(
+                    "DARK_FACTORY_CURSOR_CONFIG_DIR path is not a directory: {}",
+                    canonical.display()
+                )));
+            }
+            config_dir_opt = Some(canonical);
+        }
+    }
+
+    let mut home_opt = None;
+    if let Ok(raw) = std::env::var("DARK_FACTORY_CURSOR_HOME") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let path = PathBuf::from(trimmed);
+            if !path.exists() {
+                return Err(DaemonError::Config(format!(
+                    "DARK_FACTORY_CURSOR_HOME directory does not exist: {}",
+                    path.display()
+                )));
+            }
+            let canonical = path.canonicalize().map_err(|e| {
+                DaemonError::Config(format!(
+                    "failed to canonicalize DARK_FACTORY_CURSOR_HOME {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if !canonical.is_dir() {
+                return Err(DaemonError::Config(format!(
+                    "DARK_FACTORY_CURSOR_HOME path is not a directory: {}",
+                    canonical.display()
+                )));
+            }
+            home_opt = Some(canonical);
+        }
+    }
+
+    if key_opt.is_none() && config_dir_opt.is_none() && home_opt.is_none() {
+        return Err(DaemonError::Config(
+            "direct Cursor launch requires explicit DARK_FACTORY_CURSOR_CONFIG_DIR, DARK_FACTORY_CURSOR_HOME, or CURSOR_API_KEY".to_string(),
+        ));
+    }
+
+    Ok((key_opt, config_dir_opt, home_opt))
+}
+
+/// Apply direct Cursor scoping to a Command:
+/// 1. Validates `CURSOR_API_KEY`, `DARK_FACTORY_CURSOR_CONFIG_DIR`, and/or `DARK_FACTORY_CURSOR_HOME`.
+/// 2. Scrubs inherited AI provider authentication.
+/// 3. Applies validated `CURSOR_API_KEY`, `CURSOR_CONFIG_DIR`, and/or `HOME`.
+pub fn apply_cursor_scope(command: &mut Command) -> Result<(), DaemonError> {
+    let (key_opt, config_dir_opt, home_opt) = validate_cursor_scope()?;
+    scrub_all_ai_provider_auth(command);
+    if let Some(key) = key_opt {
+        command.env("CURSOR_API_KEY", key);
+    }
+    if let Some(dir) = config_dir_opt {
+        command.env("CURSOR_CONFIG_DIR", dir);
+    }
+    if let Some(home) = home_opt {
+        command.env("HOME", home);
+    }
+    Ok(())
+}
+
+/// Validate Gemini scoping configuration:
+/// Requires at least one of:
+/// - `GEMINI_API_KEY` set to a non-blank string
+/// - `DARK_FACTORY_GEMINI_HOME` set to an existing directory
+/// Returns validated `(Option<String>, Option<PathBuf>)`.
+/// Fails closed if neither is set, or if specified directory does not exist.
+pub fn validate_gemini_scope() -> Result<(Option<String>, Option<PathBuf>), DaemonError> {
+    let mut key_opt = None;
+    if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            key_opt = Some(trimmed.to_string());
+        }
+    }
+
+    let mut home_opt = None;
+    if let Ok(raw) = std::env::var("DARK_FACTORY_GEMINI_HOME") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let path = PathBuf::from(trimmed);
+            if !path.exists() {
+                return Err(DaemonError::Config(format!(
+                    "DARK_FACTORY_GEMINI_HOME directory does not exist: {}",
+                    path.display()
+                )));
+            }
+            let canonical = path.canonicalize().map_err(|e| {
+                DaemonError::Config(format!(
+                    "failed to canonicalize DARK_FACTORY_GEMINI_HOME {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if !canonical.is_dir() {
+                return Err(DaemonError::Config(format!(
+                    "DARK_FACTORY_GEMINI_HOME path is not a directory: {}",
+                    canonical.display()
+                )));
+            }
+            home_opt = Some(canonical);
+        }
+    }
+
+    if key_opt.is_none() && home_opt.is_none() {
+        return Err(DaemonError::Config(
+            "direct Gemini launch requires explicit DARK_FACTORY_GEMINI_HOME or GEMINI_API_KEY".to_string(),
+        ));
+    }
+
+    Ok((key_opt, home_opt))
+}
+
+/// Apply direct Gemini scoping to a Command:
+/// 1. Validates `GEMINI_API_KEY` and/or `DARK_FACTORY_GEMINI_HOME`.
+/// 2. Scrubs inherited AI provider authentication.
+/// 3. Applies validated `GEMINI_API_KEY` and/or `HOME`.
+pub fn apply_gemini_scope(command: &mut Command) -> Result<(), DaemonError> {
+    let (key_opt, home_opt) = validate_gemini_scope()?;
+    scrub_all_ai_provider_auth(command);
+    if let Some(key) = key_opt {
+        command.env("GEMINI_API_KEY", key);
+    }
+    if let Some(home) = home_opt {
+        command.env("HOME", home);
+    }
+    Ok(())
+}
+
 /// Apply scoping for the given `AiProvider`.
 pub fn apply_provider_scope(provider: AiProvider, command: &mut Command) -> Result<(), DaemonError> {
     match provider {
@@ -318,6 +487,8 @@ pub fn apply_provider_scope(provider: AiProvider, command: &mut Command) -> Resu
         AiProvider::MiniMax => apply_minimax_scope(command),
         AiProvider::Codex => apply_codex_scope(command),
         AiProvider::Antigravity => apply_agy_scope(command),
+        AiProvider::Cursor => apply_cursor_scope(command),
+        AiProvider::Gemini => apply_gemini_scope(command),
     }
 }
 
@@ -352,8 +523,10 @@ pub fn is_minimax_api_url(url_str: &str) -> bool {
 /// Detect whether `cmd` is an intended direct AI CLI program by inspecting its binary basename.
 /// Direct CLI programs:
 /// - `codex` -> `AiProvider::Codex`
-/// - `agy`, `antigravity`, `gemini` -> `AiProvider::Antigravity`
-/// - `claude`, `claude-sonnet`, `cursor-agent`, `agentf`, `cursor` -> `AiProvider::MiniMax` if explicitly indicated by `extra_env`,
+/// - `agy`, `antigravity` -> `AiProvider::Antigravity`
+/// - `gemini` -> `AiProvider::Gemini`
+/// - `cursor-agent`, `agentf`, `cursor` -> `AiProvider::Cursor`
+/// - `claude`, `claude-sonnet` -> `AiProvider::MiniMax` if explicitly indicated by `extra_env`,
 ///   otherwise `AiProvider::Claude`.
 ///   Normal non-AI commands (e.g. `git`, `br`, `gh`, `sh`, `cargo`) return `None`.
 pub fn detect_direct_cli_provider(cmd: &str, extra_env: &[(&str, &str)]) -> Option<AiProvider> {
@@ -364,14 +537,13 @@ pub fn detect_direct_cli_provider(cmd: &str, extra_env: &[(&str, &str)]) -> Opti
 
     if bin == "codex" {
         Some(AiProvider::Codex)
-    } else if bin == "agy" || bin == "antigravity" || bin == "gemini" {
+    } else if bin == "agy" || bin == "antigravity" {
         Some(AiProvider::Antigravity)
-    } else if bin == "claude"
-        || bin == "claude-sonnet"
-        || bin == "cursor-agent"
-        || bin == "agentf"
-        || bin == "cursor"
-    {
+    } else if bin == "gemini" {
+        Some(AiProvider::Gemini)
+    } else if bin == "cursor-agent" || bin == "agentf" || bin == "cursor" {
+        Some(AiProvider::Cursor)
+    } else if bin == "claude" || bin == "claude-sonnet" {
         // If extra_env explicitly indicates MiniMax, route through MiniMax scope
         if extra_env.iter().any(|(k, v)| {
             (*k == "CLAUDEM_MODE" && *v == "1")
@@ -395,14 +567,7 @@ pub fn apply_direct_cli_scope(
     extra_env: &[(&str, &str)],
     command: &mut Command,
 ) -> Result<(), DaemonError> {
-    let bin = Path::new(cmd)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(cmd);
-    if bin == "agy" || bin == "antigravity" || bin == "gemini" {
-        // Reuse the AO account boundary for direct AGY/Gemini children.
-        apply_agy_scope(command)
-    } else if let Some(provider) = detect_direct_cli_provider(cmd, extra_env) {
+    if let Some(provider) = detect_direct_cli_provider(cmd, extra_env) {
         apply_provider_scope(provider, command)
     } else {
         Ok(())
@@ -414,11 +579,11 @@ pub fn apply_direct_cli_scope(
 /// and applies the scoped environment while scrubbing conflicting provider auth.
 ///
 /// Supported agents:
-/// - `claude` / `claude-code` / `claude-sonnet` / `cursor-agent` / `agentf` / `cursor`: applies direct Claude scoping
+/// - `claude` / `claude-code` / `claude-sonnet`: applies direct Claude scoping
 /// - `codex`: applies direct Codex scoping
 /// - `minimax` / `claudem`: applies direct MiniMax scoping
-/// - `antigravity` / `agy` / `gemini`: requires `DARK_FACTORY_AGY_HOME`, validates optional Codex/Claude scope, and scrubs auth
-/// - any other agent: scrubs all auth and returns `Err(DaemonError::Config(...))` so unknown agents fail closed.
+/// - `antigravity` / `agy`: requires `DARK_FACTORY_AGY_HOME`, validates optional Codex/Claude scope, and scrubs auth
+/// - any other agent (including `cursor-agent`, `agentf`, `cursor`, `gemini`): scrubs all auth and returns `Err(DaemonError::Config(...))` so unknown agents fail closed.
 pub fn validate_ao_worker_agent_scope(
     agent: &str,
     command: &mut Command,
@@ -427,16 +592,13 @@ pub fn validate_ao_worker_agent_scope(
     if normalized == "claude"
         || normalized == "claude-code"
         || normalized == "claude-sonnet"
-        || normalized == "cursor-agent"
-        || normalized == "agentf"
-        || normalized == "cursor"
     {
         apply_claude_scope(command)
     } else if normalized == "codex" {
         apply_codex_scope(command)
     } else if normalized == "minimax" || normalized == "claudem" {
         apply_minimax_scope(command)
-    } else if normalized == "antigravity" || normalized == "agy" || normalized == "gemini" {
+    } else if normalized == "antigravity" || normalized == "agy" {
         apply_agy_scope(command)
     } else {
         scrub_all_ai_provider_auth(command);
@@ -646,16 +808,16 @@ mod tests {
         assert_eq!(detect_direct_cli_provider("agy", &[]), Some(AiProvider::Antigravity));
         assert_eq!(detect_direct_cli_provider("/opt/bin/agy", &[]), Some(AiProvider::Antigravity));
         assert_eq!(detect_direct_cli_provider("antigravity", &[]), Some(AiProvider::Antigravity));
-        assert_eq!(detect_direct_cli_provider("gemini", &[]), Some(AiProvider::Antigravity));
-        assert_eq!(detect_direct_cli_provider("/opt/bin/gemini", &[]), Some(AiProvider::Antigravity));
+        assert_eq!(detect_direct_cli_provider("gemini", &[]), Some(AiProvider::Gemini));
+        assert_eq!(detect_direct_cli_provider("/opt/bin/gemini", &[]), Some(AiProvider::Gemini));
 
         assert_eq!(detect_direct_cli_provider("claude", &[]), Some(AiProvider::Claude));
         assert_eq!(detect_direct_cli_provider("/home/user/.nvm/versions/node/v22.22.0/bin/claude", &[]), Some(AiProvider::Claude));
         assert_eq!(detect_direct_cli_provider("claude-sonnet", &[]), Some(AiProvider::Claude));
-        assert_eq!(detect_direct_cli_provider("cursor-agent", &[]), Some(AiProvider::Claude));
-        assert_eq!(detect_direct_cli_provider("/usr/local/bin/cursor-agent", &[]), Some(AiProvider::Claude));
-        assert_eq!(detect_direct_cli_provider("agentf", &[]), Some(AiProvider::Claude));
-        assert_eq!(detect_direct_cli_provider("cursor", &[]), Some(AiProvider::Claude));
+        assert_eq!(detect_direct_cli_provider("cursor-agent", &[]), Some(AiProvider::Cursor));
+        assert_eq!(detect_direct_cli_provider("/usr/local/bin/cursor-agent", &[]), Some(AiProvider::Cursor));
+        assert_eq!(detect_direct_cli_provider("agentf", &[]), Some(AiProvider::Cursor));
+        assert_eq!(detect_direct_cli_provider("cursor", &[]), Some(AiProvider::Cursor));
 
         // MiniMax via extra_env
         assert_eq!(
@@ -817,15 +979,12 @@ mod tests {
 
         let mut cmd = Command::new("dummy");
 
-        // 1. claude / cursor without config dir fails closed
+        // 1. claude without config dir fails closed
         assert!(validate_ao_worker_agent_scope("claude", &mut cmd).is_err());
         assert!(validate_ao_worker_agent_scope("claude-code", &mut cmd).is_err());
         assert!(validate_ao_worker_agent_scope("claude-sonnet", &mut cmd).is_err());
-        assert!(validate_ao_worker_agent_scope("cursor-agent", &mut cmd).is_err());
-        assert!(validate_ao_worker_agent_scope("agentf", &mut cmd).is_err());
-        assert!(validate_ao_worker_agent_scope("cursor", &mut cmd).is_err());
 
-        // claude / cursor with valid config dir succeeds
+        // claude with valid config dir succeeds
         let temp = TempDir::new("ao_worker_claude");
         std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", &temp.path);
         let mut cmd = Command::new("dummy");
@@ -834,13 +993,6 @@ mod tests {
         let envs: Vec<_> = cmd.get_envs().collect();
         assert!(envs.iter().any(|(k, v)| k.to_str() == Some("CLAUDE_CONFIG_DIR") && v.is_some()));
         assert!(envs.iter().any(|(k, v)| k.to_str() == Some("OPENAI_API_KEY") && v.is_none()));
-
-        let mut cmd = Command::new("dummy");
-        assert!(validate_ao_worker_agent_scope("cursor-agent", &mut cmd).is_ok());
-        let mut cmd = Command::new("dummy");
-        assert!(validate_ao_worker_agent_scope("agentf", &mut cmd).is_ok());
-        let mut cmd = Command::new("dummy");
-        assert!(validate_ao_worker_agent_scope("cursor", &mut cmd).is_ok());
 
         // 2. codex without config dir fails closed
         let mut cmd = Command::new("dummy");
@@ -869,15 +1021,13 @@ mod tests {
         assert!(envs.iter().any(|(k, v)| k.to_str() == Some("ANTHROPIC_MODEL") && v.map(|x| x.to_str().unwrap()) == Some("MiniMax-M3")));
         assert!(envs.iter().any(|(k, v)| k.to_str() == Some("ANTHROPIC_BASE_URL") && v.map(|x| x.to_str().unwrap()) == Some("https://api.minimax.io/anthropic")));
 
-        // 4. antigravity / agy / gemini without DARK_FACTORY_AGY_HOME fails closed
+        // 4. antigravity / agy without DARK_FACTORY_AGY_HOME fails closed
         let mut cmd = Command::new("dummy");
         assert!(validate_ao_worker_agent_scope("antigravity", &mut cmd).is_err());
         let mut cmd = Command::new("dummy");
         assert!(validate_ao_worker_agent_scope("agy", &mut cmd).is_err());
-        let mut cmd = Command::new("dummy");
-        assert!(validate_ao_worker_agent_scope("gemini", &mut cmd).is_err());
 
-        // antigravity / agy / gemini with valid DARK_FACTORY_AGY_HOME succeeds and pins HOME
+        // antigravity / agy with valid DARK_FACTORY_AGY_HOME succeeds and pins HOME
         let temp_agy = TempDir::new("ao_worker_agy");
         std::env::set_var("DARK_FACTORY_AGY_HOME", &temp_agy.path);
         let mut cmd = Command::new("dummy");
@@ -889,17 +1039,130 @@ mod tests {
 
         let mut cmd = Command::new("dummy");
         assert!(validate_ao_worker_agent_scope("agy", &mut cmd).is_ok());
-        let mut cmd = Command::new("dummy");
-        assert!(validate_ao_worker_agent_scope("gemini", &mut cmd).is_ok());
 
-        // 5. Unknown agent fails closed and scrubs auth
+        // 5. Non-AO-worker agents (cursor, gemini, arbitrary) fail closed and scrub auth
+        for non_worker in ["cursor-agent", "agentf", "cursor", "gemini", "unknown-llm-agent"] {
+            let mut cmd = Command::new("dummy");
+            cmd.env("OPENAI_API_KEY", "dirty_key");
+            let err = validate_ao_worker_agent_scope(non_worker, &mut cmd);
+            assert!(err.is_err(), "Expected {non_worker} to fail closed as AO worker");
+            assert!(
+                format!("{}", err.unwrap_err()).contains("Unsupported AO worker agent"),
+                "Expected unsupported agent error for {non_worker}"
+            );
+            let envs: Vec<_> = cmd.get_envs().collect();
+            assert!(envs.iter().any(|(k, v)| k.to_str() == Some("OPENAI_API_KEY") && v.is_none()));
+        }
+    }
+
+    #[test]
+    fn test_cursor_scope_validation() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::new(&[
+            "CURSOR_API_KEY",
+            "DARK_FACTORY_CURSOR_CONFIG_DIR",
+            "DARK_FACTORY_CURSOR_HOME",
+        ]);
+
+        std::env::remove_var("CURSOR_API_KEY");
+        std::env::remove_var("DARK_FACTORY_CURSOR_CONFIG_DIR");
+        std::env::remove_var("DARK_FACTORY_CURSOR_HOME");
+
+        // Missing all fails closed
+        assert!(validate_cursor_scope().is_err());
+        let mut cmd = Command::new("dummy");
+        assert!(apply_cursor_scope(&mut cmd).is_err());
+
+        // Blank fails closed
+        std::env::set_var("CURSOR_API_KEY", "   ");
+        std::env::set_var("DARK_FACTORY_CURSOR_CONFIG_DIR", "   ");
+        std::env::set_var("DARK_FACTORY_CURSOR_HOME", "   ");
+        assert!(validate_cursor_scope().is_err());
+        let mut cmd = Command::new("dummy");
+        assert!(apply_cursor_scope(&mut cmd).is_err());
+
+        // Non-existent directory fails closed
+        std::env::remove_var("CURSOR_API_KEY");
+        std::env::set_var("DARK_FACTORY_CURSOR_CONFIG_DIR", "/nonexistent/cursor/dir/99999");
+        assert!(validate_cursor_scope().is_err());
+
+        // Valid CURSOR_API_KEY succeeds
+        std::env::remove_var("DARK_FACTORY_CURSOR_CONFIG_DIR");
+        std::env::remove_var("DARK_FACTORY_CURSOR_HOME");
+        std::env::set_var("CURSOR_API_KEY", "test-synthetic-cursor-key");
+        assert!(validate_cursor_scope().is_ok());
         let mut cmd = Command::new("dummy");
         cmd.env("OPENAI_API_KEY", "dirty_key");
-        let err = validate_ao_worker_agent_scope("unknown-llm-agent", &mut cmd);
-        assert!(err.is_err());
-        assert!(format!("{}", err.unwrap_err()).contains("Unsupported AO worker agent"));
+        assert!(apply_cursor_scope(&mut cmd).is_ok());
         let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.iter().any(|(k, v)| k.to_str() == Some("CURSOR_API_KEY") && v.map(|x| x.to_str().unwrap()) == Some("test-synthetic-cursor-key")));
         assert!(envs.iter().any(|(k, v)| k.to_str() == Some("OPENAI_API_KEY") && v.is_none()));
+
+        // Valid DARK_FACTORY_CURSOR_CONFIG_DIR succeeds
+        let temp = TempDir::new("cursor_config_dir");
+        std::env::remove_var("CURSOR_API_KEY");
+        std::env::set_var("DARK_FACTORY_CURSOR_CONFIG_DIR", &temp.path);
+        let mut cmd = Command::new("dummy");
+        assert!(apply_cursor_scope(&mut cmd).is_ok());
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.iter().any(|(k, v)| k.to_str() == Some("CURSOR_CONFIG_DIR") && v.is_some()));
+
+        // Valid DARK_FACTORY_CURSOR_HOME succeeds
+        std::env::remove_var("DARK_FACTORY_CURSOR_CONFIG_DIR");
+        std::env::set_var("DARK_FACTORY_CURSOR_HOME", &temp.path);
+        let mut cmd = Command::new("dummy");
+        assert!(apply_cursor_scope(&mut cmd).is_ok());
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.iter().any(|(k, v)| k.to_str() == Some("HOME") && v.is_some()));
+    }
+
+    #[test]
+    fn test_gemini_scope_validation() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::new(&[
+            "GEMINI_API_KEY",
+            "DARK_FACTORY_GEMINI_HOME",
+        ]);
+
+        std::env::remove_var("GEMINI_API_KEY");
+        std::env::remove_var("DARK_FACTORY_GEMINI_HOME");
+
+        // Missing fails closed
+        assert!(validate_gemini_scope().is_err());
+        let mut cmd = Command::new("dummy");
+        assert!(apply_gemini_scope(&mut cmd).is_err());
+
+        // Blank fails closed
+        std::env::set_var("GEMINI_API_KEY", "   ");
+        std::env::set_var("DARK_FACTORY_GEMINI_HOME", "   ");
+        assert!(validate_gemini_scope().is_err());
+        let mut cmd = Command::new("dummy");
+        assert!(apply_gemini_scope(&mut cmd).is_err());
+
+        // Non-existent directory fails closed
+        std::env::remove_var("GEMINI_API_KEY");
+        std::env::set_var("DARK_FACTORY_GEMINI_HOME", "/nonexistent/gemini/dir/99999");
+        assert!(validate_gemini_scope().is_err());
+
+        // Valid GEMINI_API_KEY succeeds
+        std::env::remove_var("DARK_FACTORY_GEMINI_HOME");
+        std::env::set_var("GEMINI_API_KEY", "test-synthetic-gemini-key");
+        assert!(validate_gemini_scope().is_ok());
+        let mut cmd = Command::new("dummy");
+        cmd.env("ANTHROPIC_API_KEY", "dirty_key");
+        assert!(apply_gemini_scope(&mut cmd).is_ok());
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.iter().any(|(k, v)| k.to_str() == Some("GEMINI_API_KEY") && v.map(|x| x.to_str().unwrap()) == Some("test-synthetic-gemini-key")));
+        assert!(envs.iter().any(|(k, v)| k.to_str() == Some("ANTHROPIC_API_KEY") && v.is_none()));
+
+        // Valid DARK_FACTORY_GEMINI_HOME succeeds
+        let temp = TempDir::new("gemini_home_dir");
+        std::env::remove_var("GEMINI_API_KEY");
+        std::env::set_var("DARK_FACTORY_GEMINI_HOME", &temp.path);
+        let mut cmd = Command::new("dummy");
+        assert!(apply_gemini_scope(&mut cmd).is_ok());
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.iter().any(|(k, v)| k.to_str() == Some("HOME") && v.is_some()));
     }
 
     #[test]
@@ -931,7 +1194,7 @@ mod tests {
     fn child_scope_env(command: &mut Command) -> String {
         let output = command
             .arg("-c")
-            .arg("printf '%s\\n' \"ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY-}\" \"ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN-}\" \"ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL-}\" \"ANTHROPIC_MODEL=${ANTHROPIC_MODEL-}\" \"CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR-}\" \"CODEX_HOME=${CODEX_HOME-}\" \"GEMINI_API_KEY=${GEMINI_API_KEY-}\" \"HOME=${HOME-}\" \"MINIMAX_API_KEY=${MINIMAX_API_KEY-}\"")
+            .arg("printf '%s\\n' \"ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY-}\" \"ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN-}\" \"ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL-}\" \"ANTHROPIC_MODEL=${ANTHROPIC_MODEL-}\" \"CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR-}\" \"CODEX_HOME=${CODEX_HOME-}\" \"GEMINI_API_KEY=${GEMINI_API_KEY-}\" \"CURSOR_API_KEY=${CURSOR_API_KEY-}\" \"CURSOR_CONFIG_DIR=${CURSOR_CONFIG_DIR-}\" \"HOME=${HOME-}\" \"MINIMAX_API_KEY=${MINIMAX_API_KEY-}\" \"OPENAI_API_KEY=${OPENAI_API_KEY-}\"")
             .output()
             .expect("synthetic scope child must spawn");
         assert!(output.status.success(), "synthetic scope child failed: {output:?}");
@@ -955,6 +1218,10 @@ mod tests {
         let prior_minimax = std::env::var_os("MINIMAX_API_KEY");
         let prior_gemini = std::env::var_os("GEMINI_API_KEY");
         let prior_agy = std::env::var_os("DARK_FACTORY_AGY_HOME");
+        let prior_cursor_key = std::env::var_os("CURSOR_API_KEY");
+        let prior_cursor_dir = std::env::var_os("DARK_FACTORY_CURSOR_CONFIG_DIR");
+        let prior_cursor_home = std::env::var_os("DARK_FACTORY_CURSOR_HOME");
+        let prior_gemini_home = std::env::var_os("DARK_FACTORY_GEMINI_HOME");
         std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_dir);
         std::env::set_var("CODEX_HOME", &codex_dir);
         std::env::set_var("MINIMAX_API_KEY", "SYNTHETIC_MINIMAX_SENTINEL");
@@ -1030,6 +1297,39 @@ mod tests {
         let mut agy_api_fail = Command::new("sh");
         assert!(apply_direct_cli_scope("/opt/antigravity/bin/agy", &[], &mut agy_api_fail).is_err());
 
+        // Cursor direct CLI test: retains CURSOR_API_KEY and CURSOR_CONFIG_DIR, scrubs others
+        let cursor_dir = temp.path.join("cursor_child");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        std::env::set_var("CURSOR_API_KEY", "SYNTHETIC_CURSOR_CHILD_KEY");
+        std::env::set_var("DARK_FACTORY_CURSOR_CONFIG_DIR", &cursor_dir);
+        let mut cursor_cmd = Command::new("sh");
+        for var in SCRUBBED_AUTH_VARS {
+            cursor_cmd.env(var, "SYNTHETIC_AUTH_SENTINEL");
+        }
+        apply_direct_cli_scope("/usr/local/bin/cursor-agent", &[], &mut cursor_cmd).unwrap();
+        let cursor_env = child_scope_env(&mut cursor_cmd);
+        assert!(cursor_env.contains("CURSOR_API_KEY=SYNTHETIC_CURSOR_CHILD_KEY\n"), "Cursor child did not receive CURSOR_API_KEY: {cursor_env}");
+        assert!(cursor_env.contains(&format!("CURSOR_CONFIG_DIR={}\n", cursor_dir.canonicalize().unwrap().display())), "Cursor child did not receive CURSOR_CONFIG_DIR: {cursor_env}");
+        assert!(cursor_env.contains("OPENAI_API_KEY=\n"));
+        assert!(cursor_env.contains("MINIMAX_API_KEY=\n"));
+        assert!(cursor_env.contains("GEMINI_API_KEY=\n"));
+
+        // Gemini direct CLI test: retains GEMINI_API_KEY and sets HOME to DARK_FACTORY_GEMINI_HOME
+        let gemini_dir = temp.path.join("gemini_child");
+        std::fs::create_dir_all(&gemini_dir).unwrap();
+        std::env::set_var("GEMINI_API_KEY", "SYNTHETIC_GEMINI_DIRECT_KEY");
+        std::env::set_var("DARK_FACTORY_GEMINI_HOME", &gemini_dir);
+        let mut gemini_cmd = Command::new("sh");
+        for var in SCRUBBED_AUTH_VARS {
+            gemini_cmd.env(var, "SYNTHETIC_AUTH_SENTINEL");
+        }
+        apply_direct_cli_scope("/opt/bin/gemini", &[], &mut gemini_cmd).unwrap();
+        let gemini_env = child_scope_env(&mut gemini_cmd);
+        assert!(gemini_env.contains("GEMINI_API_KEY=SYNTHETIC_GEMINI_DIRECT_KEY\n"), "Gemini direct child did not receive GEMINI_API_KEY: {gemini_env}");
+        assert!(gemini_env.contains(&format!("HOME={}\n", gemini_dir.canonicalize().unwrap().display())), "Gemini direct child did not receive HOME: {gemini_env}");
+        assert!(gemini_env.contains("CURSOR_API_KEY=\n"));
+        assert!(gemini_env.contains("MINIMAX_API_KEY=\n"));
+
         match prior_claude {
             Some(value) => std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", value),
             None => std::env::remove_var("DARK_FACTORY_CLAUDE_CONFIG_DIR"),
@@ -1049,6 +1349,22 @@ mod tests {
         match prior_agy {
             Some(value) => std::env::set_var("DARK_FACTORY_AGY_HOME", value),
             None => std::env::remove_var("DARK_FACTORY_AGY_HOME"),
+        }
+        match prior_cursor_key {
+            Some(value) => std::env::set_var("CURSOR_API_KEY", value),
+            None => std::env::remove_var("CURSOR_API_KEY"),
+        }
+        match prior_cursor_dir {
+            Some(value) => std::env::set_var("DARK_FACTORY_CURSOR_CONFIG_DIR", value),
+            None => std::env::remove_var("DARK_FACTORY_CURSOR_CONFIG_DIR"),
+        }
+        match prior_cursor_home {
+            Some(value) => std::env::set_var("DARK_FACTORY_CURSOR_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_CURSOR_HOME"),
+        }
+        match prior_gemini_home {
+            Some(value) => std::env::set_var("DARK_FACTORY_GEMINI_HOME", value),
+            None => std::env::remove_var("DARK_FACTORY_GEMINI_HOME"),
         }
     }
 }
