@@ -929,6 +929,8 @@ fn unresolved_threads_from_gql(gql_out: &str) -> Result<Vec<UnresolvedReviewThre
     #[derive(serde::Deserialize, Default)]
     struct GhGqlComments {
         nodes: Vec<GhGqlComment>,
+        #[serde(rename = "pageInfo", default)]
+        page_info: GhGqlPageInfo,
     }
     #[derive(serde::Deserialize)]
     struct GhGqlComment {
@@ -948,6 +950,13 @@ fn unresolved_threads_from_gql(gql_out: &str) -> Result<Vec<UnresolvedReviewThre
             "gh graphql reviewThreads page is incomplete (hasNextPage=true); refusing to infer a zero/unbounded result".into(),
         ));
     }
+    for node in pr_data.review_threads.nodes.iter().filter(|n| !n.is_resolved) {
+        if node.comments.page_info.has_next_page {
+            return Err(DaemonError::Parse(
+                "gh graphql comments page for unresolved thread is incomplete (hasNextPage=true); refusing to infer a partial thread history".into(),
+            ));
+        }
+    }
     Ok(pr_data
         .review_threads
         .nodes
@@ -955,16 +964,24 @@ fn unresolved_threads_from_gql(gql_out: &str) -> Result<Vec<UnresolvedReviewThre
         .filter(|n| !n.is_resolved)
         .take(MAX_UNRESOLVED_REVIEW_THREADS)
         .map(|node| {
-            let first_comment = node.comments.nodes.into_iter().next();
-            let (author, body) = first_comment
-                .map(|comment| {
-                    let body: String = comment.body.chars().take(MAX_REVIEW_THREAD_BODY_CHARS).collect();
-                    (
-                        comment.author.map(|author| author.login).unwrap_or_default(),
-                        body,
-                    )
-                })
+            let author = node
+                .comments
+                .nodes
+                .first()
+                .and_then(|c| c.author.as_ref())
+                .map(|author| author.login.clone())
                 .unwrap_or_default();
+            let mut bodies = Vec::new();
+            for (i, c) in node.comments.nodes.iter().enumerate() {
+                let comment_author = c.author.as_ref().map(|a| a.login.as_str()).unwrap_or("unknown");
+                let b: String = c.body.chars().take(MAX_REVIEW_THREAD_BODY_CHARS).collect();
+                if i == 0 && node.comments.nodes.len() == 1 {
+                    bodies.push(b);
+                } else {
+                    bodies.push(format!("[{comment_author}]: {b}"));
+                }
+            }
+            let body = bodies.join("\n\n");
             UnresolvedReviewThread {
                 id: node.id,
                 author,
@@ -2415,10 +2432,13 @@ impl Scm for CliScm {
                     isOutdated
                     path
                     line
-                    comments(first:1){
+                    comments(first:10){
                       nodes{
                         body
                         author { login }
+                      }
+                      pageInfo {
+                        hasNextPage
                       }
                     }
                   }
@@ -13745,6 +13765,73 @@ mod external_ref_tests {
         assert_eq!(parsed[0].line, None);
         assert!(parsed[0].is_outdated);
         assert_eq!(parsed[0].body, "please fix this");
+    }
+
+    #[test]
+    fn unresolved_threads_from_gql_fails_when_comments_has_next_page() {
+        let json = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "id": "thread-2",
+                                    "isResolved": false,
+                                    "isOutdated": false,
+                                    "path": "src/main.rs",
+                                    "line": 42,
+                                    "comments": {
+                                        "nodes": [{"body": "initial", "author": {"login": "reviewer"}}],
+                                        "pageInfo": {"hasNextPage": true}
+                                    }
+                                }
+                            ],
+                            "pageInfo": {"hasNextPage": false}
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let err = unresolved_threads_from_gql(json).expect_err("comments hasNextPage must fail closed");
+        assert!(matches!(err, crate::errors::DaemonError::Parse(ref msg) if msg.contains("comments page for unresolved thread is incomplete")));
+    }
+
+    #[test]
+    fn unresolved_threads_from_gql_joins_multiple_comments() {
+        let json = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "id": "thread-multi",
+                                    "isResolved": false,
+                                    "isOutdated": false,
+                                    "path": "src/lib.rs",
+                                    "line": 10,
+                                    "comments": {
+                                        "nodes": [
+                                            {"body": "initial comment", "author": {"login": "reviewer"}},
+                                            {"body": "follow-up response", "author": {"login": "coder"}}
+                                        ],
+                                        "pageInfo": {"hasNextPage": false}
+                                    }
+                                }
+                            ],
+                            "pageInfo": {"hasNextPage": false}
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let parsed = unresolved_threads_from_gql(json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].author, "reviewer");
+        assert_eq!(parsed[0].body, "[reviewer]: initial comment\n\n[coder]: follow-up response");
     }
 
     #[test]
