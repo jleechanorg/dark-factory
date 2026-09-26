@@ -19,6 +19,10 @@ pub const SCRUBBED_AUTH_VARS: &[&str] = &[
     "CODEX_HOME",
     "MINIMAX_API_KEY",
     "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "GOOGLE_CLOUD_PROJECT",
     "CURSOR_API_KEY",
     "CURSOR_CONFIG_DIR",
 ];
@@ -315,14 +319,31 @@ pub fn apply_agy_scope(command: &mut Command) -> Result<(), DaemonError> {
     Ok(())
 }
 
-/// Validate Cursor scoping configuration:
+/// Scoped Cursor configuration resolved from environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedCursorConfig {
+    pub api_key: Option<String>,
+    pub config_dir: Option<PathBuf>,
+    pub home: Option<PathBuf>,
+}
+
+/// Scoped Gemini configuration resolved from environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedGeminiConfig {
+    pub api_key: Option<String>,
+    pub home: Option<PathBuf>,
+}
+
+/// Validate Cursor scoping configuration.
+///
 /// Requires at least one of:
 /// - `CURSOR_API_KEY` set to a non-blank string
 /// - `DARK_FACTORY_CURSOR_CONFIG_DIR` set to an existing directory
 /// - `DARK_FACTORY_CURSOR_HOME` set to an existing directory
-/// Returns validated `(Option<String>, Option<PathBuf>, Option<PathBuf>)`.
+///
+/// Returns validated `ScopedCursorConfig`.
 /// Fails closed if none is set, or if specified directories do not exist.
-pub fn validate_cursor_scope() -> Result<(Option<String>, Option<PathBuf>, Option<PathBuf>), DaemonError> {
+pub fn validate_cursor_scope() -> Result<ScopedCursorConfig, DaemonError> {
     let mut key_opt = None;
     if let Ok(key) = std::env::var("CURSOR_API_KEY") {
         let trimmed = key.trim();
@@ -391,35 +412,47 @@ pub fn validate_cursor_scope() -> Result<(Option<String>, Option<PathBuf>, Optio
         ));
     }
 
-    Ok((key_opt, config_dir_opt, home_opt))
+    Ok(ScopedCursorConfig {
+        api_key: key_opt,
+        config_dir: config_dir_opt,
+        home: home_opt,
+    })
 }
 
 /// Apply direct Cursor scoping to a Command:
 /// 1. Validates `CURSOR_API_KEY`, `DARK_FACTORY_CURSOR_CONFIG_DIR`, and/or `DARK_FACTORY_CURSOR_HOME`.
 /// 2. Scrubs inherited AI provider authentication.
 /// 3. Applies validated `CURSOR_API_KEY`, `CURSOR_CONFIG_DIR`, and/or `HOME`.
+///    Pins `HOME` to an isolated directory if neither explicit HOME nor CONFIG_DIR is provided,
+///    preventing ambient ~/.cursor token leaks.
 pub fn apply_cursor_scope(command: &mut Command) -> Result<(), DaemonError> {
-    let (key_opt, config_dir_opt, home_opt) = validate_cursor_scope()?;
+    let config = validate_cursor_scope()?;
     scrub_all_ai_provider_auth(command);
-    if let Some(key) = key_opt {
+    if let Some(key) = config.api_key {
         command.env("CURSOR_API_KEY", key);
     }
-    if let Some(dir) = config_dir_opt {
+    if let Some(ref dir) = config.config_dir {
         command.env("CURSOR_CONFIG_DIR", dir);
     }
-    if let Some(home) = home_opt {
+    if let Some(home) = config.home {
         command.env("HOME", home);
+    } else if let Some(dir) = config.config_dir {
+        command.env("HOME", dir);
+    } else {
+        command.env("HOME", std::env::temp_dir());
     }
     Ok(())
 }
 
-/// Validate Gemini scoping configuration:
+/// Validate Gemini scoping configuration.
+///
 /// Requires at least one of:
 /// - `GEMINI_API_KEY` set to a non-blank string
 /// - `DARK_FACTORY_GEMINI_HOME` set to an existing directory
-/// Returns validated `(Option<String>, Option<PathBuf>)`.
+///
+/// Returns validated `ScopedGeminiConfig`.
 /// Fails closed if neither is set, or if specified directory does not exist.
-pub fn validate_gemini_scope() -> Result<(Option<String>, Option<PathBuf>), DaemonError> {
+pub fn validate_gemini_scope() -> Result<ScopedGeminiConfig, DaemonError> {
     let mut key_opt = None;
     if let Ok(key) = std::env::var("GEMINI_API_KEY") {
         let trimmed = key.trim();
@@ -461,21 +494,28 @@ pub fn validate_gemini_scope() -> Result<(Option<String>, Option<PathBuf>), Daem
         ));
     }
 
-    Ok((key_opt, home_opt))
+    Ok(ScopedGeminiConfig {
+        api_key: key_opt,
+        home: home_opt,
+    })
 }
 
 /// Apply direct Gemini scoping to a Command:
 /// 1. Validates `GEMINI_API_KEY` and/or `DARK_FACTORY_GEMINI_HOME`.
 /// 2. Scrubs inherited AI provider authentication.
 /// 3. Applies validated `GEMINI_API_KEY` and/or `HOME`.
+///    Pins `HOME` to an isolated directory if explicit HOME is omitted,
+///    preventing ambient ~/.gemini token leaks.
 pub fn apply_gemini_scope(command: &mut Command) -> Result<(), DaemonError> {
-    let (key_opt, home_opt) = validate_gemini_scope()?;
+    let config = validate_gemini_scope()?;
     scrub_all_ai_provider_auth(command);
-    if let Some(key) = key_opt {
+    if let Some(key) = config.api_key {
         command.env("GEMINI_API_KEY", key);
     }
-    if let Some(home) = home_opt {
+    if let Some(home) = config.home {
         command.env("HOME", home);
+    } else {
+        command.env("HOME", std::env::temp_dir());
     }
     Ok(())
 }
