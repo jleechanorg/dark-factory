@@ -419,6 +419,26 @@ pub fn validate_cursor_scope() -> Result<ScopedCursorConfig, DaemonError> {
     })
 }
 
+fn resolve_fallback_scoped_home(subdir: &str) -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        let base = PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("dark-factory")
+            .join("scoped_homes")
+            .join(subdir);
+        if std::fs::create_dir_all(&base).is_ok() {
+            return base;
+        }
+    }
+    let fallback = std::env::temp_dir()
+        .join("dark-factory")
+        .join("scoped_homes")
+        .join(subdir);
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
+}
+
 /// Apply direct Cursor scoping to a Command:
 /// 1. Validates `CURSOR_API_KEY`, `DARK_FACTORY_CURSOR_CONFIG_DIR`, and/or `DARK_FACTORY_CURSOR_HOME`.
 /// 2. Scrubs inherited AI provider authentication.
@@ -439,7 +459,10 @@ pub fn apply_cursor_scope(command: &mut Command) -> Result<(), DaemonError> {
     } else if let Some(dir) = config.config_dir {
         command.env("HOME", dir);
     } else {
-        command.env("HOME", std::env::temp_dir());
+        let fallback = resolve_fallback_scoped_home("cursor");
+        command.env("HOME", &fallback);
+        command.env("XDG_CONFIG_HOME", fallback.join(".config"));
+        command.env("XDG_DATA_HOME", fallback.join(".local/share"));
     }
     Ok(())
 }
@@ -515,7 +538,9 @@ pub fn apply_gemini_scope(command: &mut Command) -> Result<(), DaemonError> {
     if let Some(home) = config.home {
         command.env("HOME", home);
     } else {
-        command.env("HOME", std::env::temp_dir());
+        let fallback = resolve_fallback_scoped_home("gemini");
+        command.env("HOME", &fallback);
+        command.env("XDG_CONFIG_HOME", fallback.join(".config"));
     }
     Ok(())
 }
