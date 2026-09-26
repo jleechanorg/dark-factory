@@ -387,7 +387,11 @@ pub fn classify_gh_failure(stderr: &str, rc: i32) -> GhFailureKind {
     // 0. Our own suppression error. Must be first: its text mentions "rate
     //    limit", so any later check would re-classify it as a GitHub signal
     //    and let the breaker re-trip on its own output.
-    if lower.contains("circuit breaker") {
+    if lower.contains("suppressed by rate limit circuit breaker")
+        || lower.contains("call suppressed by")
+        || lower.contains("circuit breaker is open")
+        || lower.contains("rate limit circuit breaker")
+    {
         return GhFailureKind::CircuitBreakerSuppressed;
     }
 
@@ -401,14 +405,31 @@ pub fn classify_gh_failure(stderr: &str, rc: i32) -> GhFailureKind {
 
     // 2. Primary limit — requires explicit exhaustion evidence, never a bare
     //    token match.
-    let has_403 = rc == 403 || lower.contains("403");
+    let has_403 = rc == 403
+        || lower.contains("http 403")
+        || lower.contains("status: 403")
+        || lower.contains("status 403")
+        || lower.contains("\"status\": 403")
+        || lower.contains("code: 403")
+        || lower.contains(" 403 forbidden")
+        || lower.contains(" 403 ");
     // Bare "429" is not usable: hex SHAs echoed in gh stderr contain digit
     // runs. Require the HTTP status in context.
-    let has_429 = rc == 429 || lower.contains("http 429") || lower.contains("too many requests");
+    let has_429 = rc == 429
+        || lower.contains("http 429")
+        || lower.contains("status: 429")
+        || lower.contains("status 429")
+        || lower.contains("\"status\": 429")
+        || lower.contains("code: 429")
+        || lower.contains(" 429 too many requests")
+        || lower.contains("too many requests");
     let is_primary = PRIMARY_EXHAUSTION_PHRASES.iter().any(|p| lower.contains(p))
         || ratelimit_remaining_is_zero(&lower)
         // GraphQL error type RATE_LIMITED (distinct from the `rate_limit`
         // REST path, which has no trailing "ed").
+        || lower.contains("\"type\": \"rate_limited\"")
+        || lower.contains("'type': 'rate_limited'")
+        || lower.contains("type: rate_limited")
         || lower.contains("rate_limited")
         || has_429
         // A 403 whose body talks about rate limiting IS a rate limit — the
