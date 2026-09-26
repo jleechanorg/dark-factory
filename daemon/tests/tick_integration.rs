@@ -8469,6 +8469,12 @@ fn setup_fake_reviewer_env(fake_bin_dir: &std::path::Path, coder_default: &str) 
     let codex_home_str = fake_codex_home.to_string_lossy().to_string();
     let claude_home_str = fake_claude_home.to_string_lossy().to_string();
     let agy_home_str = fake_agy_home.to_string_lossy().to_string();
+    let fake_cursor_home = fake_bin_dir.join("fake_cursor_home");
+    std::fs::create_dir_all(&fake_cursor_home).unwrap();
+    let fake_gemini_home = fake_bin_dir.join("fake_gemini_home");
+    std::fs::create_dir_all(&fake_gemini_home).unwrap();
+    let cursor_home_str = fake_cursor_home.to_string_lossy().to_string();
+    let gemini_home_str = fake_gemini_home.to_string_lossy().to_string();
 
     EnvVarGuard::set(&[
         ("PATH", &new_path),
@@ -8477,6 +8483,10 @@ fn setup_fake_reviewer_env(fake_bin_dir: &std::path::Path, coder_default: &str) 
         ("DARK_FACTORY_CLAUDE_CONFIG_DIR", &claude_home_str),
         ("DARK_FACTORY_AGY_HOME", &agy_home_str),
         ("MINIMAX_API_KEY", "test-synthetic-minimax-key-fixture"),
+        ("CURSOR_API_KEY", "test-synthetic-cursor-key-fixture"),
+        ("DARK_FACTORY_CURSOR_HOME", &cursor_home_str),
+        ("GEMINI_API_KEY", "test-synthetic-gemini-key-fixture"),
+        ("DARK_FACTORY_GEMINI_HOME", &gemini_home_str),
     ])
 }
 
