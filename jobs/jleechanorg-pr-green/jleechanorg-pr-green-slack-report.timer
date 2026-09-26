@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for the 8-hour jleechanorg PR repair Slack report
+
+[Timer]
+OnCalendar=*-*-* *:00/5:00
+Persistent=true
+Unit=jleechanorg-pr-green-slack-report.service
+
+[Install]
+WantedBy=timers.target
