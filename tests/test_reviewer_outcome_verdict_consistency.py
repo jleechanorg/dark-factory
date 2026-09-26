@@ -246,8 +246,14 @@ class TestEnforceOutcomeVerdictConsistency:
         assert "verdict_adjusted_for_consistency" not in adjusted.metadata
         assert adjusted.outcome == "failure"
 
-    def test_failure_outcome_with_inconclusive_verdict_unchanged(self):
-        """outcome=failure with verdict=inconclusive → consistent, unchanged."""
+    def test_failure_outcome_with_inconclusive_verdict_adjusted(self):
+        """outcome=failure with verdict=inconclusive → TRUE contradiction, adjusted.
+
+        Per dark-factory#827/#828, "inconclusive" now normalizes to the
+        "error" outcome (not "failure") — an explicit outcome=failure
+        paired with a verdict metadata of "inconclusive" is a genuine
+        disagreement, same shape as the "approve" contradiction case below.
+        """
         result = Result(
             outcome="failure",
             output="inconclusive review",
@@ -256,9 +262,10 @@ class TestEnforceOutcomeVerdictConsistency:
 
         adjusted = _enforce_outcome_verdict_consistency(result, gate_strict=False)
 
-        # inconclusive→failure, matches outcome=failure → preserved
-        assert adjusted.metadata["verdict"] == "inconclusive"
-        assert "verdict_adjusted_for_consistency" not in adjusted.metadata
+        # inconclusive→error, but outcome=failure → contradiction
+        assert adjusted.metadata["verdict"] == "fail"
+        assert adjusted.metadata["verdict_adjusted_for_consistency"] == "true"
+        assert adjusted.metadata["original_verdict"] == "inconclusive"
         assert adjusted.outcome == "failure"
 
     def test_failure_outcome_with_warn_verdict_adjusted_gate_strict_true(self):
@@ -354,7 +361,7 @@ class TestEnforceOutcomeVerdictConsistency:
             for i, line in enumerate(text.splitlines(), 1):
                 if pattern.match(line):
                     definitions.append(py.relative_to(ROOT).as_posix() + f":{i}")
-        assert definitions == ["runner/handler_verdict.py:182"], (
+        assert definitions == ["runner/handler_verdict.py:243"], (
             f"expected exactly one canonical definition in handler_verdict.py, "
             f"got: {definitions}"
         )
@@ -381,8 +388,14 @@ class TestEnforceOutcomeVerdictConsistency:
             assert "verdict_adjusted_for_consistency" not in adjusted.metadata
 
     def test_fail_family_outcome_failure_with_failure_token_unchanged(self):
-        """FAIL-family outcomes: failure token with matching outcome is unchanged."""
-        for token in ("fail", "partial", "inconclusive", "insufficient",
+        """FAIL-family outcomes: failure token with matching outcome is unchanged.
+
+        "inconclusive" is deliberately excluded from this list — per
+        dark-factory#827/#828 it normalizes to the "error" outcome, not
+        "failure" (see test_failure_outcome_with_inconclusive_verdict_
+        adjusted below for its own, now-distinct, contradiction case).
+        """
+        for token in ("fail", "partial", "insufficient",
                       "invalid", "incomplete", "conditional", "reject",
                       "rejected", "blocker"):
             # sanity: every token named here must be in the normalize map.

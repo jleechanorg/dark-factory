@@ -110,23 +110,16 @@ pub fn run_gates_compute(pr: u64, repo_opt: Option<String>) -> Result<(), Daemon
             "--repo",
             &repo,
             "--json",
-            "reviews",
+            "reviews,headRefOid",
         ],
         30,
     )?;
 
     #[derive(serde::Deserialize)]
     struct GhReviewsView {
-        reviews: Vec<GhReview>,
-    }
-    #[derive(serde::Deserialize)]
-    struct GhReview {
-        author: GhAuthor,
-        state: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct GhAuthor {
-        login: String,
+        reviews: Vec<crate::adapters::GhReview>,
+        #[serde(rename = "headRefOid")]
+        head_ref_oid: String,
     }
 
     let json_start_r = reviews_out.find('{').unwrap_or(0);
@@ -134,21 +127,15 @@ pub fn run_gates_compute(pr: u64, repo_opt: Option<String>) -> Result<(), Daemon
         DaemonError::Parse(format!("failed to parse gh pr view reviews JSON: {e}"))
     })?;
 
-    let last_coderabbit_review = reviews_view.reviews.iter()
-        .rfind(|r| r.author.login.contains("coderabbit") && r.state != "COMMENTED");
-
-    let coderabbit = match last_coderabbit_review {
-        Some(r) => {
-            if r.state == "APPROVED" {
-                "green".to_string()
-            } else if r.state == "CHANGES_REQUESTED" {
-                "red".to_string()
-            } else {
-                "unknown".to_string()
-            }
-        }
-        None => "unknown".to_string(),
-    };
+    // Keep gates-compute on the same exact-head classifier as the daemon's
+    // production PR snapshot path. Reviews without commit metadata, stale
+    // approvals, malformed payloads, and later non-actionable entries must
+    // never make this gate green accidentally.
+    let coderabbit = crate::adapters::coderabbit_status_for_head(
+        &reviews_view.reviews,
+        &reviews_view.head_ref_oid,
+    )
+    .to_string();
 
     // Gate 4: Bugbot clean
     let comments_out = run_tool(
@@ -160,6 +147,10 @@ pub fn run_gates_compute(pr: u64, repo_opt: Option<String>) -> Result<(), Daemon
     #[derive(serde::Deserialize)]
     struct GhCommentsView {
         comments: Vec<GhComment>,
+    }
+    #[derive(serde::Deserialize)]
+    struct GhAuthor {
+        login: String,
     }
     #[derive(serde::Deserialize)]
     struct GhComment {
@@ -284,6 +275,46 @@ pub fn run_gates_compute(pr: u64, repo_opt: Option<String>) -> Result<(), Daemon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct ReviewPayload {
+        reviews: Vec<crate::adapters::GhReview>,
+        #[serde(rename = "headRefOid")]
+        head_ref_oid: String,
+    }
+
+    #[test]
+    fn coderabbit_gate_binds_approval_to_reported_head() {
+        let payload: ReviewPayload = serde_json::from_str(
+            r#"{"headRefOid":"head-2","reviews":[{"author":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit":{"oid":"head-2"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::adapters::coderabbit_status_for_head(&payload.reviews, &payload.head_ref_oid),
+            "green"
+        );
+    }
+
+    #[test]
+    fn coderabbit_gate_rejects_stale_or_missing_commit_metadata() {
+        let stale: ReviewPayload = serde_json::from_str(
+            r#"{"headRefOid":"head-2","reviews":[{"author":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit":{"oid":"head-1"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::adapters::coderabbit_status_for_head(&stale.reviews, &stale.head_ref_oid),
+            "unknown"
+        );
+
+        let missing: ReviewPayload = serde_json::from_str(
+            r#"{"headRefOid":"head-2","reviews":[{"author":{"login":"coderabbitai[bot]"},"state":"APPROVED","commit":null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::adapters::coderabbit_status_for_head(&missing.reviews, &missing.head_ref_oid),
+            "unknown"
+        );
+    }
 
     #[test]
     fn run_gates_compute_fails_if_config_missing() {

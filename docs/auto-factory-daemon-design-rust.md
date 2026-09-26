@@ -29,7 +29,7 @@ daemon/                     # new Rust crate in this repo (not a workspace)
     ├── tools.rs        ~220  the 5 tool traits + subprocess implementations
     ├── intake.rs       ~140  issue→bead normalizer + write-tier auth (spec §4.2.3)
     ├── router.rs        ~70  ZFC task router: render prompt, 1 LLM call, parse verdict
-    ├── dispatch.rs     ~120  slot supervisor (≤30 workers, batch ≤15) + handoff
+    ├── dispatch.rs     ~120  slot supervisor (≤40 workers, batch ≤15) + handoff
     ├── verifier.rs     ~220  7/8-green gates, ETag cache, evidence floor (spec §4.2.5)
     ├── reroll.rs       ~180  [Stage 2] lock → quiesce(60s) → baseline → fresh branch
     └── constraints.rs  ~100  [Stage 2] extractor call + append-only spec mutation
@@ -133,7 +133,7 @@ pub struct Config {
     pub target_repo: String,            // exactly one (pilot scope)
     pub base_branch: String,            // "main"
     pub stage: u8,                      // 1 = verifier plane only; 2 = re-roll enabled
-    pub max_workers: usize,             // 30 (spec §4.2.8)
+    pub max_workers: usize,             // 40 (spec §4.2.8)
     pub max_batch: usize,               // 15
     pub fast_tick_secs: u64,            // 60
     pub slow_tick_secs: u64,            // 600
@@ -170,7 +170,7 @@ pub fn assess(scm: &dyn Scm, pr: u64, cfg: &Config) -> Result<GateReport, Daemon
 
 // dispatch.rs — spec §4.2.2/§4.2.4
 pub fn dispatch_ready(sessions: &dyn Sessions, store: &dyn StateStore, cfg: &Config,
-                      ready: &[Bead]) -> Result<usize, DaemonError>; // enforces 30/15 caps
+                      ready: &[Bead]) -> Result<usize, DaemonError>; // enforces 40/15 caps
 
 // reroll.rs — [Stage 2] spec §4.2.6 numbered handover; each step emits telemetry
 pub fn execute(deps: &RerollDeps, bead: &mut BeadOverlay) -> Result<RerollOutcome, DaemonError>;

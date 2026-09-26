@@ -378,6 +378,36 @@ def test_evaluate_malformed_output_fails_closed():
     result = evaluate(review_output="looks good, no extra text", **_ctx())
     assert result.check_state == "failure"
 
+def test_evaluate_genuine_verdict_survives_nonzero_exit_error():
+    """round-10 /advice: a real, complete, parseable FAIL verdict must
+    not be discarded just because `review_error` (e.g. a flaky
+    nonzero exit code) is also set — previously `evaluate()`
+    short-circuited to "reviewer unavailable" the instant
+    `review_error` was truthy, regardless of output content."""
+    out = _valid_output(verdict="FAIL", reason="found a real bug")
+    result = evaluate(
+        review_output=out,
+        review_error="reviewer rc=1: some flaky wrapper noise",
+        **_ctx(),
+    )
+    assert result.check_state == "failure"
+    assert result.verdict == "FAIL"
+    assert result.parsed is not None
+    assert "found a real bug" in result.reason
+
+def test_evaluate_unparseable_output_with_error_folds_error_into_reason():
+    """When review_error is set AND the output still can't be parsed
+    into a genuine verdict, the error diagnostic must not be silently
+    dropped just because output happened to be non-empty."""
+    result = evaluate(
+        review_output="not a real verdict, just prose",
+        review_error="reviewer rc=1: some flaky wrapper noise",
+        **_ctx(),
+    )
+    assert result.check_state == "failure"
+    assert result.parsed is None
+    assert "flaky wrapper noise" in result.reason
+
 # ===========================================================================
 # aggregate_results — multi-reviewer independence
 # ===========================================================================
@@ -831,7 +861,7 @@ def test_invoke_reviewer_missing_binary_returns_error():
 
     original = cli_mod._build_reviewer_cmd
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return ["definitely-not-a-real-binary-xyz"]
 
     cli_mod._build_reviewer_cmd = fake_cmd
@@ -851,7 +881,7 @@ def test_invoke_reviewer_nonzero_exit_returns_error():
 
     original = cli_mod._build_reviewer_cmd
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return ["/usr/bin/false"]  # absolute path so PATH-empty cases still find it
 
     cli_mod._build_reviewer_cmd = fake_cmd
@@ -954,7 +984,7 @@ def test_cli_forced_pass_with_both_reviewers(monkeypatch, capsys):
         lambda repo, pr, head_sha="": "claude",
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         # Emit the stdout a real reviewer would produce.
         return [
             "python3",
@@ -991,7 +1021,7 @@ def test_cli_forced_fail_with_missing_reviewer(monkeypatch, capsys):
         lambda repo, pr, head_sha="": "claude",
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         if reviewer == "codex":
             return ["definitely-not-a-real-binary-xyz"]
         return [
@@ -1033,7 +1063,7 @@ def test_cli_provenance_fails_self_review(monkeypatch, capsys):
         lambda repo, pr, head_sha="": "claude",
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return [
             "python3",
             "-c",
@@ -1104,14 +1134,19 @@ def test_adversarial_parse_rejects_second_verdict_in_prose():
     assert parse_verdict(out) is None
 
 def test_adversarial_commit_prefix_claudem_minimax_m3():
-    """Commit-subject prefix `claudem/` maps to `claude`."""
+    """Commit-subject prefix `claudem/` maps to its own `claudem`
+    identity (PR #819 round-4: previously collapsed into `claude`,
+    which silently defeated self-review detection once `claudem`
+    became independently reachable as a reviewer identity too — see
+    test_claudem_authored_commit_reviewed_by_claudem_is_rejected_as_self_review
+    in tests/test_pr819_chain_walk_vendor_support.py)."""
     from runner.skeptic_gate import extract_implementation_identity_from_commit
 
     assert (
         extract_implementation_identity_from_commit(
             "claudem/minimax-M3: feat(ci): skeptic gate redesign"
         )
-        == "claude"
+        == "claudem"
     )
 
 def test_adversarial_commit_prefix_codexm_o3():
@@ -1305,7 +1340,7 @@ def test_adversarial_status_failure_is_fail_closed(monkeypatch, capsys):
         lambda repo, pr, head_sha="": "claude",
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return [
             "python3",
             "-c",
@@ -1446,7 +1481,7 @@ def test_get_implementation_identity_uses_head_sha_direct_lookup():
         )
     finally:
         cli_mod.gh_api = orig
-    assert identity == "claude"
+    assert identity == "claudem"
     assert calls["commits_sha"] == f"repos/jleechanorg/dark-factory/commits/{head_sha}"
     assert calls["pr_commits"] == 0
 
@@ -1481,7 +1516,7 @@ def test_get_implementation_identity_falls_back_to_pr_commits_when_head_missing(
         )
     finally:
         cli_mod.gh_api = orig
-    assert identity == "claude"
+    assert identity == "claudem"
 
 def test_extract_field_parses_review_and_implementation_provenance():
     """Readback extractors must parse REVIEWER and IMPLEMENTATION_PROVENANCE
@@ -1583,7 +1618,7 @@ def test_publication_readback_rejects_duplicate_field_in_body(monkeypatch):
         cli_mod, "get_implementation_identity", lambda repo, pr, head_sha="": "claude"
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return [
             "python3",
             "-c",
@@ -1680,7 +1715,7 @@ def test_status_publish_order_pending_then_success(monkeypatch, capsys):
         cli_mod, "get_implementation_identity", lambda repo, pr, head_sha="": "claude"
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return [
             "python3",
             "-c",
@@ -1770,7 +1805,7 @@ def test_status_readback_mismatch_overwrites_to_failure(monkeypatch, capsys):
         cli_mod, "get_implementation_identity", lambda repo, pr, head_sha="": "claude"
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return [
             "python3",
             "-c",
@@ -1848,7 +1883,7 @@ def test_status_overwritten_failure_never_becomes_success(monkeypatch, capsys):
         cli_mod, "get_implementation_identity", lambda repo, pr, head_sha="": "claude"
     )
 
-    def fake_cmd(reviewer, model, *, codex_bin="", gemini_bin=""):
+    def fake_cmd(reviewer, model, **kwargs):
         return [
             "python3",
             "-c",

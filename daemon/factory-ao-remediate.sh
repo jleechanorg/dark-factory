@@ -69,7 +69,7 @@ fi
 BEAD_JSON="$("$ROOT/../bin/br" --db "${BR_DB:-$ROOT/../.beads/beads.db}" show "$BEAD_ID" --json 2>/dev/null || true)"
 if [ -z "$BEAD_JSON" ]; then
   if command -v br >/dev/null 2>&1; then
-    BEAD_JSON="$(br --db "${BR_DB:-$HOME/.beads/beads.db}" show "$BEAD_ID" --json 2>/dev/null || true)"
+    BEAD_JSON="$(br --db "${BR_DB:-${DARK_FACTORY_BR_DB:-${XDG_STATE_HOME:-$HOME/.local/state}/dark-factory/.beads/beads.db}}" show "$BEAD_ID" --json 2>/dev/null || true)"
   fi
 fi
 BEAD_DESC="$(printf '%s' "$BEAD_JSON" | python3 -c '

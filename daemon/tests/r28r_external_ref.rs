@@ -162,6 +162,7 @@ impl Scm for UnfilteredFakeScm {
 
 fn test_cfg() -> Config {
     Config {
+        task_bead_id: None,
         target_repo: "owner/repo".into(),
         ao_project: None,
         base_branch: "main".into(),

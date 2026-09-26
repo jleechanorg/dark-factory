@@ -1,0 +1,64 @@
+// pipelines/slim/review_only.dot
+//
+// Reviewer-first entry point for `/factory-review` (`/fr`, see
+// .claude/commands/factory-review.md and .claude/skills/factory-review/).
+//
+// Unlike every other pipeline in this repo, this graph has NO coding node at
+// all — it exists so a calling LLM session that already wrote its own code
+// (in some other, arbitrary repo) can request one fresh, adversarial review
+// pass without dark-factory touching, committing, or pushing anything.
+//
+// Wiring: start -> cold_reviewer -> exit (unconditional; there is no worker
+// to loop back to, so both a PASS and a FAIL verdict terminate the run —
+// the calling LLM applies any fix itself, outside this pipeline).
+//
+// Invocation contract (see .claude/commands/factory-review.md):
+//   dark-factory --pipeline pipelines/slim/review_only.dot \
+//     --target <factory.review-target.v1 locator or freeform text> \
+//     --target-intent "<what the calling LLM changed and wants reviewed>" \
+//     --workdir <calling repo, NOT dark-factory itself>
+//
+// `--target` requires a reviewer-first graph (start's only edge(s) must lead
+// directly to a verdict-gated `class="review"` node) — this graph exists to
+// satisfy that CLI precondition. `--target-intent` (new flag, see
+// runner/__main__.py) sets ctx.state["intent"] directly since --target and
+// --goal remain mutually exclusive for non-reviewer-first graphs (D5).
+//
+// The reviewer node reuses the exact same typed-target-locator +
+// Base64-intent-envelope machinery as pipelines/slim/two_node.dot's
+// cold_reviewer (runner/target_locator.py, prompts/slim/fresh_review.md,
+// runner/handler_render.py) — no new review contract is introduced here.
+
+digraph SlimReviewOnly {
+    graph [
+        goal="Single fresh Codex reviewer evaluates an externally supplied --target with NO coding node in this graph. Never writes/commits/pushes to the reviewed workspace. Default graph for /factory-review (/fr)."
+        rankdir=LR
+        label="SlimReviewOnly (default /factory-review graph)"
+    ]
+
+    start  [shape=Mdiamond, label="Start"]
+    exit   [shape=Msquare,  label="Exit"]
+
+    cold_reviewer [
+        type="codergen",
+        label="Fresh Codex Reviewer (review-only)",
+        class="review",
+        backend="codex",
+        prompt="@prompts/slim/fresh_review.md",
+        verdict_gate="true",
+        fresh_session="true",
+        goal_gate=true,
+        timeout=1320
+    ]
+
+    start -> cold_reviewer
+    // Unconditional: no fix loop exists in this graph (there is no coding
+    // node to route back to), so PASS and FAIL both terminate the run here.
+    // The calling LLM reads the verdict + findings from stdout/evidence and
+    // applies any fix itself, outside dark-factory. (G2's "reviewer FAIL
+    // must not route directly to exit" only fires on an edge whose condition
+    // literally tokenises to `outcome != success`; this edge carries no
+    // condition at all, matching pipelines/slim/review_pr.dot's
+    // `evidence -> exit` precedent.)
+    cold_reviewer -> exit
+}

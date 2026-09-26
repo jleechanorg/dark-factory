@@ -39,11 +39,11 @@ As of 2026-07-12:
 ["self-hosted","self-hosted-mikey","ezgha"]
 ```
 
-This conjunction matches all 19 online org runners (`ez-mac-runner-b-1..3`
-plus `ez-runner-c-1..16`). All 19 runners expose `self-hosted`,
-`self-hosted-mikey`, and `ezgha`; the macOS runners additionally carry
-`self-hosted-macos`, but adding it to the conjunction would restrict jobs to
-the 3 mac runners only — we want the broadest possible pool.
+This conjunction matches all online org runners (`ez-mac-runner-e-*` macOS
+runners plus `ez-runner-c-*` Linux runners). All online runners expose
+`self-hosted`, `self-hosted-mikey`, and `ezgha`; the macOS runners additionally
+carry `self-hosted-macos`, but adding it to the conjunction would restrict jobs to
+macOS runners only — we want the broadest possible pool.
 
 To verify the selector still matches ≥1 runner, run locally:
 

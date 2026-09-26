@@ -190,7 +190,11 @@ def _tool(node: "Node", ctx: "Context") -> "Result":
                     "missing_test_files": "true",
                 },
             )
-    args = _handlers_shim._sandboxed_args(shlex.split(cmd))
+    if any(op in cmd for op in ("&&", "||", ";", "|", "\n")):
+        cmd_args = ["/bin/bash", "-c", cmd]
+    else:
+        cmd_args = shlex.split(cmd)
+    args = _handlers_shim._sandboxed_args(cmd_args)
     if args is None:
         return Result(outcome="failure", output="sandbox-exec unavailable")
     try:

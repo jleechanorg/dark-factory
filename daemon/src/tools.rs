@@ -42,7 +42,7 @@ pub struct Bead {
     pub id: String,
     pub title: String,
     pub description: String, // full body/description from `br list --json`; "" if absent
-    pub notes: String, // operator-authored `br update --notes` text; "" if absent
+    pub notes: String,       // operator-authored `br update --notes` text; "" if absent
     pub file_tree_summary: String, // pre-rendered file-tree text; "" if unavailable
     pub external_ref: Option<String>, // "<owner>/<repo>#<issue_number>", None = manual bead
 }
@@ -80,7 +80,11 @@ pub fn summarize_file_tree(root: &std::path::Path, max_entries: usize) -> String
                 continue; // skip .git, .venv, dotfiles — noise for a router prompt
             }
             let path = entry.path();
-            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
 
             if path.is_dir() {
                 entries.push(format!("{rel}/"));
@@ -478,6 +482,16 @@ mod claude_project_slug_tests {
 /// `br` CLI. `fetch_candidates` == `br list --status open --label factory --json`.
 pub trait Tracker {
     fn fetch_candidates(&self) -> Result<Vec<Bead>, DaemonError>;
+    /// Authoritative dependency admission snapshot. Production uses
+    /// `br ready`; the default preserves existing fake adapters by treating
+    /// all broad candidates as ready unless a test explicitly overrides it.
+    fn fetch_ready_ids(&self) -> Result<std::collections::HashSet<String>, DaemonError> {
+        Ok(self
+            .fetch_candidates()?
+            .into_iter()
+            .map(|bead| bead.id)
+            .collect())
+    }
     fn fetch_all_external_refs(&self) -> Result<std::collections::HashSet<String>, DaemonError>;
     fn create_bead(
         &self,
@@ -654,11 +668,7 @@ pub trait Scm {
     /// unconditionally so existing test fakes and any impl that predates
     /// this method keep their original behavior; `CliScm` overrides it to
     /// actually call `gh pr list --head <branch>`.
-    fn pr_number_for_branch(
-        &self,
-        repo: &str,
-        branch: &str,
-    ) -> Result<Option<u64>, DaemonError> {
+    fn pr_number_for_branch(&self, repo: &str, branch: &str) -> Result<Option<u64>, DaemonError> {
         let _ = (repo, branch);
         Ok(None)
     }
@@ -755,8 +765,34 @@ pub trait Sessions {
     fn active_count(&self) -> Result<usize, DaemonError>;
     fn spawn(&self, spec: &SpawnSpec) -> Result<SessionId, DaemonError>;
     fn attach(&self, branch: &str, bead_id: &str) -> Result<SessionId, DaemonError>;
+    fn attach_in_project(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        project: &str,
+    ) -> Result<SessionId, DaemonError> {
+        let _ = project;
+        self.attach(branch, bead_id)
+    }
     fn stop(&self, id: &SessionId) -> Result<(), DaemonError>;
+    /// Stop a session using the AO project resolved by its durable owner.
+    ///
+    /// The default preserves existing fakes and single-project adapters. The
+    /// production adapter overrides it so restart recovery never guesses from
+    /// a process-local spawn map.
+    fn stop_in_project(&self, id: &SessionId, project: &str) -> Result<(), DaemonError> {
+        let _ = project;
+        self.stop(id)
+    }
     fn is_quiescent(&self, id: &SessionId) -> Result<bool, DaemonError>;
+    fn is_quiescent_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<bool, DaemonError> {
+        let _ = project;
+        self.is_quiescent(id)
+    }
     /// Budget-bounded `attach` (bead jleechan-zeij / issue #322 r4 P2). The
     /// re-roll proceed poll caps each probe at the time remaining until its
     /// window deadline so a single poll cannot block for multiples of the
@@ -773,6 +809,16 @@ pub trait Sessions {
         let _ = timeout_secs;
         self.attach(branch, bead_id)
     }
+    fn attach_within_in_project(
+        &self,
+        branch: &str,
+        bead_id: &str,
+        project: &str,
+        timeout_secs: u64,
+    ) -> Result<SessionId, DaemonError> {
+        let _ = project;
+        self.attach_within(branch, bead_id, timeout_secs)
+    }
     /// Budget-bounded [`session_activity`](Sessions::session_activity) (bead
     /// jleechan-zeij / issue #322 r4 P2). Default delegates to the unbounded
     /// method; `CliSessions` overrides to pass `timeout_secs` to `ao status`.
@@ -783,6 +829,15 @@ pub trait Sessions {
     ) -> Result<SessionActivity, DaemonError> {
         let _ = timeout_secs;
         self.session_activity(id)
+    }
+    fn session_activity_within_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+        timeout_secs: u64,
+    ) -> Result<SessionActivity, DaemonError> {
+        let _ = project;
+        self.session_activity_within(id, timeout_secs)
     }
     /// Activity probe distinguishing idle vs running vs terminal (bead
     /// jleechan-zeij / issue #322 r2 — see [`SessionActivity`]). The default
@@ -798,6 +853,14 @@ pub trait Sessions {
         } else {
             Ok(SessionActivity::Running)
         }
+    }
+    fn session_activity_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<SessionActivity, DaemonError> {
+        let _ = project;
+        self.session_activity(id)
     }
     /// Post-spawn session health monitor: checks if an active session died,
     /// failed authentication, hit quota limits, or suffered terminal errors in its terminal.
@@ -840,6 +903,23 @@ pub trait Sessions {
     /// absence of information.
     fn session_branch(&self, id: &SessionId) -> Result<Option<String>, DaemonError> {
         let _ = id;
+        Ok(None)
+    }
+    fn session_branch_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<Option<String>, DaemonError> {
+        let _ = project;
+        self.session_branch(id)
+    }
+    /// Returns the PR number AO reports for a given session in a project, if known.
+    fn session_pr_number_in_project(
+        &self,
+        id: &SessionId,
+        project: &str,
+    ) -> Result<Option<u64>, DaemonError> {
+        let _ = (id, project);
         Ok(None)
     }
     /// Returns the git remote URL configured for `remote_name` inside the
@@ -969,7 +1049,12 @@ pub trait Vcs {
     /// POST a `refs/heads/<name>` ref via `gh api repos/<repo>/git/refs`
     /// (cross-repo ref creation that does NOT depend on the daemon's
     /// local checkout at all).
-    fn create_branch_at_for_repo(&self, repo: &str, name: &str, sha: &str) -> Result<(), DaemonError> {
+    fn create_branch_at_for_repo(
+        &self,
+        repo: &str,
+        name: &str,
+        sha: &str,
+    ) -> Result<(), DaemonError> {
         let _ = repo;
         self.create_branch_at(name, sha)
     }
@@ -985,11 +1070,7 @@ pub trait Vcs {
     /// shape as #349). Default impl is a no-op so existing single-repo
     /// test fakes keep their original behaviour transparently; `CliVcs`
     /// overrides it to `DELETE repos/<repo>/git/refs/heads/<name>`.
-    fn delete_branch_at_for_repo(
-        &self,
-        repo: &str,
-        name: &str,
-    ) -> Result<(), DaemonError> {
+    fn delete_branch_at_for_repo(&self, repo: &str, name: &str) -> Result<(), DaemonError> {
         let _ = (repo, name);
         Ok(())
     }
@@ -1130,6 +1211,54 @@ pub fn run_tool_with_env(
     run_tool_with_cwd(cmd, args, None, extra_env, timeout_secs)
 }
 
+pub fn resolve_beads_db() -> Option<std::path::PathBuf> {
+    if let Ok(db) = std::env::var("DARK_FACTORY_BR_DB") {
+        if !db.trim().is_empty() {
+            return Some(std::path::PathBuf::from(db));
+        }
+    }
+    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+        if !state_home.trim().is_empty() {
+            let path = std::path::PathBuf::from(state_home).join("dark-factory/.beads/beads.db");
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            let path = std::path::PathBuf::from(home).join(".local/state/dark-factory/.beads/beads.db");
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Explicit AI-provider-scoped variant of `run_tool`.
+pub fn run_scoped_tool(
+    provider: crate::account_scope::AiProvider,
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&str>,
+    timeout_secs: u64,
+) -> Result<String, DaemonError> {
+    run_tool_with_cwd_scoped(Some(provider), cmd, args, cwd, &[], timeout_secs)
+}
+
+/// Explicit AI-provider-scoped variant of `run_tool_with_env`.
+pub fn run_scoped_tool_with_env(
+    provider: crate::account_scope::AiProvider,
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&str>,
+    extra_env: &[(&str, &str)],
+    timeout_secs: u64,
+) -> Result<String, DaemonError> {
+    run_tool_with_cwd_scoped(Some(provider), cmd, args, cwd, extra_env, timeout_secs)
+}
+
 fn run_tool_with_cwd(
     cmd: &str,
     args: &[&str],
@@ -1137,14 +1266,25 @@ fn run_tool_with_cwd(
     extra_env: &[(&str, &str)],
     timeout_secs: u64,
 ) -> Result<String, DaemonError> {
+    run_tool_with_cwd_scoped(None, cmd, args, cwd, extra_env, timeout_secs)
+}
+
+fn run_tool_with_cwd_scoped(
+    provider: Option<crate::account_scope::AiProvider>,
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&str>,
+    extra_env: &[(&str, &str)],
+    timeout_secs: u64,
+) -> Result<String, DaemonError> {
     // Centralized GitHub rate-limit circuit-breaker admission check.
-    crate::gh_circuit_breaker::admit_or_suppress(cmd)?;
+    crate::gh_circuit_breaker::admit_or_suppress(cmd, args)?;
 
     let res = (|| {
         let mut command = Command::new(cmd);
-        if cmd == "br" {
-            if let Ok(db) = std::env::var("DARK_FACTORY_BR_DB") {
-                command.args(["--db", db.as_str()]);
+        if cmd == "br" && !args.contains(&"--db") {
+            if let Some(db) = resolve_beads_db() {
+                command.args(["--db", db.to_str().unwrap_or_default()]);
             }
         }
         command
@@ -1166,13 +1306,41 @@ fn run_tool_with_cwd(
         for (key, value) in extra_env {
             command.env(key, value);
         }
-        let mut child = command
-            .spawn()
-            .map_err(|e| DaemonError::Tool {
-                tool: cmd.to_string(),
-                rc: -1,
-                stderr: format!("spawn failed: {e}"),
+        // Centralized AI account scoping: runs after extra_env overrides so
+        // caller-passed extra_env cannot bypass safety. Fails closed before spawn.
+        // Preserve DaemonError::Config as-is: account-scope validators return
+        // it for permanent host misconfiguration, and is_transient() treats
+        // Config as non-transient (park immediately) vs Tool (retry until
+        // MAX_TRANSIENT_SPAWN_RETRY exhausts). Downcasting Config to Tool here
+        // made dispatch requeue an unchanged misconfiguration until the retry
+        // cap burned, then park with a generic transient-spawn reason instead
+        // of the real config error.
+        if let Some(p) = provider {
+            crate::account_scope::apply_provider_scope(p, &mut command).map_err(|e| match e {
+                config @ DaemonError::Config(_) => config,
+                other => DaemonError::Tool {
+                    tool: cmd.to_string(),
+                    rc: -1,
+                    stderr: format!("account scope validation failed: {other}"),
+                },
             })?;
+        } else {
+            crate::account_scope::apply_direct_cli_scope(cmd, extra_env, &mut command).map_err(
+                |e| match e {
+                    config @ DaemonError::Config(_) => config,
+                    other => DaemonError::Tool {
+                        tool: cmd.to_string(),
+                        rc: -1,
+                        stderr: format!("account scope validation failed: {other}"),
+                    },
+                },
+            )?;
+        }
+        let mut child = command.spawn().map_err(|e| DaemonError::Tool {
+            tool: cmd.to_string(),
+            rc: -1,
+            stderr: format!("spawn failed: {e}"),
+        })?;
 
         // Take the pipes and hand them to dedicated reader threads immediately so
         // they drain concurrently with the wait/poll loop below. Readers run to
@@ -1210,7 +1378,10 @@ fn run_tool_with_cwd(
                             // process group created above. This leaves the
                             // daemon's own group untouched.
                             unsafe {
-                                unix_signals::kill(-(child.id() as unix_signals::Pid), unix_signals::SIGKILL);
+                                unix_signals::kill(
+                                    -(child.id() as unix_signals::Pid),
+                                    unix_signals::SIGKILL,
+                                );
                             }
                         }
                         #[cfg(not(unix))]
@@ -1251,7 +1422,7 @@ fn run_tool_with_cwd(
         })
     })();
 
-    crate::gh_circuit_breaker::record_result(cmd, &res);
+    crate::gh_circuit_breaker::record_result(cmd, args, &res);
     res
 }
 
@@ -1481,7 +1652,14 @@ mod tests {
             .trim()
             .to_owned();
         let pid: unix_signals::Pid = pid.parse().expect("descendant PID must be numeric");
-        let is_alive = process_is_live(pid);
+        let mut is_alive = true;
+        for _ in 0..10 {
+            is_alive = process_is_live(pid);
+            if !is_alive {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         if is_alive {
             unsafe {
                 unix_signals::kill(pid, unix_signals::SIGKILL);
@@ -1612,19 +1790,14 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_tool_in_dir_sets_child_cwd() {
-        let tmp = std::env::temp_dir().join(format!(
-            "afd_run_tool_in_dir_{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("afd_run_tool_in_dir_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         // Run `pwd` in the tmp dir — if `current_dir` is honored, the output
         // is the canonicalized tmp path; if it is dropped, we get the daemon's
         // cwd which is something else under `cargo test`.
         let out = run_tool_in_dir("pwd", &[], tmp.to_str().unwrap(), 5).unwrap();
         assert!(
-            std::path::Path::new(out.trim())
-                .canonicalize()
-                .unwrap()
+            std::path::Path::new(out.trim()).canonicalize().unwrap()
                 == std::path::Path::new(tmp.to_str().unwrap())
                     .canonicalize()
                     .unwrap(),
@@ -1674,7 +1847,8 @@ mod tests {
 
     #[test]
     fn cwd_guard_fails_closed_when_paths_differ() {
-        let expected = std::env::temp_dir().join(format!("afd_cwd_expected_{}", std::process::id()));
+        let expected =
+            std::env::temp_dir().join(format!("afd_cwd_expected_{}", std::process::id()));
         let actual = std::env::temp_dir().join(format!("afd_cwd_actual_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&expected);
         let _ = std::fs::remove_dir_all(&actual);
@@ -1682,7 +1856,10 @@ mod tests {
         std::fs::create_dir_all(&actual).unwrap();
         let err = check_cwd_guard(Some(&expected), &actual).unwrap_err();
         match err {
-            DaemonError::WorktreeCwdMismatch { expected: e, actual: a } => {
+            DaemonError::WorktreeCwdMismatch {
+                expected: e,
+                actual: a,
+            } => {
                 assert!(e.contains("afd_cwd_expected"));
                 assert!(a.contains("afd_cwd_actual"));
             }
@@ -1690,5 +1867,79 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&expected);
         let _ = std::fs::remove_dir_all(&actual);
+    }
+
+    #[test]
+    fn resolve_beads_db_prefers_explicit_dark_factory_br_db() {
+        // jleechan-9sl1: use the crate-wide `test_env_lock()` shared by every
+        // PATH/env-mutating test module — a module-local lock only
+        // serializes within this module, not against `adapters.rs`'s
+        // `cli_tracker_br_db_tests`, which mutate the same global
+        // `DARK_FACTORY_BR_DB` / `XDG_STATE_HOME` env vars.
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = std::env::temp_dir().join(format!("afd_resolve_db_explicit_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let explicit = tmp.join("custom/beads.db");
+        let xdg = tmp.join("xdg");
+        let xdg_db = xdg.join("dark-factory/.beads/beads.db");
+        std::fs::create_dir_all(xdg_db.parent().unwrap()).unwrap();
+        std::fs::write(&xdg_db, "").unwrap();
+
+        let prior_db = std::env::var_os("DARK_FACTORY_BR_DB");
+        let prior_xdg = std::env::var_os("XDG_STATE_HOME");
+        unsafe {
+            std::env::set_var("DARK_FACTORY_BR_DB", &explicit);
+            std::env::set_var("XDG_STATE_HOME", &xdg);
+        }
+
+        let resolved = resolve_beads_db();
+
+        unsafe {
+            match prior_db {
+                Some(v) => std::env::set_var("DARK_FACTORY_BR_DB", v),
+                None => std::env::remove_var("DARK_FACTORY_BR_DB"),
+            }
+            match prior_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+
+        assert_eq!(resolved, Some(explicit));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn resolve_beads_db_falls_back_to_xdg_state_when_db_exists() {
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = std::env::temp_dir().join(format!("afd_resolve_db_xdg_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let xdg = tmp.join("xdg");
+        let xdg_db = xdg.join("dark-factory/.beads/beads.db");
+        std::fs::create_dir_all(xdg_db.parent().unwrap()).unwrap();
+        std::fs::write(&xdg_db, "").unwrap();
+
+        let prior_db = std::env::var_os("DARK_FACTORY_BR_DB");
+        let prior_xdg = std::env::var_os("XDG_STATE_HOME");
+        unsafe {
+            std::env::remove_var("DARK_FACTORY_BR_DB");
+            std::env::set_var("XDG_STATE_HOME", &xdg);
+        }
+
+        let resolved = resolve_beads_db();
+
+        unsafe {
+            match prior_db {
+                Some(v) => std::env::set_var("DARK_FACTORY_BR_DB", v),
+                None => std::env::remove_var("DARK_FACTORY_BR_DB"),
+            }
+            match prior_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+
+        assert_eq!(resolved, Some(xdg_db));
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

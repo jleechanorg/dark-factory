@@ -33,6 +33,73 @@ def test_ready_pipeline_parses_and_has_required_nodes():
     assert advice_node.attrs.get("command") == "advice"
 
 
+def test_ready_pipeline_gate_advice_is_gate_strict():
+    """gate_advice must set gate_strict="true" so a Codex `verdict: warn`
+    (real disagreement, e.g. NOT APPROVED buried under an AGY-synthesized
+    warn) fails the gate instead of the legacy warn->success mapping
+    silently treating disagreement as approval (2026-08-29 false-positive
+    /factory --pipeline ready run)."""
+    from runner.handler_core import _gate_strict_flag
+
+    graph = parse(Path("pipelines/slim/ready.dot"))
+    advice_node = graph.nodes["gate_advice"]
+    assert _gate_strict_flag(advice_node) is True, (
+        "gate_advice missing gate_strict='true'; a warn verdict from /advice "
+        "would be normalized to success and mask reviewer disagreement."
+    )
+
+
+def test_ready_pipeline_advice_warn_fails_gate(monkeypatch, tmp_path):
+    """End-to-end: a gate_advice lane that returns `verdict: warn` (the
+    AGY-synthesized outcome when its inner Codex review disagrees) must
+    route to `fix`, not `exit`, now that gate_strict is set.
+
+    The fake gate_slash handler below re-runs the real
+    `_gate_strict_flag` + `_parse_verdict` chain that `_gate_slash` uses
+    internally (instead of hardcoding outcome="success"), so this test
+    actually exercises the DOT attribute -> normalization wiring rather
+    than just asserting on a canned Result."""
+    from runner.handler_core import _gate_strict_flag
+    from runner.handler_verdict import _parse_verdict
+
+    pipeline_path = Path("pipelines/slim/ready.dot")
+    graph = parse(pipeline_path)
+
+    def fake_success(node, ctx):
+        return Result(outcome="success", output="verdict: pass")
+
+    def fake_advice_warn(node, ctx):
+        raw, outcome = _parse_verdict(
+            "verdict: warn", gate_strict=_gate_strict_flag(node)
+        )
+        return Result(outcome=outcome, output=f"verdict: {raw}")
+
+    monkeypatch.setitem(TYPE_REGISTRY, "tool", fake_success)
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_es", fake_success)
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_er", fake_success)
+    monkeypatch.setitem(TYPE_REGISTRY, "gate_slash", fake_advice_warn)
+    monkeypatch.setitem(TYPE_REGISTRY, "holdout_eval", fake_success)
+
+    ctx = Context(
+        goal="Drive PR to /ready",
+        workdir=tmp_path,
+        backend="echo",
+        state={
+            "slim.test_command": "echo 'tests passed'",
+            "feature": "ready_feature",
+        },
+    )
+
+    history = run(graph, ctx, max_steps=50)
+    executed_nodes = [step.node for step in history]
+
+    assert "exit" not in executed_nodes, (
+        "gate_advice returned a warn verdict but the pipeline reached exit; "
+        "gate_strict is not being enforced on /advice."
+    )
+    assert "fix" in executed_nodes
+
+
 def test_ready_pipeline_green_execution(monkeypatch, tmp_path):
     pipeline_path = Path("pipelines/slim/ready.dot")
     graph = parse(pipeline_path)

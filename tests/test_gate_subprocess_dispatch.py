@@ -8,13 +8,34 @@ Extracted from tests/test_gates.py per docs/refactor/file-ownership-map.test_gat
 from __future__ import annotations
 
 import os
+import hashlib
 import pathlib
 import sys
+import tempfile
 import pytest
 
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
+
+
+def _canonical_sandboxed_codex_args(argv: list[str]) -> list[str]:
+    return [
+        "sandbox-exec",
+        "-p",
+        (
+            '(version 1)\n(allow default)\n'
+            '(deny file-read* (subpath "/sealed/holdouts"))\n'
+        ),
+        *argv,
+    ]
+
+
+@pytest.fixture
+def private_tmp_path():
+    """Provide a private runtime root for controller transport fixtures."""
+    with tempfile.TemporaryDirectory(prefix="df-gate-dispatch-", dir=pathlib.Path.home()) as root:
+        yield pathlib.Path(root)
 
 
 def test_gate_subprocess_args_routes_codex_to_codex_cli(monkeypatch):
@@ -159,7 +180,9 @@ def test_execute_gate_writes_exact_prompt_sidecar(tmp_path, monkeypatch):
     assert any('"event": "node_prompt"' in line and '"node": "evidence"' in line for line in events)
 
 
-def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkeypatch):
+def test_complete_controller_prompt_is_not_rewrapped_for_shadow(
+    tmp_path, private_tmp_path, monkeypatch
+):
     """Controller-owned review bytes must be identical in every reviewer lane."""
     from runner.handlers import Context as HCtx
     from runner.handler_dispatch import _launch_shadow_gate_review
@@ -173,10 +196,31 @@ def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkey
         def __init__(self, cmd, **kwargs):
             seen.append(cmd)
 
-    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    holdouts = tmp_path / "sealed holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
+    monkeypatch.setattr(
+        "runner.handlers._sandboxed_args", _canonical_sandboxed_codex_args
+    )
+    class _Runtime:
+        run_dir = private_tmp_path / "runtime"
+        codex_home = private_tmp_path / "codex-home"
+        env = {}
+
+    _Runtime.run_dir.mkdir(mode=0o700)
+    _Runtime.codex_home.mkdir(mode=0o700)
+    monkeypatch.setattr("runner.handlers._create_controller_runtime", lambda: _Runtime())
+    monkeypatch.setattr(
+        "runner.handlers._controller_output_schema",
+        lambda run_dir: run_dir / "output-schema.json",
+    )
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)
+    neutral = tmp_path / "controller-cwd"
+    neutral.mkdir()
     ctx = HCtx(goal="untrusted goal", workdir=tmp_path, backend="codex")
+    ctx.state["_df_controller_review_cwd"] = str(neutral)
 
     prompt = "CONTROLLER-OWNED COMPLETE PROMPT"
     shadow = _launch_shadow_gate_review(
@@ -191,22 +235,25 @@ def test_complete_controller_prompt_is_not_rewrapped_for_shadow(tmp_path, monkey
     assert shadow is not None
     assert shadow.prompt_is_complete is True
     assert shadow.prompt == prompt
-    assert shadow.json_transport is True
+    assert shadow.json_transport is True, shadow.launch_error
     assert seen
     assert seen[0][-1] == "-"
     assert "--json" in seen[0]
     assert "--ephemeral" in seen[0]
-    assert "--sandbox" in seen[0]
-    assert "read-only" in seen[0]
+    assert "--disable" in seen[0]
+    assert "shell_tool" in seen[0]
+    assert "unified_exec" in seen[0]
     assert "--yolo" not in seen[0]
     assert "--dangerously-bypass-approvals-and-sandbox" not in seen[0]
-    assert "--ignore-user-config" not in seen[0]
+    assert "--ignore-user-config" in seen[0]
     assert "--ephemeral" in seen[0]
     assert "Normal gate prompt for comparison" not in " ".join(seen[0])
 
 
-def test_launch_shadow_gate_review_uses_controller_cwd_and_sanitized_env(tmp_path, monkeypatch):
-    """Controller-complete shadow launch must run from neutral cwd and
+def test_launch_shadow_gate_review_uses_target_cwd_and_sanitized_env(
+    tmp_path, private_tmp_path, monkeypatch
+):
+    """Controller-complete shadow launch must run from target cwd and
     sanitized environment."""
     from runner.handlers import Context as HCtx
     from runner.handler_dispatch import _launch_shadow_gate_review
@@ -221,9 +268,26 @@ def test_launch_shadow_gate_review_uses_controller_cwd_and_sanitized_env(tmp_pat
             observed["cwd"] = kwargs.get("cwd")
             observed["env"] = kwargs.get("env", {})
 
-    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", "/secret/holdouts")
+    holdouts = tmp_path / "sealed holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
     monkeypatch.setenv("MY_HOLDOUT_SECRET", "sealed")
-    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr(
+        "runner.handlers._sandboxed_args", _canonical_sandboxed_codex_args
+    )
+    class _Runtime:
+        run_dir = private_tmp_path / "runtime"
+        codex_home = private_tmp_path / "codex-home"
+        env = {}
+
+    _Runtime.run_dir.mkdir(mode=0o700)
+    _Runtime.codex_home.mkdir(mode=0o700)
+    monkeypatch.setattr("runner.handlers._create_controller_runtime", lambda: _Runtime())
+    monkeypatch.setattr(
+        "runner.handlers._controller_output_schema",
+        lambda run_dir: run_dir / "output-schema.json",
+    )
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
     monkeypatch.setattr("runner.handler_dispatch.shutil.which", lambda name: "/usr/bin/codex")
     monkeypatch.setattr("runner.handler_dispatch.subprocess.Popen", _FakePopen)
     monkeypatch.setattr(
@@ -231,6 +295,8 @@ def test_launch_shadow_gate_review_uses_controller_cwd_and_sanitized_env(tmp_pat
         lambda: "claude",
     )
 
+    target = tmp_path / "target"
+    target.mkdir()
     neutral = tmp_path / "controller-cwd"
     neutral.mkdir()
     ctx = HCtx(goal="review", workdir=tmp_path / "target", backend="codex")
@@ -247,36 +313,61 @@ def test_launch_shadow_gate_review_uses_controller_cwd_and_sanitized_env(tmp_pat
 
     assert review is not None
     assert review.prompt_is_complete is True
-    assert review.json_transport is True
+    assert review.json_transport is True, review.launch_error
     assert observed.get("cwd") == neutral
+    assert observed.get("cwd") != ctx.workdir
     env = observed.get("env", {})
     assert isinstance(env, dict)
     assert "DARK_FACTORY_HOLDOUTS" not in env
     assert "MY_HOLDOUT_SECRET" not in env
 
 
-def test_controller_codex_args_builds_stdin_transport():
+def test_controller_codex_args_builds_stdin_transport(monkeypatch, tmp_path):
     """Controller transport must use JSON transport on stdin and a neutral cwd."""
     from runner.handler_dispatch import _controller_codex_args
+    holdouts = tmp_path / "sealed holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
     argv = [
         "sandbox-exec",
         "-p",
-        "(version 1)\n(allow default)",
+        (
+            '(version 1)\n(allow default)\n'
+            '(deny file-read* (subpath "/sealed/holdouts"))'
+        ),
         "codex",
         "exec",
         "--skip-git-repo-check",
         "PROMPT",
     ]
-    transformed = _controller_codex_args(argv)
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
+    transformed = _controller_codex_args(argv, read_only_path=tmp_path)
     assert transformed[-1] == "-"
-    assert transformed == [
+    assert transformed[:2] == ["sandbox-exec", "-p"]
+    assert f'(deny file-read* (subpath "{holdouts.resolve()}"))' in transformed[2]
+    assert "(deny file-write*)" in transformed[2]
+    assert transformed[3:] == [
         "codex",
         "exec",
         "--json",
         "--ephemeral",
+        "--ignore-user-config",
         "--skip-git-repo-check",
-        "--sandbox",
-        "read-only",
+        "--disable",
+        "shell_tool",
+        "--disable",
+        "unified_exec",
+        "--disable",
+        "browser_use",
+        "--disable",
+        "computer_use",
+        "--disable",
+        "plugins",
+        "--disable",
+        "shell_snapshot",
+        "--config",
+        'web_search="disabled"',
+        "--ignore-rules",
         "-",
     ]
 
@@ -288,41 +379,63 @@ def test_controller_codex_args_rejects_non_codex_command():
         _controller_codex_args(["claude", "--print", "PROMPT"])
 
 
-def test_controller_codex_args_rejects_unsafe_transport_options():
+def test_controller_codex_args_rejects_unsafe_transport_options(monkeypatch, tmp_path):
     """Unsafe Codex transport options must fail closed before launch."""
     from runner.handler_dispatch import _controller_codex_args
 
-    legacy = _controller_codex_args([
-        "codex",
-        "exec",
-        "--yolo",
-        "--skip-git-repo-check",
-        "PROMPT",
-    ])
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
+    with pytest.raises(ValueError, match="sandbox-exec"):
+        _controller_codex_args([
+            "codex",
+            "exec",
+            "--yolo",
+            "--skip-git-repo-check",
+            "PROMPT",
+        ])
+
+    legacy = _controller_codex_args(
+        _canonical_sandboxed_codex_args([
+            "codex",
+            "exec",
+            "--yolo",
+            "--skip-git-repo-check",
+            "PROMPT",
+        ]),
+        read_only_path=tmp_path,
+    )
     assert "--yolo" not in legacy
 
     with pytest.raises(ValueError, match="unsafe codex flags"):
-        _controller_codex_args([
-            "codex",
-            "exec",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "PROMPT",
-        ])
+        _controller_codex_args(
+            _canonical_sandboxed_codex_args([
+                "codex",
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "PROMPT",
+            ]),
+            read_only_path=tmp_path,
+        )
     with pytest.raises(ValueError, match="read-only"):
-        _controller_codex_args([
-            "codex",
-            "exec",
-            "--sandbox",
-            "read-write",
-            "PROMPT",
-        ])
+        _controller_codex_args(
+            _canonical_sandboxed_codex_args([
+                "codex",
+                "exec",
+                "--sandbox",
+                "read-write",
+                "PROMPT",
+            ]),
+            read_only_path=tmp_path,
+        )
     with pytest.raises(ValueError, match="read-only"):
-        _controller_codex_args([
-            "codex",
-            "exec",
-            "--sandbox=read-write",
-            "PROMPT",
-        ])
+        _controller_codex_args(
+            _canonical_sandboxed_codex_args([
+                "codex",
+                "exec",
+                "--sandbox=read-write",
+                "PROMPT",
+            ]),
+            read_only_path=tmp_path,
+        )
 
 
 def test_launch_shadow_gate_review_rejects_complete_controller_prompt_non_codex_backend(
@@ -398,22 +511,144 @@ def test_execute_gate_uses_controller_codex_transport(tmp_path, monkeypatch):
 
     result = _execute_gate("PROMPT", fake_sha, 300, ctx, "gate_er", "codex")
 
+    assert result.outcome == "error"
+    assert not observed
+
+
+def test_run_gate_once_controller_uses_authenticated_json_verdict_without_sha_echo(
+    tmp_path, monkeypatch
+):
+    """Graph controller PASS must not depend on legacy prose markers."""
+    import json
+    from types import SimpleNamespace
+
+    from runner.handler_dispatch import _run_gate_once
+    from runner.review_controller import EvidenceArtifact, ReviewInputs, create_review_request
+
+    evidence = tmp_path / "evidence.txt"
+    evidence.write_text("proof\n", encoding="utf-8")
+    request = create_review_request(
+        ReviewInputs(
+            repository="example",
+            workspace_path=str(tmp_path),
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            tree_sha="c" * 40,
+            task_text="Review the change.",
+            changed_files=("evidence.txt",),
+            evidence=(
+                EvidenceArtifact(
+                    path="evidence.txt",
+                    size_bytes=evidence.stat().st_size,
+                    sha256=hashlib.sha256(evidence.read_bytes()).hexdigest(),
+                ),
+            ),
+        )
+    )
+    response = json.dumps(
+        {
+            "verdict": "pass",
+            "findings": [],
+            "evidence_checked": ["evidence.txt"],
+            "commands_executed": [],
+            "caveats": [],
+        }
+    )
+    runtime = SimpleNamespace(run_dir=tmp_path, codex_home=tmp_path, env={})
+    ctx = SimpleNamespace(
+        state={
+            "_df_controller_review_json": "true",
+            "_df_controller_review_request": request,
+            "_df_controller_review_cwd": str(tmp_path),
+        },
+        workdir=tmp_path,
+        run_id="run",
+    )
+
+    monkeypatch.setattr("runner.handler_dispatch._gate_subprocess_args", lambda *args: ["codex"])
+    monkeypatch.setattr("runner.handler_dispatch._gate_subprocess_env", lambda *args: {})
+    monkeypatch.setattr("runner.handlers._create_controller_runtime", lambda: runtime)
+    monkeypatch.setattr("runner.handler_dispatch._controller_codex_args", lambda args, **kwargs: args)
+    monkeypatch.setattr("runner.handler_dispatch._start_shadow_gate_review", lambda *args: None)
+    monkeypatch.setattr("runner.handlers._close_pinned_launcher_command", lambda args: None)
+    monkeypatch.setattr("runner.handlers._controller_output_schema", lambda run_dir: tmp_path / "schema.json")
+    monkeypatch.setattr("runner.handler_dispatch.subprocess.run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=0, stdout=json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": response}})
+        + "\n"
+        + json.dumps({"type": "turn.completed"}),
+        stderr="",
+    ))
+    monkeypatch.setattr("runner.handlers._parse_verdict", lambda *args, **kwargs: pytest.fail("legacy parser used"))
+    monkeypatch.setattr("runner.handlers._verify_head_sha_echo", lambda *args, **kwargs: pytest.fail("legacy SHA echo used"))
+
+    result = _run_gate_once("codex", "controller prompt", request.head_sha, 30, ctx, "cold_reviewer")
+
     assert result.outcome == "success"
-    assert observed["input"] == "PROMPT"
-    assert observed["cwd"] == neutral
-    cmd = observed["cmd"]
-    assert isinstance(cmd, list)
-    assert cmd[-1] == "-"
-    assert "--json" in cmd
-    assert "--ephemeral" in cmd
-    assert "--sandbox" in cmd
-    assert "read-only" in cmd
-    assert "--skip-git-repo-check" in cmd
-    assert "--yolo" not in cmd
-    env = observed.get("env", {})
-    assert isinstance(env, dict)
-    assert "DARK_FACTORY_HOLDOUTS" not in env
-    assert "MY_HOLDOUT_SECRET" not in env
+    assert result.metadata["verdict"] == "pass"
+    assert result.metadata["head_sha_status"] == "matched"
+
+
+def test_run_gate_once_controller_rejects_tampered_receipt_and_keeps_failures(
+    tmp_path, monkeypatch
+):
+    """Controller receipt head tampering is an error; a real JSON fail is failure."""
+    import json
+    from types import SimpleNamespace
+
+    from runner.handler_dispatch import _run_gate_once
+    from dataclasses import replace
+
+    from runner.review_controller import ReviewTransportReceipt
+    from tests.test_pr771_transport_hardening import _request
+
+    request = _request(tmp_path)
+    runtime = SimpleNamespace(run_dir=tmp_path, codex_home=tmp_path, env={})
+    ctx = SimpleNamespace(
+        state={
+            "_df_controller_review_json": "true",
+            "_df_controller_review_request": request,
+            "_df_controller_review_cwd": str(tmp_path),
+        },
+        workdir=tmp_path,
+        run_id="run",
+    )
+    fail_response = json.dumps(
+        {
+            "verdict": "fail",
+            "findings": ["blocking finding"],
+            "evidence_checked": ["evidence.txt"],
+            "commands_executed": [],
+            "caveats": [],
+        }
+    )
+    transport = "\n".join(
+        (
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": fail_response}}),
+            json.dumps({"type": "turn.completed"}),
+        )
+    )
+
+    monkeypatch.setattr("runner.handler_dispatch._gate_subprocess_args", lambda *args: ["codex"])
+    monkeypatch.setattr("runner.handler_dispatch._gate_subprocess_env", lambda *args: {})
+    monkeypatch.setattr("runner.handlers._create_controller_runtime", lambda: runtime)
+    monkeypatch.setattr("runner.handler_dispatch._controller_codex_args", lambda args, **kwargs: args)
+    monkeypatch.setattr("runner.handler_dispatch._start_shadow_gate_review", lambda *args: None)
+    monkeypatch.setattr("runner.handlers._close_pinned_launcher_command", lambda args: None)
+    monkeypatch.setattr("runner.handlers._controller_output_schema", lambda run_dir: tmp_path / "schema.json")
+    monkeypatch.setattr("runner.handler_dispatch.subprocess.run", lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=transport, stderr=""))
+
+    failure = _run_gate_once("codex", "controller prompt", request.head_sha, 30, ctx, "cold_reviewer")
+    assert failure.outcome == "failure"
+    assert failure.metadata["verdict"] == "fail"
+
+    receipt = ReviewTransportReceipt.from_request(request, response=fail_response, transport="tool-free")
+    tampered = replace(receipt, head_sha="0" * 40)
+    monkeypatch.setattr(
+        "runner.review_controller.parse_tool_free_codex_jsonl",
+        lambda raw, *, request: (fail_response, tampered),
+    )
+    error = _run_gate_once("codex", "controller prompt", request.head_sha, 30, ctx, "cold_reviewer")
+    assert error.outcome == "error"
 
 
 def test_execute_gate_rejects_controller_request_for_non_codex_backend(
@@ -549,10 +784,14 @@ def test_execute_gate_runs_minimax_with_correct_env(monkeypatch, tmp_path):
 def test_resolve_adversarial_backend_falls_back_to_default_when_post_filter_empty(
     monkeypatch,
 ):
-    """When prefer_adversarial empties the post-filter priority list, the
-    resolver must NOT short-circuit to ``claude-sonnet``; it must probe the
-    default priority (codex, minimax, agy, claude-sonnet) so cross-vendor
-    review is a real subprocess, not a label."""
+    """A lane naming ONLY the coder's own backend keeps that entry.
+
+    ``prefer_adversarial`` demotes rather than drops, so the single entry
+    survives and the resolver returns it even though it is uninstalled.
+    Recovery is ``_execute_gate``'s job: a missing binary is an infra failure
+    that triggers its agy -> claude fallback. Resolving to an installed-but-
+    unrequested vendor here would silently override a controller-review
+    lane's codex-only queue."""
     from runner.handlers import _resolve_gate_backend, Context as HCtx
     from runner.parser import Node
     # All non-claude-sonnet backends are uninstalled; only claude-sonnet
@@ -581,15 +820,19 @@ def test_resolve_adversarial_backend_falls_back_to_default_when_post_filter_empt
         },
     )
     resolved, meta = _resolve_gate_backend(node, ctx)
-    assert resolved == "claude-sonnet"
-    # If the resolver had used the empty-list short-circuit, the skip
-    # list would be empty (nothing was probed). With the default-priority
-    # fallback, the skip list records codex, minimax, agy, and any
-    # earlier default entries that were probed and skipped.
-    skipped = meta["adversarial_skipped"].split(",") if meta["adversarial_skipped"] else []
-    assert "codex" in skipped, (
-        f"empty-list fallback must probe the default priority; "
-        f"skipped list missing 'codex': {skipped!r}"
+
+    # The lane's own entry survives demotion and is returned even though it
+    # is uninstalled -- the resolver never substitutes a vendor the lane did
+    # not ask for. `_execute_gate` owns recovery from the missing binary.
+    assert resolved == "claude", (
+        f"the lane's only entry must survive demotion; got {resolved!r}"
     )
-    assert "minimax" in skipped
-    assert "agy" in skipped
+    assert meta["adversarial_priority"] == "claude", (
+        "the queue must stay exactly what the lane declared; got "
+        f"{meta['adversarial_priority']!r}"
+    )
+    # It was really probed, not assumed present.
+    skipped = meta["adversarial_skipped"].split(",") if meta["adversarial_skipped"] else []
+    assert skipped == ["claude"], (
+        f"the single entry must be probed and recorded as skipped; got {skipped!r}"
+    )

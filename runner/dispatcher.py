@@ -6,7 +6,11 @@ import re
 from typing import List, Optional, Tuple, Dict, Any
 from runner.rule_loader import Rule
 from runner.skeptic_gate_cli import invoke_reviewer as _invoke_reviewer_module_ref
-from runner.skeptic_gate import SkepticResult
+from runner.skeptic_gate import (
+    SkepticResult,
+    IDENTITY_TOKEN_PLACEHOLDER as _IDENTITY_TOKEN_PLACEHOLDER,
+    expected_identity_for_vendor as _expected_identity_for_vendor,
+)
 from runner import skeptic_gate_cli as _cli
 
 # Resolve build_prompt/evaluate/invoke_reviewer through the CLI module
@@ -44,6 +48,30 @@ _RATE_LIMIT_PATTERNS = (
 )
 
 
+# Single source of truth for the per-vendor IDENTITY token lives in
+# runner.skeptic_gate (also used directly by bind_reviewer_identity's
+# REVIEWER_CLI_TO_IDENTITY table), so the prompt instruction and the
+# deterministic bind check can never drift apart. PR #819 round-2: the
+# prompt used to hardcode `IDENTITY: <gemini|codex|claude>`, so a
+# claudem/agy/cursor-agent reviewer following the prompt literally
+# could never declare its own configured vendor name —
+# bind_reviewer_identity then rejected every verdict from a non-codex/
+# gemini vendor.
+#
+# Round-3 first attempt built ONE placeholder-bearing prompt (with the
+# PR diff already spliced in) and retargeted it per vendor via a blind
+# ``str.replace`` over the *entire* assembled prompt+diff blob. That is
+# unsafe: if the diff under review itself contains the placeholder
+# text — which THIS PR's own diff does, since it introduces the
+# ``IDENTITY_TOKEN_PLACEHOLDER`` constant as literal source — the
+# replace also silently rewrites the reviewer's view of the diff.
+# Round-4 fixes this by never searching assembled content at all: the
+# resolved per-vendor identity is threaded into ``build_rule_prompt``
+# at construction time (``.format()``/f-string substitution happens
+# once, before any diff content could be re-scanned), so the prompt is
+# rebuilt fresh per vendor instead of retargeted after the fact.
+
+
 def _detect_rate_limit(err: Optional[str]) -> bool:
     """Return True if ``err`` looks like a rate-limit / quota bust.
 
@@ -57,12 +85,86 @@ def _detect_rate_limit(err: Optional[str]) -> bool:
     return any(p in text for p in _RATE_LIMIT_PATTERNS)
 
 
+# PR #819 round-7 /advice finding (Opus): round-6's self-review pre-filter
+# correctly routes a claudem-authored PR's review to the next queue vendor
+# (typically agy), but the walker used to only advance past a *rate-limit*
+# error — a generic launch/auth failure (missing/unauthenticated CLI,
+# nonzero return code, timeout, or an exception during invocation) dead-
+# ended the walk on that fallback vendor instead of trying the next one,
+# making the round-6 fallback route non-functional in practice for a
+# vendor (like agy) that can be invoked but can't authenticate in this
+# CI-sandboxed path.
+#
+# round-8 /advice finding (Opus, confirmed against skeptic_gate_cli.py:
+# `invoke_reviewer` returns ``proc.stdout`` alongside the error message
+# on ANY nonzero return code — it does not null stdout on failure): the
+# round-7 version of this function keyed on raw ``stdout`` truthiness,
+# so a vendor that printed even one incidental byte (a banner, partial
+# output) before exiting nonzero was treated as "produced a result" and
+# never advanced past — STRICTER than the original rate-limit-only
+# check for the single most common real failure shape. Fixed by keying
+# on whether a genuinely parseable terminal verdict was produced
+# (``parse_verdict(stdout) is not None``), not on stdout's mere
+# presence.
+#
+# round-9 /advice finding (Codex + Opus, independently converged): the
+# REAL evaluation path, ``evaluate()`` in skeptic_gate.py, strips the
+# ``CONTRACT_ECHO:`` block from stdout via ``_strip_contract_echo_block``
+# BEFORE calling ``parse_verdict`` — it never parses raw stdout directly
+# when a contract is in play. Round-8's version of this function parsed
+# raw stdout, so on any contract-enabled run, a vendor that produced a
+# genuine, complete verdict *and* also exited nonzero (contract-echo
+# block still attached) had its stdout wrongly rejected by the strict
+# field parser — a real verdict was misclassified as "vendor
+# unavailable," and the chain-walk kept advancing hunting for a
+# different (possibly more favorable) vendor. Fixed by stripping the
+# contract-echo block first, exactly like ``evaluate()`` does, via the
+# SAME shared helper — the two functions must never diverge on whether
+# a given stdout blob contains a genuine verdict; that divergence IS
+# the bug. ``_strip_contract_echo_block`` is documented to be a no-op
+# when no ``CONTRACT_ECHO:`` block is present, so this is safe to call
+# unconditionally regardless of whether the run is contract-enabled.
+def _detect_vendor_unavailable(err: Optional[str], stdout: Optional[str]) -> bool:
+    """Return True if this vendor's own invocation failed to produce a
+    genuine, parseable terminal verdict — rate limit, missing/
+    unauthenticated CLI, nonzero return code, timeout, a crash mid-write
+    that leaves partial/garbage stdout, or any exception during
+    invocation — so the chain-walk should advance to the next vendor
+    exactly like it already does for a rate-limit bust.
+
+    A vendor whose ``stdout`` parses as a genuine structured verdict
+    (``parse_verdict`` returns non-``None``, after stripping any
+    ``CONTRACT_ECHO:`` block exactly like ``evaluate()`` does) is
+    presumed to have actually run and produced judgeable content — this
+    function only ever returns True when NO such verdict could be
+    parsed, so a real PASS/FAIL is never mistaken for a launch failure
+    and silently retried looking for a more favorable vendor. Keying on
+    raw stdout truthiness (as round-7 did) is unsafe: ``invoke_reviewer``
+    can return non-empty stdout alongside a nonzero return code (a
+    banner, partial output before a crash), so "stdout is non-empty"
+    does not mean "a verdict was produced" (round-8 /advice, Opus).
+    Parsing raw (un-stripped) stdout is also unsafe: a genuine verdict
+    followed by a ``CONTRACT_ECHO:`` block fails the strict field parser
+    unless that block is stripped first, exactly as ``evaluate()``
+    already does (round-9 /advice, Codex + Opus).
+    """
+    if err is None:
+        return False
+    from runner.skeptic_contract_echo import _strip_contract_echo_block
+    from runner.skeptic_gate import parse_verdict
+
+    return parse_verdict(_strip_contract_echo_block(stdout)) is None
+
+
 class VerifierDispatcher:
-    def __init__(self, cheap_reviewer: str = "gemini", cheap_model: str = "gemini-3.7-flash",
-                 premium_reviewer: str = "gemini", premium_model: str = "gemini-3.7-pro"):
-        self.cheap_reviewer = cheap_reviewer
+    def __init__(self, cheap_reviewer: Optional[str] = None, cheap_model: str = "",
+                 premium_reviewer: Optional[str] = None, premium_model: str = ""):
+        from runner.reviewer_priority import skeptic_reviewer_priority
+        priority = list(skeptic_reviewer_priority())
+        default_reviewer = priority[0] if priority else "claudem"
+        self.cheap_reviewer = cheap_reviewer or default_reviewer
         self.cheap_model = cheap_model
-        self.premium_reviewer = premium_reviewer
+        self.premium_reviewer = premium_reviewer or default_reviewer
         self.premium_model = premium_model
 
     def match_glob(self, file_path: str, glob_pattern: str) -> bool:
@@ -97,7 +199,34 @@ class VerifierDispatcher:
                     return True
         return False
 
-    def build_rule_prompt(self, rule: Rule, repo: str, pr_number: int, head_sha: str, base_sha: str, diff: str, implementation_identity: str, contract=None) -> str:
+    def build_rule_prompt(
+        self,
+        rule: Rule,
+        repo: str,
+        pr_number: int,
+        head_sha: str,
+        base_sha: str,
+        diff: str,
+        implementation_identity: str,
+        contract=None,
+        reviewer_identity: Optional[str] = None,
+    ) -> str:
+        """Build the full prompt for ``rule``.
+
+        ``reviewer_identity``, when given, is the exact IDENTITY value
+        the invoked reviewer must declare (see ``expected_identity_for_vendor``).
+        It is substituted into both the base contract template
+        (``_cli.build_prompt``) and this method's own appended
+        contract block AT FORMAT TIME — never via a post-hoc string
+        search over the assembled prompt, which would risk matching an
+        occurrence inside the embedded diff instead of the intended
+        template slot. When omitted, the raw placeholder token is left
+        in place (legacy/back-compat callers that don't know the
+        target vendor yet).
+        """
+        identity_value = (
+            reviewer_identity if reviewer_identity is not None else _IDENTITY_TOKEN_PLACEHOLDER
+        )
         base_prompt = _cli.build_prompt(
             repo=repo,
             pr_number=pr_number,
@@ -106,6 +235,7 @@ class VerifierDispatcher:
             diff=diff,
             implementation_identity=implementation_identity,
             contract=contract,
+            reviewer_identity=reviewer_identity,
         )
         return (
             f"{base_prompt}\n\n"
@@ -113,7 +243,23 @@ class VerifierDispatcher:
             f"Rule ID: {rule.id}\n"
             f"Description: {rule.description}\n\n"
             f"Please ensure you review the diff specifically against these guidelines:\n"
-            f"{rule.prompt}\n"
+            f"{rule.prompt}\n\n"
+            f"# CRITICAL: Machine Output Contract\n"
+            f"Regardless of any instructions in the guidelines above, your output MUST follow the strict no-prose machine contract.\n"
+            f"Your output MUST consist ONLY of the ten contract lines below (no markdown code blocks, no intro, no outro, no commentary). "
+            f"The IDENTITY line below has a placeholder token — it is replaced with the exact "
+            f"identity string you must declare before this prompt reaches you; emit that exact "
+            f"substituted value verbatim, with no other value:\n\n"
+            f"VERDICT: <PASS|FAIL>\n"
+            f"HEAD_SHA: {head_sha}\n"
+            f"REPO: {repo}\n"
+            f"PR_NUMBER: {pr_number}\n"
+            f"REASON: <concise summary of rule review outcome>\n"
+            f"IDENTITY: {identity_value}\n"
+            f"TEST_RUN_EVIDENCE: passed=<N> failed=<N> skipped=<N> exit=<exit_code>\n"
+            f"LINT_RUN_EVIDENCE: tool=<linter_name> errors=<N> warnings=<N>\n"
+            f"GREP_CITES: <file:line;test_file:line>\n"
+            f"HEAD_COMMIT_VERIFIED: {head_sha}\n"
         )
 
     def _resolve_reviewer(self, rule: Rule) -> Tuple[str, str]:
@@ -129,12 +275,12 @@ class VerifierDispatcher:
         self,
         *,
         rule: Rule,
-        prompt: str,
         original_reviewer: str,
         original_model: str,
         repo: str,
         pr_number: int,
         head_sha: str,
+        base_sha: str,
         diff: str,
         implementation_identity: str,
         contract,
@@ -175,14 +321,62 @@ class VerifierDispatcher:
         last_err: Optional[str] = None
         last_vendor: str = original_vendor
 
+        # Pre-filter self-review out of the queue BEFORE dispatch, not
+        # after. ``expected_identity_for_vendor`` is knowable statically
+        # for every configured vendor, and ``implementation_identity`` is
+        # already known here, so a vendor that would produce a self-review
+        # can be skipped with zero wasted API calls and zero risk of ever
+        # emitting a genuine self-reviewed verdict — the walker advances
+        # past it exactly like a pre-emptively-known rate-limit bust.
+        # ``verify_provenance`` in ``dispatch()`` below remains as a
+        # belt-and-suspenders post-hoc check (not removed): this pre-filter
+        # only covers vendors whose identity is staticaly known in advance
+        # via ``expected_identity_for_vendor``; any path that bypasses it
+        # (or a vendor whose actual declared identity differs from its
+        # expected one) still needs the terminal safety net.
+        implementation_identity_norm = (implementation_identity or "").strip().lower() or "unknown"
+        self_review_vendors = [
+            v for v in queue if _expected_identity_for_vendor(v) == implementation_identity_norm
+        ]
+        queue = [
+            v for v in queue if _expected_identity_for_vendor(v) != implementation_identity_norm
+        ]
+        if not queue:
+            skipped = ", ".join(self_review_vendors) if self_review_vendors else "(none configured)"
+            reason = (
+                f"all configured reviewers share the implementer's identity "
+                f"('{implementation_identity_norm}'); reviewers skipped as "
+                f"self-review: {skipped}. Add a differently-identified "
+                f"reviewer to skeptic_reviewer_priority.json."
+            )
+            return SkepticResult(
+                check_state="failure",
+                verdict=None,
+                reason=reason,
+                comment_body="",
+                parsed=None,
+                reviewer=self_review_vendors[-1] if self_review_vendors else original_vendor,
+            )
+
         for vendor in queue:
             last_vendor = vendor
             try:
-                stdout, err = _cli.invoke_reviewer(vendor, original_model, prompt)
+                vendor_prompt = self.build_rule_prompt(
+                    rule,
+                    repo,
+                    pr_number,
+                    head_sha,
+                    base_sha,
+                    diff,
+                    implementation_identity,
+                    contract=contract,
+                    reviewer_identity=_expected_identity_for_vendor(vendor),
+                )
+                stdout, err = _cli.invoke_reviewer(vendor, original_model, vendor_prompt)
             except Exception as exc:
                 stdout = None
                 err = str(exc)
-            if err and _detect_rate_limit(err):
+            if _detect_vendor_unavailable(err, stdout):
                 last_err = err
                 # Hard cap: the queue length is the upper bound on
                 # retries. The for-loop already enforces this.
@@ -244,9 +438,6 @@ class VerifierDispatcher:
         results: List[Tuple[Rule, SkepticResult]] = []
 
         def run_one(rule: Rule) -> Tuple[Rule, SkepticResult]:
-            prompt = self.build_rule_prompt(
-                rule, repo, pr_number, head_sha, base_sha, diff, implementation_identity, contract=contract
-            )
             reviewer, model = self._resolve_reviewer(rule)
 
             # Chain-walk: try the resolved reviewer; on rate-limit,
@@ -255,14 +446,17 @@ class VerifierDispatcher:
             # exhausted). The original invoke+evaluate single call is
             # encapsulated in ``_chain_walk_reviewer`` so the surface
             # here is just "invoke once, but resilient to vendor busts".
+            # ``_chain_walk_reviewer`` builds the actual per-vendor
+            # prompt itself (see its docstring / round-4 note) so no
+            # placeholder-bearing prompt is built here.
             res = self._chain_walk_reviewer(
                 rule=rule,
-                prompt=prompt,
                 original_reviewer=reviewer,
                 original_model=model,
                 repo=repo,
                 pr_number=pr_number,
                 head_sha=head_sha,
+                base_sha=base_sha,
                 diff=diff,
                 implementation_identity=implementation_identity,
                 contract=contract,

@@ -43,7 +43,23 @@ _VERDICT_NORMALIZE = {
     "approved": "success",
     "fail": "failure",
     "partial": "failure",
-    "inconclusive": "failure",
+    # "inconclusive" is NOT a rejection — it means the reviewer could not
+    # reach a verdict at all (no finding to act on). Conflating it with
+    # "failure" is exactly the dark-factory#828 defect: an inconclusive
+    # gate routed to the `fix` node, which then improvised destructively
+    # with nothing real to fix. Maps to "error" (NOT a new outcome bucket):
+    # `runner.engine_observability._normalized_result` re-buckets EVERY
+    # handler outcome through `runner._classify._classify_outcome` before
+    # DOT-edge routing ever sees it, and that classifier only recognizes
+    # {success, partial, error, failure} — an invented "inconclusive"
+    # outcome would silently collapse back into "failure" there, making
+    # this fix a no-op (caught by actually running the pipeline end-to-end,
+    # not just unit-testing `_parse_verdict` in isolation). "error" is an
+    # EXISTING safe bucket that survives that re-bucketing unchanged and
+    # already carries "infra state, not a verdict disagreement" semantics
+    # (see `_HEAD_SHA_ECHO_RE` comment below) — a null/inconclusive verdict
+    # fits that same shape.
+    "inconclusive": "error",
     "insufficient": "failure",
     "invalid": "failure",
     "incomplete": "failure",
@@ -127,6 +143,34 @@ _STANDALONE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# dark-factory#828 exact incident shape: a gate rendered its verdict-marker
+# template but the substitution produced a NULL SENTINEL (`VERDICT: None`)
+# instead of a real token — e.g. a Python ``None`` object stringified into
+# the template. Matched PER-LINE (not with re.MULTILINE over the whole
+# body) against the single line already known to contain a marker, so a
+# leading "**" or trailing "**"/punctuation around the marker doesn't
+# defeat the anchor. Deliberately narrow: only an EMPTY remainder or one of
+# none/null/n-a counts as null; any other unrecognized remainder (e.g.
+# "REQUEST CHANGES") does NOT match here and stays the conservative
+# "failure" fail-safe in `_parse_verdict`.
+_NULL_VERDICT_RE = re.compile(
+    r"(?:verdict|overall|normalized)\s*:\s*[^\w\n]*(?:none|null|n/?a)?[^\w\n]*$",
+    re.IGNORECASE,
+)
+
+
+def _marker_remainder_is_null(body: str) -> bool:
+    """Return True iff the LAST verdict-marker line's remainder is a null
+    sentinel (empty/"none"/"null"/"n/a") rather than unrecognized prose.
+
+    "Last marker wins" mirrors the convention used by `_MARKER_RE` /
+    `_parse_verdict` elsewhere in this module.
+    """
+    marker_lines = [ln for ln in body.splitlines() if _MARKER_PRESENT_RE.search(ln)]
+    if not marker_lines:
+        return False
+    return bool(_NULL_VERDICT_RE.search(marker_lines[-1]))
+
 
 def _parse_verdict(text: str, *, gate_strict: bool = False) -> tuple[str, str]:
     """Extract a normalized verdict from gate output.
@@ -135,10 +179,12 @@ def _parse_verdict(text: str, *, gate_strict: bool = False) -> tuple[str, str]:
       1. Look for explicit marker lines (`Verdict: PASS`). The LAST valid marker
          wins — gates may emit progress lines before the authoritative one.
       2. If a marker word was present but no matching token followed it,
-         return ("unknown", "failure") — do NOT fall back; the gate's own
-         marker line is the contract.
+         return ("unknown", "failure") — conservative fail-safe — UNLESS
+         the remainder is a null sentinel (see below), which returns
+         ("null", "error") instead.
       3. With no marker at all, scan the last 40 lines for a *standalone*
-         verdict token (not embedded in prose).
+         verdict token (not embedded in prose). No standalone match either
+         → ("unknown", "failure") — conservative fail-safe.
 
     Args:
       text: Gate output text to parse.
@@ -147,7 +193,18 @@ def _parse_verdict(text: str, *, gate_strict: bool = False) -> tuple[str, str]:
         DOT attribute (see jleechan-9ia / F6). Default False preserves the
         legacy warn→success mapping so existing graphs do not regress.
 
-    Returns (raw_verdict, normalized_outcome). Unknown returns ("unknown", "failure").
+    Returns (raw_verdict, normalized_outcome). Most unparseable cases keep
+    the conservative "failure" fail-safe (e.g. a reviewer writing real but
+    unrecognized prose like "Verdict: REQUEST CHANGES" stays a blocker).
+    The one deliberate exception (dark-factory#827/#828) is a verdict
+    marker whose remainder is a **null sentinel** (empty, "none", "null",
+    "n/a") — e.g. `VERDICT: None`, the exact incident shape where a
+    template substitution echoed Python's ``None`` instead of a real
+    token. That is "the reviewer produced no verdict at all", not a
+    rejection, and grades as ("null", "error") — "error" (not a fabricated
+    third outcome bucket) so callers do not route it to a fix/coder node
+    with nothing actionable to act on. See `_VERDICT_NORMALIZE["inconclusive"]`
+    above for why "error", not "inconclusive", is the target bucket.
     """
     body = text or ""
     matches = list(_MARKER_RE.finditer(body))
@@ -156,7 +213,11 @@ def _parse_verdict(text: str, *, gate_strict: bool = False) -> tuple[str, str]:
         return raw, _normalize_outcome(raw, gate_strict=gate_strict)
 
     if _MARKER_PRESENT_RE.search(body):
-        # A verdict marker existed but with an invalid token — refuse to guess.
+        # A verdict marker existed but with an invalid token — refuse to
+        # guess. Distinguish a null-sentinel remainder (nothing was
+        # decided) from other unparseable prose (conservative fail-safe).
+        if _marker_remainder_is_null(body):
+            return "null", "error"
         return "unknown", "failure"
 
     tail = "\n".join(body.splitlines()[-40:])

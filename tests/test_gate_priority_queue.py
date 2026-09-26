@@ -58,9 +58,11 @@ def test_adversarial_priority_picks_first_installed(monkeypatch):
     assert gate_meta["prefer_adversarial"] == "false"
 
 
-def test_adversarial_priority_skips_coder_backend_when_prefer_adversarial(monkeypatch):
-    """prefer_adversarial: true drops the run-level coder backend from the
-    queue so a `claude` coder run never gets a `claude` reviewer."""
+def test_adversarial_priority_demotes_coder_backend_when_prefer_adversarial(monkeypatch):
+    """prefer_adversarial: true DEMOTES the run-level coder backend to last
+    rather than dropping it. Any other installed entry still wins, so a
+    `claude` coder run gets a `claude` reviewer only when nothing else is
+    available -- see the companion test below."""
     from runner.handlers import (
         _resolve_adversarial_backend,
         _resolve_gate_backend,
@@ -94,12 +96,47 @@ def test_adversarial_priority_skips_coder_backend_when_prefer_adversarial(monkey
     )
     backend, gate_meta = _resolve_gate_backend(node, ctx)
     assert backend == "codex", (
-        f"prefer_adversarial must drop the coder backend; got {backend!r}"
+        f"prefer_adversarial must demote the coder backend; got {backend!r}"
     )
-    assert "claude" not in gate_meta["adversarial_priority"].split(","), (
-        f"the post-filter priority list must not contain 'claude'; got {gate_meta['adversarial_priority']!r}"
+    ordered = gate_meta["adversarial_priority"].split(",")
+    assert "claude" in ordered, (
+        f"the coder backend must be demoted, not removed; got {ordered!r}"
+    )
+    assert ordered.index("claude") > ordered.index("codex"), (
+        f"the coder backend must rank below the other lane entries; got {ordered!r}"
     )
     assert gate_meta["prefer_adversarial"] == "true"
+
+
+def test_prefer_adversarial_reviews_on_coder_backend_when_it_is_the_only_option(
+    monkeypatch,
+):
+    """Demotion, not exclusion: when the coder's backend is the only installed
+    entry, the lane reviews on it instead of escaping to a vendor nobody put
+    in the queue. The old hard filter emptied the list here and fell through
+    to the default priority, which reached for codex first -- the expensive
+    default this change exists to avoid.
+    """
+    from runner.handlers import _resolve_gate_backend, Context as HCtx
+
+    ctx = HCtx(goal="test", workdir=pathlib.Path("/tmp"), backend="minimax")
+    monkeypatch.setattr(
+        "runner.handlers._probe_backend_installed",
+        lambda name: name == "minimax",
+    )
+
+    node = _priority_node(
+        ["minimax", "codex"], prefer_adversarial=True, name="evidence"
+    )
+    backend, meta = _resolve_gate_backend(node, ctx)
+
+    assert backend == "minimax", (
+        f"the only installed backend must be used, not skipped; got {backend!r}"
+    )
+    assert "codex" in meta["adversarial_skipped"].split(","), (
+        "codex must have been probed and skipped as uninstalled, "
+        f"got skipped={meta['adversarial_skipped']!r}"
+    )
 
 
 def test_adversarial_priority_env_override_honored(monkeypatch):

@@ -655,11 +655,16 @@ def test_controller_review_codex_unavailable_fails_closed(monkeypatch, tmp_path)
     assert attempts == ["codex"]
 
 
-def test_controller_codex_transport_strips_outer_sandbox_exec():
-    """_build_controller_codex_transport strips any outer sandbox-exec wrapper
-    so `codex exec --sandbox read-only` runs natively."""
+def test_controller_codex_transport_replaces_permissive_outer_sandbox_exec(
+    monkeypatch, tmp_path
+):
+    """A permissive outer profile is replaced with the owned profile."""
     from runner.handler_dispatch import _build_controller_codex_transport
 
+    monkeypatch.setattr("runner.handler_dispatch.sys.platform", "darwin")
+    holdouts = tmp_path / "sealed holdouts"
+    holdouts.mkdir()
+    monkeypatch.setenv("DARK_FACTORY_HOLDOUTS", str(holdouts))
     sandboxed_argv = [
         "/usr/bin/sandbox-exec",
         "-p",
@@ -670,9 +675,9 @@ def test_controller_codex_transport_strips_outer_sandbox_exec():
         "--skip-git-repo-check",
         "prompt text",
     ]
-    transport = _build_controller_codex_transport(sandboxed_argv)
+    transport = _build_controller_codex_transport(sandboxed_argv, read_only_path=tmp_path)
 
-    assert transport[0] == "codex"
-    assert transport[1] == "exec"
-    assert "--sandbox" in transport
-    assert "read-only" in transport
+    assert transport[:2] == ["/usr/bin/sandbox-exec", "-p"]
+    assert '(version 1)' in transport[2]
+    assert f'(deny file-read* (subpath "{holdouts.resolve()}"))' in transport[2]
+    assert "(deny file-write*)" in transport[2]

@@ -114,3 +114,50 @@ def test_gate_slash_runs_named_command(tmp_path, monkeypatch):
     assert "# /zfc review" in seen_prompts[0]
     assert f"head_sha: {fake_sha}" in seen_prompts[0]
     assert "verdict: <pass|warn|fail|partial>" in seen_prompts[0]
+
+
+def test_gate_slash_warn_verdict_strict_forwarding(tmp_path, monkeypatch):
+    """Real `_gate_slash` (not a TYPE_REGISTRY fake) must actually forward
+    node.attrs["gate_strict"] through `_execute_gate` -> `_run_gate_once` ->
+    `_parse_verdict`, so a `verdict: warn` reviewer response normalizes to
+    `failure` when gate_strict="true" and to `success` when it is absent.
+
+    tests/test_pipeline_ready.py::test_ready_pipeline_advice_warn_fails_gate
+    exercises `_gate_strict_flag`/`_parse_verdict` directly via a fake
+    TYPE_REGISTRY["gate_slash"] handler — it would still pass even if the
+    real `_gate_slash` stopped forwarding `gate_strict` into `_execute_gate`.
+    This test closes that gap by calling the real `_gate_slash` function
+    (mocking only `subprocess.run`, per the pattern above)."""
+    import subprocess as _sp
+    from runner.handlers import _gate_slash, Context as HCtx
+
+    cmd_dir = tmp_path / ".claude" / "commands"
+    cmd_dir.mkdir(parents=True)
+    (cmd_dir / "advice.md").write_text("# /advice review")
+
+    fake_sha = "e" * 40
+
+    def _fake_run(cmd, **kwargs):
+        return _sp.CompletedProcess(
+            cmd, 0, stdout=f"head_sha: {fake_sha}\nverdict: warn\n", stderr=""
+        )
+
+    monkeypatch.setattr("runner.handlers._worktree_head_sha", lambda p: fake_sha)
+    monkeypatch.setattr("runner.handlers._sandboxed_args", lambda a: a)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    ctx = HCtx(goal="test", workdir=tmp_path, backend="claude")
+
+    strict_node = make_node(name="lane", command="advice", gate_strict="true")
+    strict_result = _gate_slash(strict_node, ctx)
+    assert strict_result.outcome == "failure", (
+        "real _gate_slash with gate_strict='true' must normalize a warn "
+        "verdict to failure, not silently pass it through as success"
+    )
+
+    lenient_node = make_node(name="lane", command="advice")
+    lenient_result = _gate_slash(lenient_node, ctx)
+    assert lenient_result.outcome == "success", (
+        "sanity check: without gate_strict, the legacy warn->success mapping "
+        "still applies via the real _gate_slash path"
+    )

@@ -1,0 +1,3 @@
+[2026-08-31 15:42:21] [START] LOG_DIR was unset; using task-scoped fallback .agent-logs/snapshot_fingerprint_fix
+[2026-08-31 15:42:36] [ENGINE] Skills invoked: systematic debugging, TDD, SOLID, ponytail
+[2026-08-31 15:43:07] [ENGINE] Root-cause trace: b9 snapshot fingerprint includes working tree diff but copied snapshot git index can classify pre-existing target changes differently, creating false mutation.

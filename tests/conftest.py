@@ -175,6 +175,16 @@ def _declare_test_environment() -> None:
     # found" for `@pipelines/_base.dot`. Set it to the install root (parent of
     # this conftest).
     os.environ.setdefault("DARK_FACTORY_HOME", str(ROOT))
+    # DARK_FACTORY_VIA_AF: the whole pre-existing test suite (chain-walk,
+    # vendor-support, and parity tests) was written against the /af
+    # daemon's claudem-first `reviewer_priority` list, which is what
+    # `runner.reviewer_priority.skeptic_reviewer_priority()` returns when
+    # this is truthy. Default it "on" for the ambient test session so
+    # those tests keep exercising the list they were written for; tests
+    # that specifically exercise the manual/codex-first path use
+    # `monkeypatch.delenv("DARK_FACTORY_VIA_AF", raising=False)`, which
+    # pytest restores after each test.
+    os.environ.setdefault("DARK_FACTORY_VIA_AF", "1")
 
 
 # Registry of module-level SCRATCH workdirs created by tests that

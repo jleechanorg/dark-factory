@@ -36,8 +36,58 @@ class TestSkepticIntegration(unittest.TestCase):
             node.attrs = {}
             
             res = _gate_skeptic(node, ctx)
-            
+
             # Assertions
             self.assertEqual(res.outcome, "success")
             self.assertEqual(res.output, "Consolidated Report")
             self.assertEqual(res.metadata["verdict"], "PASS")
+
+    @patch("runner.rule_loader.RuleLoader")
+    @patch("runner.scm_provider.LocalGitScm")
+    @patch("runner.dispatcher.VerifierDispatcher")
+    @patch("runner.consensus.ConsensusAggregator")
+    def test_gate_skeptic_null_verdict_is_inconclusive_not_failure(
+        self, mock_aggregator, mock_dispatcher, mock_scm, mock_loader
+    ):
+        """Issue #827 Defect 1: an absent/unparseable verdict (`None`) must
+        be scored as `outcome="inconclusive"`, never `outcome="failure"` —
+        the two are different events (no verdict vs. a real rejection) and
+        gates.dot must be able to route them differently (`fix` has nothing
+        to fix on an inconclusive review)."""
+        mock_loader_instance = MagicMock()
+        mock_loader.return_value = mock_loader_instance
+        mock_loader_instance.load_rules.return_value = [MagicMock(id="rule1")]
+
+        mock_scm_instance = MagicMock()
+        mock_scm.return_value = mock_scm_instance
+        mock_scm_instance.get_changed_files.return_value = ["src/main.rs"]
+        mock_scm_instance.get_diff.return_value = "diff content"
+
+        mock_dispatcher_instance = MagicMock()
+        mock_dispatcher.return_value = mock_dispatcher_instance
+        mock_dispatcher_instance.dispatch.return_value = [("rule1", MagicMock())]
+
+        mock_aggregator_instance = MagicMock()
+        mock_aggregator.return_value = mock_aggregator_instance
+        # Mirrors ConsensusAggregator.aggregate()'s `has_invalid` branch:
+        # compile_report returns verdict=None with a rendered
+        # "VERDICT: None" body (verbatim from issue #827's CXDB evidence).
+        mock_aggregator_instance.compile_report.return_value = (
+            None, "## Skeptic Gate — `None`\n\n**VERDICT: None**",
+        )
+
+        ctx = Context(goal="test", workdir=MagicMock(), backend="ao")
+        with patch("runner.handler_universal_prompts._handlers_shim._worktree_head_sha", return_value="head_sha_value"):
+            node = MagicMock()
+            node.name = "gate_skeptic"
+            node.attrs = {}
+
+            res = _gate_skeptic(node, ctx)
+
+            self.assertEqual(res.outcome, "inconclusive")
+            self.assertNotEqual(res.outcome, "failure")
+            self.assertIsNone(res.metadata["verdict"])
+            # gates.dot routes on this metadata flag, not `outcome` — the
+            # engine normalizes `outcome="inconclusive"` to the "failure"
+            # bucket before edge conditions ever see it.
+            self.assertEqual(res.metadata["no_verdict"], "true")
