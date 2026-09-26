@@ -1945,6 +1945,136 @@ mod graphql_rate_limit_circuit_breaker_tests {
             "a non-rate-limit error at the hypothetical 6th site must not trip the breaker"
         );
     }
+
+    /// Bead rev-x92c8 REGRESSION PIN. Live symptom: the daemon emitted
+    /// `GH_CIRCUIT_BREAKER_OPENED reason=primary_rate_limit
+    /// retry_after_secs=null` every few seconds while GitHub quota was
+    /// healthy -- `gh api rate_limit` reported core 2692/5000 and graphql
+    /// 4209/5000 remaining at the same moment. Root cause: the shared
+    /// classifier matched the bare tokens `rate limit` / `rate_limit` /
+    /// `ratelimit` / `retry-after` anywhere in stderr, so failures that only
+    /// MENTION rate limiting were laundered into a primary-quota trip.
+    ///
+    /// Each case below carries healthy-quota or non-quota evidence and must
+    /// (a) not trip the breaker, and (b) classify under its own reason
+    /// string, never `primary_rate_limit`.
+    #[test]
+    fn healthy_quota_non_rate_limit_gh_failures_do_not_trip_breaker() {
+        use crate::gh_circuit_breaker::classify_gh_failure;
+
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("healthy_quota", _guard);
+
+        let cases: &[(&str, i32, &str)] = &[
+            // The `gh api rate_limit` quota probe itself timing out: the
+            // probe URL contains "rate_limit", which used to be enough.
+            (
+                "gh: Get \"https://api.github.com/rate_limit\": net/http: request canceled (Client.Timeout exceeded while awaiting headers)",
+                1,
+                "gh_timeout",
+            ),
+            // A permission 403 that echoes response headers proving the
+            // quota is FINE (4209 of 5000 left).
+            (
+                "HTTP 403: Resource not accessible by integration\nx-ratelimit-limit: 5000\nx-ratelimit-remaining: 4209",
+                1,
+                "gh_forbidden",
+            ),
+            // The breaker's OWN suppression stderr, previously re-read as a
+            // fresh GitHub primary-limit signal (self-feeding trip loop).
+            (
+                "gh call suppressed by rate limit circuit breaker (cooldown active for 47s until epoch 1756000000, suppressed_calls=3)",
+                403,
+                "circuit_breaker_suppressed",
+            ),
+            // Plain transport failure.
+            ("gh: connection refused", 1, "gh_network_error"),
+            // Empty/garbage response.
+            ("gh: unexpected empty response from api.github.com", 1, "gh_network_error"),
+        ];
+
+        for (stderr, rc, expected_reason) in cases {
+            clear_graphql_rate_limited();
+            let kind = classify_gh_failure(stderr, *rc);
+            assert_eq!(
+                kind.reason(),
+                *expected_reason,
+                "stderr {stderr:?} must classify as {expected_reason}, got {}",
+                kind.reason()
+            );
+            assert!(
+                !kind.is_rate_limit(),
+                "stderr {stderr:?} is not a GitHub rate limit"
+            );
+            assert!(
+                crate::gh_circuit_breaker::parse_rate_limit_error(stderr, *rc).is_none(),
+                "stderr {stderr:?} must produce no rate-limit signal"
+            );
+
+            let err = DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: *rc,
+                stderr: (*stderr).to_string(),
+            };
+            let tripped = detect_and_mark_graphql_rate_limit(&err, Duration::from_secs(60));
+            assert!(!tripped, "stderr {stderr:?} must not be treated as a rate limit");
+            assert!(
+                !is_graphql_rate_limited(),
+                "breaker must stay closed for {stderr:?} while quota is healthy"
+            );
+        }
+        clear_graphql_rate_limited();
+    }
+
+    /// Bead rev-x92c8 counterpart: tightening the classifier must NOT make
+    /// the breaker blind to real exhaustion. Includes the 2026-08-17 shape
+    /// (quota exhaustion delivered as a 403, the inverse misread of this
+    /// bug) and a zero-remaining header.
+    #[test]
+    fn real_rate_limit_signals_still_trip_breaker() {
+        use crate::gh_circuit_breaker::classify_gh_failure;
+
+        let _guard = crate::test_env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _sandbox = BreakerSandbox::new("real_rate_limit", _guard);
+
+        let cases: &[(&str, i32, &str)] = &[
+            ("gh: API rate limit exceeded for installation ID 99999", 1, "primary_rate_limit"),
+            ("gh: GraphQL API rate limit already exceeded", 1, "primary_rate_limit"),
+            // 2026-08-17: real exhaustion arriving as a 403.
+            ("HTTP 403: rate limit hit for user ID 42", 1, "primary_rate_limit"),
+            (
+                "HTTP 403: Resource protected\nx-ratelimit-limit: 5000\nx-ratelimit-remaining: 0",
+                1,
+                "primary_rate_limit",
+            ),
+            ("gh: {\"errors\":[{\"type\":\"RATE_LIMITED\"}]}", 1, "primary_rate_limit"),
+            (
+                "HTTP 403: You have exceeded a secondary rate limit. Please wait 2 minutes before you try again.",
+                1,
+                "secondary_rate_limit",
+            ),
+        ];
+
+        for (stderr, rc, expected_reason) in cases {
+            clear_graphql_rate_limited();
+            assert_eq!(
+                classify_gh_failure(stderr, *rc).reason(),
+                *expected_reason,
+                "stderr {stderr:?} must classify as {expected_reason}"
+            );
+            let err = DaemonError::Tool {
+                tool: "gh".to_string(),
+                rc: *rc,
+                stderr: (*stderr).to_string(),
+            };
+            assert!(
+                detect_and_mark_graphql_rate_limit(&err, Duration::from_secs(60)),
+                "stderr {stderr:?} is a real rate limit and must trip the breaker"
+            );
+            assert!(is_graphql_rate_limited(), "breaker must be open for {stderr:?}");
+        }
+        clear_graphql_rate_limited();
+    }
 }
 
 
