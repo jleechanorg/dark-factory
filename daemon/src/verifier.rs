@@ -1545,6 +1545,7 @@ mod tests {
             coderabbit_approved: true,
             bugbot_error_count: 0,
             unresolved_thread_count: Some(0),
+            unresolved_threads: Some(Vec::new()),
             head_sha: "deadbeef".into(),
             body: "".into(),
             comments: vec![],
@@ -1577,6 +1578,7 @@ mod tests {
             coderabbit_approved: true,
             bugbot_error_count: 0,
             unresolved_thread_count: None, // Unknown - GraphQL failed
+            unresolved_threads: None,
             head_sha: "deadbeef".into(),
             body: "".into(),
             comments: vec![],
