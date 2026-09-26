@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the jleechanorg PR repair sweep every 30 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/30:00
+Persistent=true
+Unit=jleechanorg-pr-green-daily.service
+
+[Install]
+WantedBy=timers.target

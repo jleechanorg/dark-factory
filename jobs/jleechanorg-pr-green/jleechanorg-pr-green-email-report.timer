@@ -1,0 +1,10 @@
+[Unit]
+Description=Run daily jleechanorg PR repair email report
+
+[Timer]
+OnCalendar=*-*-* 08:30:00
+Persistent=true
+Unit=jleechanorg-pr-green-email-report.service
+
+[Install]
+WantedBy=timers.target
