@@ -352,7 +352,8 @@ pub fn is_minimax_api_url(url_str: &str) -> bool {
 /// Detect whether `cmd` is an intended direct AI CLI program by inspecting its binary basename.
 /// Direct CLI programs:
 /// - `codex` -> `AiProvider::Codex`
-/// - `claude`, `claude-sonnet` -> `AiProvider::MiniMax` if explicitly indicated by `extra_env`,
+/// - `agy`, `antigravity`, `gemini` -> `AiProvider::Antigravity`
+/// - `claude`, `claude-sonnet`, `cursor-agent`, `agentf`, `cursor` -> `AiProvider::MiniMax` if explicitly indicated by `extra_env`,
 ///   otherwise `AiProvider::Claude`.
 ///   Normal non-AI commands (e.g. `git`, `br`, `gh`, `sh`, `cargo`) return `None`.
 pub fn detect_direct_cli_provider(cmd: &str, extra_env: &[(&str, &str)]) -> Option<AiProvider> {
@@ -363,9 +364,14 @@ pub fn detect_direct_cli_provider(cmd: &str, extra_env: &[(&str, &str)]) -> Opti
 
     if bin == "codex" {
         Some(AiProvider::Codex)
-    } else if bin == "agy" || bin == "antigravity" {
+    } else if bin == "agy" || bin == "antigravity" || bin == "gemini" {
         Some(AiProvider::Antigravity)
-    } else if bin == "claude" || bin == "claude-sonnet" {
+    } else if bin == "claude"
+        || bin == "claude-sonnet"
+        || bin == "cursor-agent"
+        || bin == "agentf"
+        || bin == "cursor"
+    {
         // If extra_env explicitly indicates MiniMax, route through MiniMax scope
         if extra_env.iter().any(|(k, v)| {
             (*k == "CLAUDEM_MODE" && *v == "1")
@@ -393,8 +399,8 @@ pub fn apply_direct_cli_scope(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(cmd);
-    if bin == "agy" || bin == "antigravity" {
-        // Reuse the AO account boundary for direct AGY children.
+    if bin == "agy" || bin == "antigravity" || bin == "gemini" {
+        // Reuse the AO account boundary for direct AGY/Gemini children.
         apply_agy_scope(command)
     } else if let Some(provider) = detect_direct_cli_provider(cmd, extra_env) {
         apply_provider_scope(provider, command)
@@ -408,23 +414,29 @@ pub fn apply_direct_cli_scope(
 /// and applies the scoped environment while scrubbing conflicting provider auth.
 ///
 /// Supported agents:
-/// - `claude` / `claude-code` / `claude-sonnet`: applies direct Claude scoping
+/// - `claude` / `claude-code` / `claude-sonnet` / `cursor-agent` / `agentf` / `cursor`: applies direct Claude scoping
 /// - `codex`: applies direct Codex scoping
 /// - `minimax` / `claudem`: applies direct MiniMax scoping
-/// - `antigravity` / `agy`: requires `DARK_FACTORY_AGY_HOME`, validates optional Codex/Claude scope, and scrubs auth
+/// - `antigravity` / `agy` / `gemini`: requires `DARK_FACTORY_AGY_HOME`, validates optional Codex/Claude scope, and scrubs auth
 /// - any other agent: scrubs all auth and returns `Err(DaemonError::Config(...))` so unknown agents fail closed.
 pub fn validate_ao_worker_agent_scope(
     agent: &str,
     command: &mut Command,
 ) -> Result<(), DaemonError> {
     let normalized = agent.trim().to_lowercase();
-    if normalized == "claude" || normalized == "claude-code" || normalized == "claude-sonnet" {
+    if normalized == "claude"
+        || normalized == "claude-code"
+        || normalized == "claude-sonnet"
+        || normalized == "cursor-agent"
+        || normalized == "agentf"
+        || normalized == "cursor"
+    {
         apply_claude_scope(command)
     } else if normalized == "codex" {
         apply_codex_scope(command)
     } else if normalized == "minimax" || normalized == "claudem" {
         apply_minimax_scope(command)
-    } else if normalized == "antigravity" || normalized == "agy" {
+    } else if normalized == "antigravity" || normalized == "agy" || normalized == "gemini" {
         apply_agy_scope(command)
     } else {
         scrub_all_ai_provider_auth(command);
@@ -634,10 +646,16 @@ mod tests {
         assert_eq!(detect_direct_cli_provider("agy", &[]), Some(AiProvider::Antigravity));
         assert_eq!(detect_direct_cli_provider("/opt/bin/agy", &[]), Some(AiProvider::Antigravity));
         assert_eq!(detect_direct_cli_provider("antigravity", &[]), Some(AiProvider::Antigravity));
+        assert_eq!(detect_direct_cli_provider("gemini", &[]), Some(AiProvider::Antigravity));
+        assert_eq!(detect_direct_cli_provider("/opt/bin/gemini", &[]), Some(AiProvider::Antigravity));
 
         assert_eq!(detect_direct_cli_provider("claude", &[]), Some(AiProvider::Claude));
         assert_eq!(detect_direct_cli_provider("/home/user/.nvm/versions/node/v22.22.0/bin/claude", &[]), Some(AiProvider::Claude));
         assert_eq!(detect_direct_cli_provider("claude-sonnet", &[]), Some(AiProvider::Claude));
+        assert_eq!(detect_direct_cli_provider("cursor-agent", &[]), Some(AiProvider::Claude));
+        assert_eq!(detect_direct_cli_provider("/usr/local/bin/cursor-agent", &[]), Some(AiProvider::Claude));
+        assert_eq!(detect_direct_cli_provider("agentf", &[]), Some(AiProvider::Claude));
+        assert_eq!(detect_direct_cli_provider("cursor", &[]), Some(AiProvider::Claude));
 
         // MiniMax via extra_env
         assert_eq!(
@@ -799,12 +817,15 @@ mod tests {
 
         let mut cmd = Command::new("dummy");
 
-        // 1. claude without config dir fails closed
+        // 1. claude / cursor without config dir fails closed
         assert!(validate_ao_worker_agent_scope("claude", &mut cmd).is_err());
         assert!(validate_ao_worker_agent_scope("claude-code", &mut cmd).is_err());
         assert!(validate_ao_worker_agent_scope("claude-sonnet", &mut cmd).is_err());
+        assert!(validate_ao_worker_agent_scope("cursor-agent", &mut cmd).is_err());
+        assert!(validate_ao_worker_agent_scope("agentf", &mut cmd).is_err());
+        assert!(validate_ao_worker_agent_scope("cursor", &mut cmd).is_err());
 
-        // claude with valid config dir succeeds
+        // claude / cursor with valid config dir succeeds
         let temp = TempDir::new("ao_worker_claude");
         std::env::set_var("DARK_FACTORY_CLAUDE_CONFIG_DIR", &temp.path);
         let mut cmd = Command::new("dummy");
@@ -813,6 +834,13 @@ mod tests {
         let envs: Vec<_> = cmd.get_envs().collect();
         assert!(envs.iter().any(|(k, v)| k.to_str() == Some("CLAUDE_CONFIG_DIR") && v.is_some()));
         assert!(envs.iter().any(|(k, v)| k.to_str() == Some("OPENAI_API_KEY") && v.is_none()));
+
+        let mut cmd = Command::new("dummy");
+        assert!(validate_ao_worker_agent_scope("cursor-agent", &mut cmd).is_ok());
+        let mut cmd = Command::new("dummy");
+        assert!(validate_ao_worker_agent_scope("agentf", &mut cmd).is_ok());
+        let mut cmd = Command::new("dummy");
+        assert!(validate_ao_worker_agent_scope("cursor", &mut cmd).is_ok());
 
         // 2. codex without config dir fails closed
         let mut cmd = Command::new("dummy");
@@ -841,13 +869,15 @@ mod tests {
         assert!(envs.iter().any(|(k, v)| k.to_str() == Some("ANTHROPIC_MODEL") && v.map(|x| x.to_str().unwrap()) == Some("MiniMax-M3")));
         assert!(envs.iter().any(|(k, v)| k.to_str() == Some("ANTHROPIC_BASE_URL") && v.map(|x| x.to_str().unwrap()) == Some("https://api.minimax.io/anthropic")));
 
-        // 4. antigravity / agy without DARK_FACTORY_AGY_HOME fails closed
+        // 4. antigravity / agy / gemini without DARK_FACTORY_AGY_HOME fails closed
         let mut cmd = Command::new("dummy");
         assert!(validate_ao_worker_agent_scope("antigravity", &mut cmd).is_err());
         let mut cmd = Command::new("dummy");
         assert!(validate_ao_worker_agent_scope("agy", &mut cmd).is_err());
+        let mut cmd = Command::new("dummy");
+        assert!(validate_ao_worker_agent_scope("gemini", &mut cmd).is_err());
 
-        // antigravity / agy with valid DARK_FACTORY_AGY_HOME succeeds and pins HOME
+        // antigravity / agy / gemini with valid DARK_FACTORY_AGY_HOME succeeds and pins HOME
         let temp_agy = TempDir::new("ao_worker_agy");
         std::env::set_var("DARK_FACTORY_AGY_HOME", &temp_agy.path);
         let mut cmd = Command::new("dummy");
@@ -859,6 +889,8 @@ mod tests {
 
         let mut cmd = Command::new("dummy");
         assert!(validate_ao_worker_agent_scope("agy", &mut cmd).is_ok());
+        let mut cmd = Command::new("dummy");
+        assert!(validate_ao_worker_agent_scope("gemini", &mut cmd).is_ok());
 
         // 5. Unknown agent fails closed and scrubs auth
         let mut cmd = Command::new("dummy");
