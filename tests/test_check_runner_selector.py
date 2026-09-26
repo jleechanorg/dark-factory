@@ -400,7 +400,7 @@ def test_non_array_json_object_is_rejected_with_rc2(fake_gh_env):
 def test_selector_with_integer_element_is_rejected(fake_gh_env):
     """Selectors must be arrays of strings. An array containing a non-string
     element (e.g. integer) must be coerced to string, not silently dropped.
-    _normalize_labels does str(x).strip() — verify the coercion is harmless.""";
+    _normalize_labels does str(x).strip() — verify the coercion is harmless."""
     fake_gh_env({"total_count": 1, "runners": [
         {"id": 1, "name": "r1", "status": "online", "busy": False,
          "labels": [{"name": "1"}, {"name": "self-hosted"}]}
@@ -415,3 +415,77 @@ def test_selector_with_integer_element_is_rejected(fake_gh_env):
     assert proc.returncode == 0, proc.stderr
     body = json.loads(proc.stdout)
     assert body["verdict"] == "PASS"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for load_selector and helper functions
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_labels_comma_string():
+    from check_runner_selector import _normalize_labels
+    assert _normalize_labels("self-hosted, ezgha,  arm64 ") == ["self-hosted", "ezgha", "arm64"]
+
+
+def test_normalize_labels_invalid_type():
+    from check_runner_selector import _normalize_labels
+    with pytest.raises(ValueError, match="selector must be a JSON array of strings"):
+        _normalize_labels(12345)
+
+
+def test_load_selector_cli_arg():
+    from check_runner_selector import load_selector
+    assert load_selector('["self-hosted", "ezgha"]') == ["self-hosted", "ezgha"]
+
+
+def test_load_selector_env_var(monkeypatch):
+    from check_runner_selector import load_selector
+    monkeypatch.setenv("SELF_HOSTED_RUNNER_LABELS", '["self-hosted", "self-hosted-mikey"]')
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    assert load_selector(None) == ["self-hosted", "self-hosted-mikey"]
+
+
+def test_load_selector_missing_all(monkeypatch):
+    from check_runner_selector import load_selector
+    monkeypatch.delenv("SELF_HOSTED_RUNNER_LABELS", raising=False)
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    with pytest.raises(ValueError, match="no --selector, no SELF_HOSTED_RUNNER_LABELS env var"):
+        load_selector(None)
+
+
+def test_load_selector_invalid_github_repository(monkeypatch):
+    from check_runner_selector import load_selector
+    monkeypatch.delenv("SELF_HOSTED_RUNNER_LABELS", raising=False)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "invalid_repo_name_without_slash")
+    with pytest.raises(ValueError, match="is not owner/name"):
+        load_selector(None)
+
+
+def test_load_selector_repo_variable_success(fake_gh_env, monkeypatch):
+    from check_runner_selector import load_selector
+    fake_gh_env({"value": '["self-hosted", "ezgha"]'})
+    monkeypatch.delenv("SELF_HOSTED_RUNNER_LABELS", raising=False)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "jleechanorg/dark-factory")
+    assert load_selector(None) == ["self-hosted", "ezgha"]
+
+
+def test_load_selector_repo_variable_gh_failure(fake_gh_env, monkeypatch):
+    from check_runner_selector import load_selector
+    fake_gh_env(None, rc=1, stderr="Not found")
+    monkeypatch.delenv("SELF_HOSTED_RUNNER_LABELS", raising=False)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "jleechanorg/dark-factory")
+    with pytest.raises(ValueError, match="gh api failed"):
+        load_selector(None)
+
+
+def test_render_human_drift():
+    from check_runner_selector import render_human
+    out = render_human(
+        org="jleechanorg",
+        selector=["self-hosted", "Linux", "ARM64", "agent-orchestrator"],
+        online=[{"name": "runner-1"}],
+        matches=[],
+        min_matches=1,
+    )
+    assert "Verdict:             DRIFT" in out
+    assert "Matching runners:    0 (none)" in out

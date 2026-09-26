@@ -64,9 +64,12 @@ run() {
 }
 
 render_unit() {
+    local state_root="${XDG_STATE_HOME:-$HOME/.local/state}/dark-factory"
+    local br_db="${DARK_FACTORY_BR_DB:-$state_root/.beads/beads.db}"
     sed \
         -e "s|@HOME@|$HOME|g" \
         -e "s|@REPO@|$REPO|g" \
+        -e "s|@BR_DB@|$br_db|g" \
         "$SCRIPT_DIR/$UNIT_NAME.template"
 }
 

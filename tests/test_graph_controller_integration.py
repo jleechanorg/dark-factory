@@ -64,8 +64,7 @@ def _build_request(repo: Path) -> object:
             head_sha=head,
             tree_sha=_git(repo, "rev-parse", "HEAD^{tree}").strip(),
             task_text="task",
-            diff_text="",
-            changed_files=("README.md",),
+                changed_files=("README.md",),
             evidence=(
                 EvidenceArtifact(
                     path="README.md",

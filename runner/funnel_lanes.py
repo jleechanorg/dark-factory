@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -56,6 +57,127 @@ LANES = ["bead_start", "gh_issue_start", "pr_adopted_start"]
 _STAGE_RANK = {s: i for i, s in enumerate(MAIN_STAGES)}
 _SIDE_SET = set(SIDE_STAGES)
 _MAIN_SET = set(MAIN_STAGES)
+
+# These are deliberately observation buckets, not funnel stages.  A single
+# GATE_ASSESSMENT contributes exactly one bucket, including ``unobserved`` when
+# the daemon event predates the per-gate telemetry contract.
+CODERABBIT_BUCKETS = (
+    "direct_approved",
+    "waived_unavailable",
+    "unknown",
+    "fail",
+    "unobserved",
+)
+_CODERABBIT_WAIVER_TOKEN = "coderabbit:waived_vendor_unavailable"
+_REPOSITORY_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def _contains_waiver_token(value) -> bool:
+    """Return whether an evidence value contains the canonical waiver token."""
+    if isinstance(value, str):
+        return _CODERABBIT_WAIVER_TOKEN in value
+    if isinstance(value, dict):
+        return any(_contains_waiver_token(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_waiver_token(item) for item in value)
+    return False
+
+
+def classify_coderabbit(context: object) -> str:
+    """Classify one GATE_ASSESSMENT's CodeRabbit observation.
+
+    ``unobserved`` means the assessment has no usable ``gates.coderabbit``
+    field at all.  A present but malformed/unknown verdict is ``unknown``.
+    The waiver token is checked before the verdict so a green-equivalent
+    vendor outage cannot inflate direct approval metrics.  This is telemetry
+    reporting only and does not alter gate or merge semantics.
+    """
+    if not isinstance(context, dict):
+        return "unobserved"
+    gates = context.get("gates")
+    if not isinstance(gates, dict) or "coderabbit" not in gates:
+        return "unobserved"
+    raw = gates["coderabbit"]
+    if isinstance(raw, str):
+        verdict = raw.strip().lower()
+        evidence = None
+    elif isinstance(raw, dict):
+        verdict = raw.get("verdict")
+        verdict = verdict.strip().lower() if isinstance(verdict, str) else None
+        evidence = raw.get("evidence")
+    else:
+        return "unknown"
+
+    if verdict in {"fail", "red"}:
+        return "fail"
+    # A waiver is only a green-equivalent observation when the underlying
+    # verdict is explicitly pass/green.  Contradictory fail/waiver and
+    # unknown/waiver payloads remain conservative.
+    if verdict in {"pass", "green"}:
+        if _contains_waiver_token(evidence):
+            return "waived_unavailable"
+        return "direct_approved"
+    return "unknown"
+
+
+def _resolved_repository(event: dict) -> Optional[str]:
+    """Return the canonical repository identity carried by gate telemetry.
+
+    New daemon assessments emit ``context.repo`` from the resolved routing
+    entry.  The aliases below keep the reader compatible with fixtures and
+    older producers that used ``target_repo`` or ``repository``.  Values are
+    validated as an owner/name pair and normalized because GitHub repository
+    names are case-insensitive.
+    """
+    context = event.get("context")
+    if not isinstance(context, dict):
+        return None
+    for field in ("repo", "target_repo", "repository", "repository_full_name"):
+        value = context.get(field)
+        if isinstance(value, dict):
+            value = value.get("full_name") or value.get("name")
+        if not isinstance(value, str):
+            continue
+        value = value.strip().rstrip("/")
+        if _REPOSITORY_ID_RE.fullmatch(value):
+            return value.lower()
+    return None
+
+
+def coderabbit_observation_key(event: dict, sequence: object = None) -> tuple:
+    """Return the deduplication key for a CodeRabbit gate observation.
+
+    Recent daemon telemetry carries ``(repo, pr_number, head_sha)``.  Repeated
+    assessments for that immutable PR head are one observation for funnel
+    metrics; the latest event wins because a vendor can move from unknown to
+    approved (or vice versa) without a new head.  Legacy rows without the
+    repository field retain the historical ``(pr_number, head_sha)`` key so
+    existing logs remain comparable; the daemon now emits ``repo`` for new
+    rows, preventing cross-repository collisions going forward.
+    """
+    context = event.get("context")
+    if isinstance(context, dict):
+        pr_number = context.get("pr_number")
+        head_sha = context.get("head_sha")
+        if (
+            isinstance(pr_number, (int, str))
+            and not isinstance(pr_number, bool)
+            and str(pr_number)
+            and isinstance(head_sha, str)
+            and head_sha
+        ):
+            repo = _resolved_repository(event)
+            if repo is not None:
+                return ("pr_head", repo, str(pr_number), head_sha)
+            return ("pr_head_legacy", str(pr_number), head_sha)
+    # ``sequence`` is supplied by the streaming loader/compute loop.  It is
+    # required for legacy rows where multiple assessments share bead, attempt,
+    # and timestamp; using those fields alone silently collapses observations.
+    if sequence is None:
+        sequence = event.get("_seq")
+    if sequence is None:
+        sequence = id(event)
+    return ("event", sequence)
 
 
 def _normalize_full(raw: dict) -> Optional[dict]:
@@ -131,6 +253,7 @@ def load_events_full(path: pathlib.Path, since=None, now=None) -> list[dict]:
                 continue
             if cutoff is not None and evt["ts"] < cutoff:
                 continue
+            evt["_seq"] = len(events)
             events.append(evt)
     return events
 
@@ -141,12 +264,18 @@ class LaneStat:
     total: int
     furthest: dict = field(default_factory=dict)  # {"INTAKE_ONLY"|stage: count}
     terminal: dict = field(default_factory=dict)  # {"none"|side_stage: count}
+    coderabbit: dict = field(default_factory=dict)  # observation bucket -> count
+    coderabbit_total: int = 0
 
 
 @dataclass
 class LaneReport:
     since_label: str
     lanes: list  # list[LaneStat]
+    # Global CodeRabbit observations include assessments whose intake origin
+    # is outside the window and therefore cannot be assigned to a lane.
+    coderabbit: dict = field(default_factory=dict)
+    coderabbit_total: int = 0
 
 
 def classify_origin(events: list[dict]) -> dict[str, str]:
@@ -201,7 +330,20 @@ def compute_lane_report(events: list[dict], since_label: str = "") -> LaneReport
     misreported as still-parked."""
     origin = classify_origin(events)  # bead_id -> lane
 
+    # Keep a report-level exact-head metric in addition to per-lane values.
+    # This prevents the lane-origin join from dropping legitimate PR/head
+    # observations when the intake event predates the reporting window.
+    global_coderabbit_latest: dict[tuple, dict] = {}
+    for sequence, evt in enumerate(events):
+        if evt["event_type"] != "GATE_ASSESSMENT":
+            continue
+        key = coderabbit_observation_key(evt, sequence)
+        previous = global_coderabbit_latest.get(key)
+        if previous is None or evt["ts"] >= previous["ts"]:
+            global_coderabbit_latest[key] = evt
+
     bead_events: dict[str, list[tuple[int, str]]] = {}
+    coderabbit_events: dict[str, list[dict]] = {}
     latest_attempt_by_bead: dict[str, int] = {}
     for evt in events:
         bead_id = evt["bead_id"]
@@ -212,16 +354,37 @@ def compute_lane_report(events: list[dict], since_label: str = "") -> LaneReport
             evt["attempt_id"],
         )
         et = evt["event_type"]
-        if et not in _MAIN_SET and et not in _SIDE_SET:
-            continue
-        bead_events.setdefault(bead_id, []).append((evt["attempt_id"], et))
+        if et in _MAIN_SET or et in _SIDE_SET:
+            bead_events.setdefault(bead_id, []).append((evt["attempt_id"], et))
+        if et == "GATE_ASSESSMENT":
+            coderabbit_events.setdefault(bead_id, []).append(evt)
 
-    lane_stats: dict[str, LaneStat] = {lane: LaneStat(lane=lane, total=0) for lane in LANES}
+    lane_stats: dict[str, LaneStat] = {
+        lane: LaneStat(
+            lane=lane,
+            total=0,
+            coderabbit={bucket: 0 for bucket in CODERABBIT_BUCKETS},
+        )
+        for lane in LANES
+    }
 
     for bead_id, lane in origin.items():
         stat = lane_stats[lane]
         stat.total += 1
         evs = bead_events.get(bead_id, [])
+
+        # Count one latest observation per PR/head.  Older daemon rows do not
+        # carry a head SHA and intentionally use their event identity key.
+        latest_coderabbit: dict[tuple, dict] = {}
+        for sequence, evt in enumerate(coderabbit_events.get(bead_id, [])):
+            key = coderabbit_observation_key(evt, sequence)
+            previous = latest_coderabbit.get(key)
+            if previous is None or evt["ts"] >= previous["ts"]:
+                latest_coderabbit[key] = evt
+        for evt in latest_coderabbit.values():
+            bucket = classify_coderabbit(evt.get("context"))
+            stat.coderabbit[bucket] = stat.coderabbit.get(bucket, 0) + 1
+            stat.coderabbit_total += 1
 
         main_hit = [et for (_a, et) in evs if et in _MAIN_SET]
         furthest = max(main_hit, key=lambda x: _STAGE_RANK[x]) if main_hit else "INTAKE_ONLY"
@@ -235,7 +398,15 @@ def compute_lane_report(events: list[dict], since_label: str = "") -> LaneReport
             terminal = "none"
         stat.terminal[terminal] = stat.terminal.get(terminal, 0) + 1
 
-    return LaneReport(since_label=since_label, lanes=[lane_stats[lane] for lane in LANES])
+    global_coderabbit = {bucket: 0 for bucket in CODERABBIT_BUCKETS}
+    for evt in global_coderabbit_latest.values():
+        global_coderabbit[classify_coderabbit(evt.get("context"))] += 1
+    return LaneReport(
+        since_label=since_label,
+        lanes=[lane_stats[lane] for lane in LANES],
+        coderabbit=global_coderabbit,
+        coderabbit_total=sum(global_coderabbit.values()),
+    )
 
 
 def _fmt_pct(n: int, total: int) -> str:
@@ -252,6 +423,16 @@ def render_markdown(report: LaneReport) -> str:
         "pr_adopted_start (adopted an already-open PR)",
         "",
     ]
+    lines.append("## CodeRabbit exact-head observations (all classified events)")
+    lines.append("")
+    lines.append(f"Assessments observed: {report.coderabbit_total}")
+    lines.append("")
+    lines.append("| Outcome | Count | % of assessments |")
+    lines.append("|---|---|---|")
+    for bucket in CODERABBIT_BUCKETS:
+        n = report.coderabbit.get(bucket, 0)
+        lines.append(f"| {bucket} | {n} | {_fmt_pct(n, report.coderabbit_total)} |")
+    lines.append("")
     stage_order = ["INTAKE_ONLY"] + MAIN_STAGES
     for stat in report.lanes:
         lines.append(f"## {stat.lane} (n={stat.total})")
@@ -271,18 +452,39 @@ def render_markdown(report: LaneReport) -> str:
         for s, n in sorted(stat.terminal.items(), key=lambda kv: -kv[1]):
             lines.append(f"| {s} | {n} | {_fmt_pct(n, stat.total)} |")
         lines.append("")
+        lines.append("### CodeRabbit gate observations")
+        lines.append("")
+        assessment_total = sum(stat.coderabbit.values())
+        lines.append(f"Assessments observed: {assessment_total}")
+        lines.append("")
+        lines.append("| Outcome | Count | % of assessments |")
+        lines.append("|---|---|---|")
+        for bucket in CODERABBIT_BUCKETS:
+            n = stat.coderabbit.get(bucket, 0)
+            lines.append(f"| {bucket} | {n} | {_fmt_pct(n, assessment_total)} |")
+        lines.append("")
     return "\n".join(lines)
 
 
 def render_json(report: LaneReport) -> dict:
     return {
         "since": report.since_label,
+        "coderabbit": {
+            bucket: report.coderabbit.get(bucket, 0)
+            for bucket in CODERABBIT_BUCKETS
+        },
+        "coderabbit_total": report.coderabbit_total,
         "lanes": [
             {
                 "lane": stat.lane,
                 "total": stat.total,
                 "furthest_stage": dict(stat.furthest),
                 "terminal_divert": dict(stat.terminal),
+                "coderabbit": {
+                    bucket: stat.coderabbit.get(bucket, 0)
+                    for bucket in CODERABBIT_BUCKETS
+                },
+                "coderabbit_total": stat.coderabbit_total,
             }
             for stat in report.lanes
         ],

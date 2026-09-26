@@ -1,0 +1,74 @@
+// pipelines/slim/two_node_holdout.dot
+//
+// Opt-in graph for `/f` (and `/factory`). Generic worker plus fresh Codex reviewer
+// plus behavioral holdout evaluation:
+//   worker         — generic codergen; light prompt; does whatever the user asked.
+//   cold_reviewer  — fresh, fully tooled Codex process in the coder worktree.
+//   holdout        — behavioral holdout evaluation against sealed scenario suite.
+//
+// Wiring:
+//   start -> worker -> cold_reviewer -> holdout -> exit        (on success)
+//                          \-> worker                          (on failure, bounded max_visits=3)
+//                                                 \-> worker   (on failure, bounded max_visits=3)
+//
+// Backend routing:
+//   - worker          honors the run-level --backend.
+//   - cold_reviewer   always launches a fresh Codex CLI session.
+//   - holdout         runs the holdout_eval handler.
+//
+// Failure semantics:
+//   - Both cold_reviewer and holdout are goal_gate=true.
+//   - On non-success verdict or failure, routing returns to worker directly.
+//   - Worker handles iteration (bounded by max_visits=3).
+
+digraph SlimTwoNodeHoldout {
+    graph [
+        goal="Generic worker does the user's task; a fresh Codex reviewer and behavioral holdouts gate it. Opt-in slim pipeline."
+        rankdir=LR
+        label="SlimTwoNodeHoldout (opt-in /f graph with holdouts)"
+    ]
+
+    start  [shape=Mdiamond, label="Start"]
+    exit   [shape=Msquare,  label="Exit"]
+
+    worker [
+        type="codergen",
+        label="Generic Worker",
+        class="worker",
+        prompt="@prompts/slim/worker.md",
+        max_retries=2,
+        max_visits="3",
+        timeout=600
+    ]
+
+    cold_reviewer [
+        type="codergen",
+        label="Fresh Codex Reviewer",
+        class="review",
+        backend="codex",
+        prompt="@prompts/slim/fresh_review.md",
+        verdict_gate="true",
+        fresh_session="true",
+        goal_gate=true,
+        timeout=600
+    ]
+
+    holdout [
+        type="holdout_eval",
+        label="Behavioral Holdouts",
+        feature="${state.feature}",
+        validation=true,
+        goal_gate=true,
+        timeout=600
+    ]
+
+    start -> worker
+    worker -> cold_reviewer [condition="outcome=success"]
+    worker -> worker        [condition="outcome!=success"]
+
+    cold_reviewer -> holdout [condition="outcome=success"]
+    cold_reviewer -> worker  [condition="outcome!=success"]
+
+    holdout -> exit   [condition="outcome=success"]
+    holdout -> worker [condition="outcome!=success"]
+}

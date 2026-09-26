@@ -5,7 +5,7 @@
 
 use daemon::config::{self, Config};
 use daemon::errors::DaemonError;
-use daemon::state::{SqliteStateStore, StateStore};
+use daemon::state::{BeadOverlay, OverlayState, SqliteStateStore, StateStore};
 use daemon::tick::{run_tick, TickDeps};
 use daemon::tools::{Bead, Issue, Llm, Permission, PrSnapshot, Scm, SessionId, Sessions, SpawnSpec, Tracker, Vcs};
 use daemon::vendor_health::VendorHealthLedger;
@@ -301,6 +301,15 @@ fn load_config(path: &Path) -> Result<Config, DaemonError> {
     config::load(path)
 }
 
+fn validate_task_scope(
+    store: &dyn StateStore,
+    cfg: &Config,
+    tracker: &dyn Tracker,
+    task_bead_id: &str,
+) -> Result<(), DaemonError> {
+    daemon::tick::validate_task_scope(store, cfg, tracker, task_bead_id)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TickLoopAction {
     Success {
@@ -421,57 +430,130 @@ type DaemonAdapters = (
     Box<dyn Vcs>,
 );
 
-fn ao_runtime_binding(cfg: &Config) -> Result<(String, String), DaemonError> {
+fn ao_runtime_binding_for_repo(cfg: &Config, repo: &str) -> Result<(String, String), DaemonError> {
     // Use the canonical routing path shared with dispatch, including legacy
     // aliases such as worldarchitect.ai -> worldarchitect. Duplicating its
     // derivation here would let startup reject a config that spawning accepts.
     let ao_project = cfg
-        .resolve_repo(&cfg.target_repo)
+        .resolve_repo(repo)
         .ok_or_else(|| {
             DaemonError::Config(format!(
-                "target repository {:?} has no AO routing configuration",
-                cfg.target_repo
+                "repository {:?} has no AO routing configuration",
+                repo
             ))
         })?
         .ao_project;
-    let default_agent = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT")
+    let default_agent = std::env::var("DARK_FACTORY_CODER_DEFAULT")
+        .or_else(|_| std::env::var("DARK_FACTORY_REVIEWER_DEFAULT"))
         .unwrap_or_else(|_| "agy".to_string());
     Ok((ao_project, default_agent))
 }
 
+fn ao_runtime_binding(cfg: &Config) -> Result<(String, String), DaemonError> {
+    ao_runtime_binding_for_repo(cfg, &cfg.target_repo)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupScopeBinding {
+    selected_repo: String,
+    ao_project: String,
+    default_agent: String,
+    restored_session_projects: Vec<(Option<String>, Option<String>, String)>,
+}
+
+fn resolve_startup_scope_binding(
+    store: &dyn StateStore,
+    cfg: &Config,
+    tracker: &dyn Tracker,
+) -> Result<StartupScopeBinding, DaemonError> {
+    if let Some(task_bead_id) = cfg.task_bead_id.as_deref() {
+        validate_task_scope(store, cfg, tracker, task_bead_id)?;
+        let overlay = store.load(task_bead_id)?.ok_or_else(|| {
+            DaemonError::Config(format!("task_bead_id {task_bead_id:?} has no overlay row"))
+        })?;
+        let selected_repo = overlay.repo(cfg).to_string();
+        let (ao_project, default_agent) = ao_runtime_binding_for_repo(cfg, &selected_repo)?;
+        let restored_session_projects = match (overlay.session_id, overlay.branch) {
+            (Some(session_id), Some(branch)) => {
+                let project = overlay
+                    .session_ao_project
+                    .unwrap_or_else(|| ao_project.clone());
+                vec![(Some(session_id), Some(branch), project)]
+            }
+            _ => Vec::new(),
+        };
+        Ok(StartupScopeBinding {
+            selected_repo,
+            ao_project,
+            default_agent,
+            restored_session_projects,
+        })
+    } else {
+        let selected_repo = cfg.target_repo.clone();
+        let (ao_project, default_agent) = ao_runtime_binding(cfg)?;
+        let restored_session_projects = store
+            .session_routing_bindings()?
+            .into_iter()
+            .map(|binding| {
+                let project = if let Some(project) = binding.ao_project {
+                    project
+                } else {
+                    let repo = binding.target_repo.as_deref().unwrap_or(&cfg.target_repo);
+                    cfg.resolve_repo(repo).ok_or_else(|| {
+                        DaemonError::Config(format!(
+                            "durable AO identity {:?}/{:?} references unmapped target repo {repo:?}",
+                            binding.session_id, binding.branch
+                        ))
+                    })?.ao_project
+                };
+                Ok((binding.session_id, binding.branch, project))
+            })
+            .collect::<Result<Vec<_>, DaemonError>>()?;
+        Ok(StartupScopeBinding {
+            selected_repo,
+            ao_project,
+            default_agent,
+            restored_session_projects,
+        })
+    }
+}
+
+fn reconcile_tick_recovery(
+    store: &dyn StateStore,
+    cfg: &Config,
+) -> Result<(), DaemonError> {
+    if cfg.task_bead_id.is_some() {
+        return Ok(());
+    }
+    store.reconcile_dispatching()
+}
+
+fn handle_tick_action<T: Copy>(
+    tick_loop: &mut TickLoopState<T>,
+    action: &TickLoopAction,
+    store: &dyn StateStore,
+    cfg: &Config,
+) -> Result<(), DaemonError> {
+    apply_tick_action(tick_loop, action, || reconcile_tick_recovery(store, cfg))
+}
+
 /// Mirrors the runtime fallback chain (`CliSessions::spawn_with_fallback`)
-/// using the same `canonical_for_alias` mapping so the preflight and the
-/// `--agent` argv agree on every vendor name. This is the SINGLE source for
-/// the configured vendor list — startup and dispatch consult it so a renamed
-/// plugin cannot pass preflight while failing the runtime fallback chain
-/// (or vice versa).
-fn configured_vendor_list(default_agent: &str) -> Vec<String> {
+/// by reusing `daemon::adapters::build_runtime_fallback_chain`. This is the
+/// SINGLE source for the configured vendor list — startup and dispatch consult
+/// it so engine-aware vendor filtering and aliases agree on every vendor name.
+fn configured_vendor_list(default_agent: &str) -> Result<Vec<String>, DaemonError> {
     let fallback_str = std::env::var("DARK_FACTORY_CODER_FALLBACK_CHAIN")
         .or_else(|_| std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"))
         .unwrap_or_else(|_| "agy->minimax->claudem".to_string());
 
-    let canonicalize = |vendor: &str| -> String {
-        daemon::adapters::canonical_for_alias(vendor)
-            .map(str::to_string)
-            .unwrap_or_else(|| vendor.to_string())
-    };
-
-    let mut chain: Vec<String> = Vec::new();
-    let default_canonical = canonicalize(default_agent);
-    if !default_canonical.is_empty() {
-        chain.push(default_canonical);
+    let chain = daemon::adapters::build_runtime_fallback_chain(default_agent, &fallback_str);
+    let had_input = !default_agent.trim().is_empty() || !fallback_str.trim().is_empty();
+    if had_input && chain.is_empty() {
+        return Err(DaemonError::Config(format!(
+            "configured vendor chain '{fallback_str}' with default agent '{default_agent}' contains no supported agents for current AO engine"
+        )));
     }
-    for part in fallback_str.split("->") {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let canonical = canonicalize(trimmed);
-        if !canonical.is_empty() && !chain.contains(&canonical) {
-            chain.push(canonical);
-        }
-    }
-    chain
+    Ok(chain)
 }
 
 fn verify_startup_ao_compatibility(
@@ -484,6 +566,21 @@ fn verify_startup_ao_compatibility(
         return Ok(());
     }
     verify(ao_project, configured_vendors)
+}
+
+fn verify_startup_account_scopes(
+    args: Args,
+    configured_vendors: &[String],
+    mut validate: impl FnMut(&str, &mut std::process::Command) -> Result<(), DaemonError>,
+) -> Result<(), DaemonError> {
+    if args.dry_run {
+        return Ok(());
+    }
+    for vendor in configured_vendors {
+        let mut cmd = std::process::Command::new("true");
+        validate(vendor, &mut cmd)?;
+    }
+    Ok(())
 }
 
 /// Bead jleechan-sb4b: emit a loud config warning at daemon startup when
@@ -529,31 +626,39 @@ fn verify_startup_cargo_toolchain(args: Args) {
     }
 }
 
+/// Emit a non-fatal startup capability signal for Python gate-8 targets.
+/// Cargo remains the primary daemon toolchain, so a host without pytest must
+/// not prevent startup or Rust-only assessments; it should nevertheless be
+/// visible in the service journal before a Python PR reaches verification.
+fn verify_startup_pytest_capability(args: Args) {
+    if args.dry_run {
+        return;
+    }
+    match daemon::vacuous_red_green::resolve_pytest(None) {
+        daemon::vacuous_red_green::PytestLocation::OnPath
+        | daemon::vacuous_red_green::PytestLocation::Found(_) => {
+            eprintln!("auto-factory daemon: gate-8 pytest capability available");
+        }
+        daemon::vacuous_red_green::PytestLocation::NotFound => {
+            eprintln!(
+                "auto-factory daemon: WARNING: pytest binary not found. Python target PRs will \
+                 report a structured pytest-not-found gate-8 result; Rust-only assessments and \
+                 daemon startup remain unaffected. Install pytest in the daemon service PATH \
+                 (for example, `python3 -m pip install pytest`)."
+            );
+        }
+    }
+}
+
 fn run(args: Args) -> Result<(), DaemonError> {
     let cfg_path = default_config_path();
-    let cfg = load_config(&cfg_path)?;
-    let (ao_project, default_agent) = ao_runtime_binding(&cfg)?;
-    let configured_vendors = configured_vendor_list(&default_agent);
-    // Fail before opening/reconciling state, advertising READY, or polling a
-    // healthy tick when the installed AO/Node adapter is incompatible. The
-    // diagnostic exits before AO preflight, locking, workspace creation, or
-    // worker launch.
-    verify_startup_ao_compatibility(args, &ao_project, &configured_vendors, |project, vendors| {
-        daemon::adapters::verify_ao_bridge_compatibility(project, vendors.first().map(String::as_str).unwrap_or("agy"), vendors)
-    })?;
-    // Bead jleechan-sb4b: emit a loud config warning at startup if the
-    // runtime red-green detector's toolchain is missing. The previous
-    // behavior was silent: every assessment reported a misleading
-    // `GreenFailed: git error: spawn cargo test: No such file or
-    // directory` and operators had no upfront signal that the daemon's
-    // systemd environment lacked cargo. This emit is non-fatal — the
-    // daemon can still run other gates — but loud enough that the
-    // operator sees it in the journalctl output before the first
-    // assessment.
-    verify_startup_cargo_toolchain(args);
-    // Verify the telemetry log path is writable BEFORE we start polling
-    // ticks — every assessment writes here, and a churning 7-green false
-    // alarm usually traces back to a silent telemetry write failure.
+    let mut cfg = load_config(&cfg_path)?;
+    let env_task_bead_id = std::env::var_os("DARK_FACTORY_TASK_BEAD_ID")
+        .map(|value| value.to_string_lossy().into_owned());
+    cfg.task_bead_id = config::resolve_task_bead_id(
+        cfg.task_bead_id.as_deref(),
+        env_task_bead_id.as_deref(),
+    )?;
     let telemetry_log = default_telemetry_log();
     let db_path = default_state_db_path();
 
@@ -565,14 +670,58 @@ fn run(args: Args) -> Result<(), DaemonError> {
         Box::new(SqliteStateStore::open(&db_path)?)
     };
 
-    store.reconcile_dispatching()?;
+    let tracker: Box<dyn Tracker> = if args.dry_run {
+        #[cfg(any(test, debug_assertions))]
+        {
+            Box::new(NoopAdapters)
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            return Err(DaemonError::Config("--dry-run is unavailable in this build".into()));
+        }
+    } else {
+        Box::new(daemon::adapters::CliTracker)
+    };
+
+    let binding = resolve_startup_scope_binding(store.as_ref(), &cfg, tracker.as_ref())?;
+    let configured_vendors = configured_vendor_list(&binding.default_agent)?;
+    // Fail before opening/reconciling state, advertising READY, or polling a
+    // healthy tick when the installed AO/Node adapter is incompatible. The
+    // diagnostic exits before AO preflight, locking, workspace creation, or
+    // worker launch.
+    verify_startup_ao_compatibility(args, &binding.ao_project, &configured_vendors, |project, vendors| {
+        daemon::adapters::verify_ao_bridge_compatibility(project, vendors.first().map(String::as_str).unwrap_or("agy"), vendors)
+    })?;
+    verify_startup_account_scopes(args, &configured_vendors, |vendor, cmd| {
+        daemon::account_scope::validate_ao_worker_agent_scope(vendor, cmd)
+    })?;
+    // Bead jleechan-sb4b: emit a loud config warning at startup if the
+    // runtime red-green detector's toolchain is missing. The previous
+    // behavior was silent: every assessment reported a misleading
+    // `GreenFailed: git error: spawn cargo test: No such file or
+    // directory` and operators had no upfront signal that the daemon's
+    // systemd environment lacked cargo. This emit is non-fatal — the
+    // daemon can still run other gates — but loud enough that the
+    // operator sees it in the journalctl output before the first
+    // assessment.
+    verify_startup_cargo_toolchain(args);
+    // Python parity: expose whether the optional pytest backend is available
+    // without making non-Python daemon startup fail closed.
+    verify_startup_pytest_capability(args);
+
+    if cfg.task_bead_id.is_none() {
+        store.reconcile_dispatching()?;
+    }
+    // Verify the telemetry log path is writable BEFORE we start polling
+    // ticks — every assessment writes here, and a churning 7-green false
+    // alarm usually traces back to a silent telemetry write failure.
 
     let (scm, tracker, sessions, llm, vcs): DaemonAdapters = if args.dry_run {
         #[cfg(any(test, debug_assertions))]
         {
             (
                 Box::new(NoopAdapters),
-                Box::new(NoopAdapters),
+                tracker,
                 Box::new(NoopAdapters),
                 Box::new(NoopAdapters),
                 Box::new(NoopAdapters),
@@ -585,13 +734,18 @@ fn run(args: Args) -> Result<(), DaemonError> {
             ));
         }
     } else {
-        use daemon::adapters::{CliScm, CliSessions, CliTracker, ChainLlm, CliVcs};
+        use daemon::adapters::{CliScm, CliSessions, ChainLlm, CliVcs};
         (
-            Box::new(CliScm::new(cfg.target_repo.clone())),
-            Box::new(CliTracker),
-            Box::new(CliSessions::new(&ao_project, &default_agent)),
+            Box::new(CliScm::new(binding.selected_repo.clone())),
+            tracker,
+            Box::new(CliSessions::with_restored_projects(
+                &binding.ao_project,
+                &binding.default_agent,
+                binding.restored_session_projects,
+                cfg.repos.is_empty(),
+            )?),
             Box::new(ChainLlm),
-            Box::new(CliVcs::new(cfg.target_repo.clone())),
+            Box::new(CliVcs::new(binding.selected_repo)),
         )
     };
 
@@ -665,7 +819,7 @@ fn run(args: Args) -> Result<(), DaemonError> {
             send_daemon_alert(consecutive_failures, sleep_secs, error);
         }
 
-        apply_tick_action(&mut tick_loop, &action, || store.reconcile_dispatching())?;
+        handle_tick_action(&mut tick_loop, &action, store.as_ref(), &cfg)?;
         let _ = systemd_notify(&watchdog_status);
 
         match action {
@@ -675,7 +829,12 @@ fn run(args: Args) -> Result<(), DaemonError> {
                 if previous_failures >= 3 {
                     send_daemon_recovery_alert(previous_failures);
                 }
-                std::thread::sleep(std::time::Duration::from_secs(cfg.fast_tick_secs));
+                let sleep_secs = if attempt.tick_index == 0 {
+                    cfg.fast_tick_secs.min(30)
+                } else {
+                    cfg.fast_tick_secs
+                };
+                std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
             }
             TickLoopAction::TransientBackoff {
                 consecutive_failures: _,
@@ -879,11 +1038,13 @@ fn main() {
 mod tests {
     use super::*;
 
-    // Serializes tests that mutate the process-wide NOTIFY_SOCKET env var. Rust
-    // runs tests in parallel by default, so without this lock two tests can each
-    // set NOTIFY_SOCKET and systemd_notify may send its datagram to the sibling
-    // test's socket, leaving this listener's recv() to time out (WouldBlock).
-    static NOTIFY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The daemon binary's unit tests are a separate crate from the daemon
+    // library tests, so they need their own process-wide environment lock.
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn test_env_lock() -> &'static std::sync::Mutex<()> {
+        &TEST_ENV_LOCK
+    }
 
     #[test]
     fn scaffold_compiles() {
@@ -916,6 +1077,7 @@ mod tests {
     #[test]
     fn startup_binding_uses_canonical_legacy_worldarchitect_project_alias() {
         let cfg = Config {
+            task_bead_id: None,
             target_repo: "jleechanorg/worldarchitect.ai".to_string(),
             ao_project: None,
             base_branch: "main".to_string(),
@@ -950,13 +1112,18 @@ mod tests {
     // preflight sees the same vendor order the runtime fallback chain does.
     #[test]
     fn configured_vendor_list_resolves_aliases_and_dedupes() {
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Snapshot the existing env, mutate it for the test, restore after.
         let prior_default = std::env::var("DARK_FACTORY_REVIEWER_DEFAULT").ok();
         let prior_chain = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+        let prior_engine = std::env::var("DARK_FACTORY_AO_ENGINE").ok();
 
         // SAFETY: env mutation is serialized by the test isolation rules;
         // we set/remove only the keys this test owns.
         unsafe {
+            std::env::remove_var("DARK_FACTORY_AO_ENGINE");
             std::env::set_var("DARK_FACTORY_REVIEWER_DEFAULT", "agy");
             std::env::set_var(
                 "DARK_FACTORY_REVIEWER_FALLBACK_CHAIN",
@@ -964,7 +1131,7 @@ mod tests {
             );
         }
 
-        let vendors = configured_vendor_list("agy");
+        let vendors = configured_vendor_list("agy").unwrap();
 
         unsafe {
             match prior_default {
@@ -975,6 +1142,10 @@ mod tests {
                 Some(v) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", v),
                 None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
             }
+            match prior_engine {
+                Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+                None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+            }
         }
 
         // Default + canonical fallback entries, deduped (agy->antigravity
@@ -984,6 +1155,101 @@ mod tests {
             vendors,
             vec!["antigravity".to_string(), "minimax".to_string(), "claude-code".to_string()]
         );
+    }
+
+    #[test]
+    fn go_ao_configured_vendor_list_drops_minimax_and_validates_supported_scopes() {
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior_engine = std::env::var("DARK_FACTORY_AO_ENGINE").ok();
+        let prior_coder_chain = std::env::var("DARK_FACTORY_CODER_FALLBACK_CHAIN").ok();
+        let prior_reviewer_chain = std::env::var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN").ok();
+
+        unsafe {
+            std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+            std::env::remove_var("DARK_FACTORY_CODER_FALLBACK_CHAIN");
+            std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN");
+        }
+
+        // 1. Default fallback chain under strongdm-go drops minimax/claudem:
+        // default agy->minimax->claudem yields only ["agy"].
+        let default_go_vendors = configured_vendor_list("agy").unwrap();
+        assert_eq!(default_go_vendors, vec!["agy".to_string()]);
+        assert!(!default_go_vendors.contains(&"minimax".to_string()));
+        assert!(!default_go_vendors.contains(&"claudem".to_string()));
+
+        // Verification over default Go vendors succeeds without requiring MINIMAX_API_KEY
+        let prod_args = Args { once: false, dry_run: false };
+        let mut validated_vendors = Vec::new();
+        let verify_res = verify_startup_account_scopes(
+            prod_args,
+            &default_go_vendors,
+            |vendor, _cmd| {
+                validated_vendors.push(vendor.to_string());
+                Ok(())
+            },
+        );
+        assert!(verify_res.is_ok());
+        assert_eq!(validated_vendors, vec!["agy".to_string()]);
+
+        // 2. Explicit chain with AGY, Codex, MiniMax, and Claude:
+        // MiniMax is dropped, but supported AGY, Codex, and Claude scopes are retained and validated.
+        unsafe {
+            std::env::set_var(
+                "DARK_FACTORY_CODER_FALLBACK_CHAIN",
+                "antigravity->codex->minimax->claude-code",
+            );
+        }
+        let explicit_go_vendors = configured_vendor_list("antigravity").unwrap();
+        assert_eq!(
+            explicit_go_vendors,
+            vec!["agy".to_string(), "codex".to_string(), "claude-code".to_string()]
+        );
+
+        let mut validated_multi = Vec::new();
+        let verify_multi = verify_startup_account_scopes(
+            prod_args,
+            &explicit_go_vendors,
+            |vendor, _cmd| {
+                validated_multi.push(vendor.to_string());
+                Ok(())
+            },
+        );
+        assert!(verify_multi.is_ok());
+        assert_eq!(
+            validated_multi,
+            vec!["agy".to_string(), "codex".to_string(), "claude-code".to_string()]
+        );
+
+        // 3. Fallback chain containing only unsupported vendors under Go fails closed.
+        unsafe {
+            std::env::set_var(
+                "DARK_FACTORY_CODER_FALLBACK_CHAIN",
+                "minimax->claudem->aow",
+            );
+        }
+        let empty_err = configured_vendor_list("minimax").unwrap_err();
+        assert!(matches!(empty_err, DaemonError::Config(_)));
+        assert!(empty_err
+            .to_string()
+            .contains("contains no supported agents for current AO engine"));
+
+        unsafe {
+            match prior_engine {
+                Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+                None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+            }
+            match prior_coder_chain {
+                Some(v) => std::env::set_var("DARK_FACTORY_CODER_FALLBACK_CHAIN", v),
+                None => std::env::remove_var("DARK_FACTORY_CODER_FALLBACK_CHAIN"),
+            }
+            match prior_reviewer_chain {
+                Some(v) => std::env::set_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN", v),
+                None => std::env::remove_var("DARK_FACTORY_REVIEWER_FALLBACK_CHAIN"),
+            }
+        }
     }
 
     #[test]
@@ -1323,7 +1589,9 @@ mod tests {
         use std::os::unix::net::UnixDatagram;
         use std::time::Duration;
 
-        let _env_guard = NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let socket_path = std::path::PathBuf::from(format!(
             "/tmp/df-notify-{}.sock",
@@ -1355,7 +1623,9 @@ mod tests {
         use std::os::unix::net::{SocketAddr, UnixDatagram};
         use std::time::Duration;
 
-        let _env_guard = NOTIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let socket_name = format!(
             "df-abs-{}",
@@ -1383,6 +1653,9 @@ mod tests {
     /// under `--dry-run` (tests construct synthetic envs).
     #[test]
     fn startup_cargo_check_is_silent_under_dry_run() {
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Even with PATH stripped to "/tmp/some_empty_dir" and a
         // nonexistent CARGO_HOME, the dry-run flag must keep the
         // startup function silent — no stderr write, no panic.
@@ -1402,5 +1675,479 @@ mod tests {
             Some(p) => std::env::set_var("CARGO_HOME", p),
             None => std::env::remove_var("CARGO_HOME"),
         }
+    }
+
+    #[test]
+    fn startup_pytest_check_is_silent_under_dry_run() {
+        // Dry-run diagnostics must not probe or mutate the host's optional
+        // Python toolchain; production startup remains non-fatal either way.
+        verify_startup_pytest_capability(Args {
+            dry_run: true,
+            once: false,
+        });
+    }
+
+    fn test_config_with_repos(task_bead_id: Option<&str>) -> Config {
+        let repos = std::collections::HashMap::from([
+            (
+                "owner/default".to_string(),
+                daemon::config::RepoConfig {
+                    ao_project: "default-ao-project".to_string(),
+                    push_remote: "origin".to_string(),
+                    local_checkout: None,
+                },
+            ),
+            (
+                "owner/secondary".to_string(),
+                daemon::config::RepoConfig {
+                    ao_project: "secondary-ao-project".to_string(),
+                    push_remote: "origin".to_string(),
+                    local_checkout: None,
+                },
+            ),
+        ]);
+        Config {
+            task_bead_id: task_bead_id.map(str::to_string),
+            target_repo: "owner/default".to_string(),
+            ao_project: Some("default-ao-project".to_string()),
+            base_branch: "main".to_string(),
+            stage: 1,
+            max_workers: 40,
+            max_batch: 15,
+            fast_tick_secs: 60,
+            slow_tick_secs: 600,
+            autonomy_timebox_secs: 10_800,
+            budget_warn_usd: 20.0,
+            spec_dir: ".factory/specs".to_string(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos,
+            pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
+        }
+    }
+
+    #[test]
+    fn startup_scope_resolves_selected_project_and_unblocks_saturated_default() {
+        let _env_guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let store = SqliteStateStore::open_in_memory_with_schema(include_str!(
+            "../contracts/schema.sql"
+        ))
+        .unwrap();
+
+        let target_bead_id = "target-cross-repo-bead";
+        let overlay = BeadOverlay {
+            bead_id: target_bead_id.to_string(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/target-cross-repo-bead-r1".to_string()),
+            session_id: Some("sess-cross-target".to_string()),
+            session_ao_project: Some("secondary-ao-project".to_string()),
+            is_adopted: false,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("owner/secondary".to_string()),
+            attempt_started_at: None,
+        };
+        store
+            .save_dispatched_session(&overlay, "secondary-ao-project")
+            .unwrap();
+
+        let cfg = test_config_with_repos(Some(target_bead_id));
+        let binding = resolve_startup_scope_binding(&store, &cfg, &NoopAdapters).unwrap();
+
+        assert_eq!(binding.selected_repo, "owner/secondary");
+        assert_eq!(binding.ao_project, "secondary-ao-project");
+        assert_eq!(
+            binding.restored_session_projects,
+            vec![(
+                Some("sess-cross-target".to_string()),
+                Some("factory/target-cross-repo-bead-r1".to_string()),
+                "secondary-ao-project".to_string()
+            )]
+        );
+
+        // Verify active_count against Go AO db with saturated default-ao-project.
+        let prev_engine = std::env::var_os("DARK_FACTORY_AO_ENGINE");
+        let prev_ao_data = std::env::var_os("AO_DATA_DIR");
+        let temp_home = std::env::temp_dir().join(format!(
+            "df_test_sat_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ao_data = temp_home.join(".ao/data");
+        std::fs::create_dir_all(&ao_data).unwrap();
+        std::env::set_var("DARK_FACTORY_AO_ENGINE", "strongdm-go");
+        std::env::set_var("AO_DATA_DIR", &ao_data);
+
+        let db_path = ao_data.join("ao.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                workspace_path TEXT,
+                branch TEXT,
+                project_id TEXT,
+                is_terminated INTEGER,
+                activity_state TEXT,
+                num INTEGER
+            );",
+        )
+        .unwrap();
+
+        // Populate default-ao-project with 40 active sessions (reaching cfg.max_workers capacity)
+        for i in 0..40 {
+            conn.execute(
+                "INSERT INTO sessions VALUES (?1, '/ws/default', 'main', 'default-ao-project', 0, 'active', ?2)",
+                rusqlite::params![format!("sess-default-{i}"), i],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        // Construct CliSessions using the resolved binding.ao_project ("secondary-ao-project")
+        let sessions = daemon::adapters::CliSessions::with_restored_projects(
+            &binding.ao_project,
+            &binding.default_agent,
+            binding.restored_session_projects.clone(),
+            false,
+        )
+        .unwrap();
+
+        let active = sessions.active_count().unwrap();
+        assert_eq!(
+            active, 0,
+            "scoped sessions for secondary-ao-project must see 0 active workers despite saturated default project"
+        );
+        let free_slots = cfg.max_workers.saturating_sub(active);
+        assert_eq!(
+            free_slots, 40,
+            "all 40 worker slots must be available to dispatch the selected task"
+        );
+
+        // Contrast: old behavior derived project purely from cfg.target_repo ("default-ao-project")
+        let (default_ao, default_agent) = ao_runtime_binding(&cfg).unwrap();
+        assert_eq!(default_ao, "default-ao-project");
+        let default_sessions = daemon::adapters::CliSessions::new(&default_ao, &default_agent);
+        let default_active = default_sessions.active_count().unwrap();
+        assert_eq!(
+            default_active, 40,
+            "default project must be seen as fully saturated with 40 active workers"
+        );
+        assert_eq!(
+            cfg.max_workers.saturating_sub(default_active),
+            0,
+            "saturated default project would have blocked dispatch with 0 free slots"
+        );
+
+        // Environment cleanup
+        match prev_engine {
+            Some(v) => std::env::set_var("DARK_FACTORY_AO_ENGINE", v),
+            None => std::env::remove_var("DARK_FACTORY_AO_ENGINE"),
+        }
+        match prev_ao_data {
+            Some(v) => std::env::set_var("AO_DATA_DIR", v),
+            None => std::env::remove_var("AO_DATA_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[test]
+    fn transient_recovery_preserves_unrelated_dispatching_row() {
+        let store = SqliteStateStore::open_in_memory_with_schema(include_str!(
+            "../contracts/schema.sql"
+        ))
+        .unwrap();
+
+        let make_overlay = |id: &str| BeadOverlay {
+            bead_id: id.to_string(),
+            state: OverlayState::Dispatching,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some(format!("factory/{id}-r1")),
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("owner/production".to_string()),
+            attempt_started_at: None,
+        };
+
+        store.save(&make_overlay("target-task")).unwrap();
+        store.save(&make_overlay("unrelated-task")).unwrap();
+
+        // 1. In scoped mode, transient error must NOT park unrelated (or target) DISPATCHING rows.
+        let mut scoped_cfg = test_config_with_repos(Some("target-task"));
+        scoped_cfg.target_repo = "owner/production".to_string();
+
+        let mut tick_loop = TickLoopState::new(100_u64);
+        let action = classify_tick_result::<()>(
+            Err(DaemonError::Tool {
+                tool: "ao".to_string(),
+                rc: 1,
+                stderr: "transient network backoff".to_string(),
+            }),
+            10,
+            tick_loop.consecutive_failures,
+        )
+        .unwrap();
+
+        handle_tick_action(&mut tick_loop, &action, &store, &scoped_cfg).unwrap();
+
+        assert_eq!(
+            store.load("unrelated-task").unwrap().unwrap().state,
+            OverlayState::Dispatching,
+            "unrelated DISPATCHING row must be preserved in task mode"
+        );
+        assert_eq!(
+            store.load("unrelated-task").unwrap().unwrap().park_reason,
+            None,
+            "unrelated DISPATCHING row must not receive a park reason in task mode"
+        );
+        assert_eq!(
+            store.load("target-task").unwrap().unwrap().state,
+            OverlayState::Dispatching,
+            "target DISPATCHING row must be preserved during transient backoff in task mode"
+        );
+
+        // 2. In unscoped mode, transient error MUST trigger global reconciliation (parking DISPATCHING rows).
+        let mut unscoped_cfg = test_config_with_repos(None);
+        unscoped_cfg.target_repo = "owner/production".to_string();
+
+        handle_tick_action(&mut tick_loop, &action, &store, &unscoped_cfg).unwrap();
+
+        assert_eq!(
+            store.load("unrelated-task").unwrap().unwrap().state,
+            OverlayState::HumanHeld,
+            "unrelated DISPATCHING row must be parked to HumanHeld in unscoped mode"
+        );
+        assert_eq!(
+            store.load("unrelated-task").unwrap().unwrap().park_reason,
+            Some("ambiguous_dispatching_recovery".to_string()),
+            "unrelated row must have ambiguous_dispatching_recovery park reason"
+        );
+        assert_eq!(
+            store.load("target-task").unwrap().unwrap().state,
+            OverlayState::HumanHeld,
+            "target DISPATCHING row must be parked to HumanHeld in unscoped mode"
+        );
+    }
+
+    #[test]
+    fn startup_scope_fails_closed_on_unmapped_repo_or_missing_overlay() {
+        let store = SqliteStateStore::open_in_memory_with_schema(include_str!(
+            "../contracts/schema.sql"
+        ))
+        .unwrap();
+
+        // 1. Missing overlay fails closed
+        let cfg = test_config_with_repos(Some("missing-task"));
+        let err = resolve_startup_scope_binding(&store, &cfg, &NoopAdapters).unwrap_err();
+        assert!(matches!(err, DaemonError::Config(_)));
+        assert!(err.to_string().contains("has no overlay row"));
+
+        // 2. Overlay with unmapped repository fails closed
+        let mut unmapped_overlay = BeadOverlay {
+            bead_id: "unmapped-task".to_string(),
+            state: OverlayState::Dispatched,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 0,
+            spend_usd: 0.0,
+            pr_number: None,
+            branch: Some("factory/unmapped-task-r1".to_string()),
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("unmapped/repo".to_string()),
+            attempt_started_at: None,
+        };
+        store.save(&unmapped_overlay).unwrap();
+        let unmapped_cfg = test_config_with_repos(Some("unmapped-task"));
+        let err = resolve_startup_scope_binding(&store, &unmapped_cfg, &NoopAdapters).unwrap_err();
+        assert!(matches!(err, DaemonError::Config(_)));
+        assert!(err.to_string().contains("targets unmapped repository"));
+
+        // 3. Conflicting session_ao_project fails closed
+        unmapped_overlay.bead_id = "conflict-task".to_string();
+        unmapped_overlay.target_repo = Some("owner/secondary".to_string());
+        unmapped_overlay.session_id = Some("sess-conflict".to_string());
+        unmapped_overlay.session_ao_project = Some("conflicting-ao-project".to_string());
+        store.save(&unmapped_overlay).unwrap();
+        let conflict_cfg = test_config_with_repos(Some("conflict-task"));
+        let err = resolve_startup_scope_binding(&store, &conflict_cfg, &NoopAdapters).unwrap_err();
+        assert!(matches!(err, DaemonError::Config(_)));
+        assert!(err.to_string().contains("conflicts with routed project"));
+
+        // 4. Overlay in DISPATCHING state after crash fails closed with redrive diagnostic
+        let mut dispatching_overlay = unmapped_overlay;
+        dispatching_overlay.bead_id = "dispatching-task".to_string();
+        dispatching_overlay.state = OverlayState::Dispatching;
+        dispatching_overlay.session_ao_project = None;
+        store.save(&dispatching_overlay).unwrap();
+        let dispatching_cfg = test_config_with_repos(Some("dispatching-task"));
+        let err = resolve_startup_scope_binding(&store, &dispatching_cfg, &NoopAdapters).unwrap_err();
+        assert!(matches!(err, DaemonError::Config(_)));
+        assert_eq!(
+            err.to_string(),
+            "config: task_bead_id \"dispatching-task\" is in orphaned/ambiguous DISPATCHING state after crash; redrive by resetting state to QUEUED or park explicitly"
+        );
+    }
+
+    #[test]
+    fn startup_binding_resolution_is_pure_and_preserves_dispatching_state() {
+        let store = SqliteStateStore::open_in_memory_with_schema(include_str!(
+            "../contracts/schema.sql"
+        ))
+        .unwrap();
+
+        let make_dispatching = |id: &str| BeadOverlay {
+            bead_id: id.to_string(),
+            state: OverlayState::Dispatching,
+            attempt: 1,
+            reroll_count: 0,
+            autonomy_secs: 10,
+            spend_usd: 0.5,
+            pr_number: None,
+            branch: None,
+            session_id: None,
+            session_ao_project: None,
+            is_adopted: false,
+            spawn_failure_count: 0,
+            transient_error_count: 0,
+            pre_session_head_sha: None,
+            park_reason: None,
+            target_repo: Some("owner/production".to_string()),
+            attempt_started_at: None,
+        };
+
+        store.save(&make_dispatching("unscoped-orphaned-1")).unwrap();
+        store.save(&make_dispatching("unscoped-orphaned-2")).unwrap();
+
+        // Calling resolve_startup_scope_binding in unscoped mode must be pure:
+        // no DISPATCHING rows may be mutated or parked during binding resolution.
+        let mut cfg = test_config_with_repos(None);
+        cfg.target_repo = "owner/production".to_string();
+
+        let binding = resolve_startup_scope_binding(&store, &cfg, &NoopAdapters).unwrap();
+        assert_eq!(binding.selected_repo, "owner/production");
+
+        // Verify rows are completely untouched (still DISPATCHING, no park_reason).
+        let row1 = store.load("unscoped-orphaned-1").unwrap().unwrap();
+        assert_eq!(row1.state, OverlayState::Dispatching);
+        assert_eq!(row1.park_reason, None);
+
+        let row2 = store.load("unscoped-orphaned-2").unwrap().unwrap();
+        assert_eq!(row2.state, OverlayState::Dispatching);
+        assert_eq!(row2.park_reason, None);
+
+        // If compatibility verification fails before reconciliation, rows remain untouched.
+        let compat_err = verify_startup_ao_compatibility(
+            Args { once: false, dry_run: false },
+            &binding.ao_project,
+            &["agy".to_string()],
+            |_project, _vendors| Err(DaemonError::Config("simulated compat failure".into())),
+        );
+        assert!(compat_err.is_err());
+
+        // Still untouched:
+        assert_eq!(
+            store.load("unscoped-orphaned-1").unwrap().unwrap().state,
+            OverlayState::Dispatching
+        );
+
+        // Only after all validations pass does unscoped startup run reconcile_dispatching.
+        if cfg.task_bead_id.is_none() {
+            store.reconcile_dispatching().unwrap();
+        }
+
+        assert_eq!(
+            store.load("unscoped-orphaned-1").unwrap().unwrap().state,
+            OverlayState::HumanHeld
+        );
+        assert_eq!(
+            store.load("unscoped-orphaned-2").unwrap().unwrap().state,
+            OverlayState::HumanHeld
+        );
+    }
+
+    #[test]
+    fn verify_startup_account_scopes_honors_dry_run_and_validates_vendors() {
+        let dry_run_args = Args { once: false, dry_run: true };
+        let prod_args = Args { once: false, dry_run: false };
+
+        // 1. Dry run bypasses all account scope checks even with failing validator.
+        let dry_res = verify_startup_account_scopes(
+            dry_run_args,
+            &["bad-vendor".to_string()],
+            |_vendor, _cmd| Err(DaemonError::Config("must be bypassed".into())),
+        );
+        assert!(dry_res.is_ok());
+
+        // 2. Production mode calls validator on each configured vendor.
+        let mut validated = Vec::new();
+        let prod_res = verify_startup_account_scopes(
+            prod_args,
+            &["agy".to_string(), "codex".to_string()],
+            |vendor, _cmd| {
+                validated.push(vendor.to_string());
+                Ok(())
+            },
+        );
+        assert!(prod_res.is_ok());
+        assert_eq!(validated, vec!["agy", "codex"]);
+
+        // 3. Production mode propagates validation errors immediately.
+        let fail_res = verify_startup_account_scopes(
+            prod_args,
+            &["unsupported".to_string()],
+            |vendor, _cmd| Err(DaemonError::Config(format!("unsupported vendor {vendor}"))),
+        );
+        assert!(fail_res.is_err());
+        assert!(fail_res.unwrap_err().to_string().contains("unsupported vendor unsupported"));
+
+        // 4. Live daemon::account_scope::validate_ao_worker_agent_scope integration:
+        // Unknown/unsupported agent fails closed in production mode.
+        let live_fail = verify_startup_account_scopes(
+            prod_args,
+            &["invalid-agent-foo".to_string()],
+            daemon::account_scope::validate_ao_worker_agent_scope,
+        );
+        assert!(live_fail.is_err());
+        assert!(live_fail.unwrap_err().to_string().contains("Unsupported AO worker agent"));
+
+        // But is bypassed in dry-run mode.
+        let live_dry = verify_startup_account_scopes(
+            dry_run_args,
+            &["invalid-agent-foo".to_string()],
+            daemon::account_scope::validate_ao_worker_agent_scope,
+        );
+        assert!(live_dry.is_ok());
     }
 }

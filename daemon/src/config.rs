@@ -27,6 +27,11 @@ pub struct RepoRouting {
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Config {
+    /// Optional exact bead execution scope. Omitted preserves the legacy
+    /// unrestricted daemon behavior; when set, only this bead may be routed
+    /// or dispatched by the tick loop.
+    #[serde(default)]
+    pub task_bead_id: Option<String>,
     pub target_repo: String,
     #[serde(default)]
     pub ao_project: Option<String>,
@@ -201,6 +206,24 @@ impl Config {
         path.is_dir().then_some(path)
     }
 
+    /// Resolve the mutable reroll spec outside managed source checkouts.
+    /// Absolute paths are explicit operator-owned locations. Relative paths
+    /// use the daemon runtime-state tree, sharded by complete repository
+    /// identity, so mutation cannot dirty an exact-head target checkout.
+    pub fn resolve_spec_path(&self, repo: &str, bead_id: &str) -> PathBuf {
+        let filename = format!("{bead_id}.toml");
+        if Path::new(&self.spec_dir).is_relative() {
+            let (owner, name) = repo.split_once('/').unwrap_or(("unknown", repo));
+            crate::intake::runtime_state_dir()
+                .join("specs")
+                .join(owner)
+                .join(name)
+                .join(filename)
+        } else {
+            Path::new(&self.spec_dir).join(&filename)
+        }
+    }
+
     /// Bead jleechan-jw4c: resolve the per-agent worktree directory under
     /// `agent_worktree_root`. Returns `None` when the operator has not
     /// flipped on the new layout (the config knob is `None`), in which
@@ -310,6 +333,46 @@ pub fn is_fixture_repo(repo: &str) -> bool {
     matches!(repo, "owner/repo" | "other/repo" | "myorg/myrepo")
 }
 
+/// Validate and canonicalize one exact bead selector. Bead IDs are opaque
+/// tracker identities, but the tracker grammar is deliberately narrow here:
+/// ASCII letters/digits plus `.`, `_`, and `-`, with no whitespace or path
+/// separators. This is syntax validation only; existence and routing are
+/// checked against the overlay/tracker before startup side effects.
+pub fn validate_task_bead_id(value: &str) -> Result<String, DaemonError> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+    {
+        return Err(DaemonError::Config(
+            "task_bead_id must be a nonblank ASCII bead ID (letters, digits, '.', '_' or '-')"
+                .to_string(),
+        ));
+    }
+    Ok(value.to_string())
+}
+
+/// Resolve the optional task selector from config and the process environment.
+/// The environment is an override only when it agrees with the configured
+/// value; a conflicting pair fails closed rather than silently changing scope.
+pub fn resolve_task_bead_id(
+    configured: Option<&str>,
+    env_override: Option<&str>,
+) -> Result<Option<String>, DaemonError> {
+    let configured = configured.map(validate_task_bead_id).transpose()?;
+    let env_override = env_override.map(validate_task_bead_id).transpose()?;
+    match (configured, env_override) {
+        (Some(configured), Some(env)) if configured != env => Err(DaemonError::Config(
+            format!(
+                "DARK_FACTORY_TASK_BEAD_ID {env:?} conflicts with configured task_bead_id {configured:?}"
+            ),
+        )),
+        (Some(configured), _) => Ok(Some(configured)),
+        (None, Some(env)) => Ok(Some(env)),
+        (None, None) => Ok(None),
+    }
+}
+
 pub fn load(path: &Path) -> Result<Config, DaemonError> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| DaemonError::Config(format!("{}: {e}", path.display())))?;
@@ -319,14 +382,55 @@ pub fn load(path: &Path) -> Result<Config, DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static TARGET_WORKTREE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn parses_example_config() {
-        let cfg = load(std::path::Path::new("contracts/daemon.toml.example")).unwrap();
+        let cfg = load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("contracts/daemon.toml.example"),
+        )
+        .unwrap();
         assert_eq!(cfg.ao_project.as_deref(), Some("dark-factory"));
         assert_eq!(cfg.stage, 1);
-        assert_eq!(cfg.max_workers, 30);
+        assert_eq!(cfg.max_workers, 40);
         assert_eq!(cfg.max_batch, 15);
         assert_eq!(cfg.base_branch, "main");
+    }
+
+    #[test]
+    fn task_bead_id_is_optional_and_exactly_validated() {
+        let raw = include_str!("../contracts/daemon.toml.example");
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.task_bead_id, None);
+        let cfg: Config = toml::from_str(&format!(
+            "{raw}\ntask_bead_id = 'dark-factory-c4zhq'\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.task_bead_id.as_deref(), Some("dark-factory-c4zhq"));
+        assert_eq!(
+            resolve_task_bead_id(None, Some("dark-factory-c4zhq"))
+                .unwrap()
+                .as_deref(),
+            Some("dark-factory-c4zhq")
+        );
+        assert_eq!(
+            resolve_task_bead_id(
+                Some("dark-factory-c4zhq"),
+                Some("dark-factory-c4zhq")
+            )
+            .unwrap()
+            .as_deref(),
+            Some("dark-factory-c4zhq")
+        );
+        assert_eq!(resolve_task_bead_id(None, None).unwrap(), None);
+        assert!(resolve_task_bead_id(Some("dark-factory-c4zhq"), Some("other")).is_err());
+        assert!(resolve_task_bead_id(None, Some("")).is_err());
+        assert!(resolve_task_bead_id(Some(" bad"), None).is_err());
+        for value in ["", "bad/id", "bad space", "é"] {
+            assert!(validate_task_bead_id(value).is_err(), "{value:?}");
+        }
     }
     #[test]
     fn missing_key_is_config_error() {
@@ -630,6 +734,9 @@ local_checkout = "{}"
 
     #[test]
     fn target_worktree_reuses_isolated_checkout_when_local_checkout_is_missing() {
+        let _lock = TARGET_WORKTREE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let root = std::env::temp_dir().join(format!("afd_isolated_target_{}", std::process::id()));
         let isolated = root.join("owner").join("target");
         std::fs::create_dir_all(&isolated).unwrap();
@@ -663,9 +770,86 @@ push_remote = "origin"
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Relative runtime specs must never dirty the managed target checkout.
+    #[test]
+    fn relative_spec_dir_uses_runtime_state_not_target_worktree() {
+        let cfg = Config {
+            task_bead_id: None,
+            target_repo: "owner/daemon".into(),
+            ao_project: None,
+            base_branch: "main".into(),
+            stage: 1,
+            max_workers: 1,
+            max_batch: 1,
+            fast_tick_secs: 1,
+            slow_tick_secs: 1,
+            autonomy_timebox_secs: 60,
+            budget_warn_usd: 1.0,
+            spec_dir: ".factory/specs/".into(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos: std::collections::HashMap::new(),
+            pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
+        };
+
+        let resolved = cfg.resolve_spec_path("owner/target", "bead-123");
+        let expected = crate::intake::runtime_state_dir()
+            .join("specs")
+            .join("owner")
+            .join("target")
+            .join("bead-123.toml");
+        assert_eq!(
+            resolved, expected,
+            "a relative spec_dir must resolve under daemon runtime state, not a managed source checkout"
+        );
+    }
+
+    /// Companion to the relative case above: an ABSOLUTE `spec_dir` must be
+    /// used as-is, never joined onto the target worktree root at all.
+    #[test]
+    fn absolute_spec_dir_ignores_target_worktree() {
+        let root = std::env::temp_dir().join(format!("afd_absolute_spec_dir_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let absolute_spec_dir = root.join("shared-specs");
+
+        let cfg = Config {
+            task_bead_id: None,
+            target_repo: "owner/daemon".into(),
+            ao_project: None,
+            base_branch: "main".into(),
+            stage: 1,
+            max_workers: 1,
+            max_batch: 1,
+            fast_tick_secs: 1,
+            slow_tick_secs: 1,
+            autonomy_timebox_secs: 60,
+            budget_warn_usd: 1.0,
+            spec_dir: absolute_spec_dir.display().to_string(),
+            reroll_head_stability_window_secs: 30,
+            reroll_death_confirm_secs: 5,
+            held_recheck_cooldown_secs: 900,
+            repos: std::collections::HashMap::new(),
+            pre_gate_validation_enabled: false,
+            escalation_refire_secs: 3600,
+            agent_worktree_root: None,
+            worktree_ttl_secs: 14 * 24 * 60 * 60,
+            worktree_max_count: 200,
+        };
+
+        let resolved = cfg.resolve_spec_path("owner/target", "bead-456");
+        assert_eq!(resolved, absolute_spec_dir.join("bead-456.toml"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn explicit_production_repo_without_checkout_is_clone_eligible() {
         let cfg = Config {
+            task_bead_id: None,
             target_repo: "owner/daemon".into(),
             ao_project: None,
             base_branch: "main".into(),
@@ -707,6 +891,7 @@ push_remote = "origin"
         ));
         let checkout = root.join("production");
         let cfg = Config {
+            task_bead_id: None,
             target_repo: "owner/daemon".into(),
             ao_project: None,
             base_branch: "main".into(),
@@ -750,6 +935,7 @@ push_remote = "origin"
     #[test]
     fn explicit_relative_checkout_is_not_clone_eligible() {
         let cfg = Config {
+            task_bead_id: None,
             target_repo: "owner/daemon".into(),
             ao_project: None,
             base_branch: "main".into(),
@@ -784,6 +970,9 @@ push_remote = "origin"
 
     #[test]
     fn isolated_target_worktree_path_keeps_same_name_repositories_separate() {
+        let _lock = TARGET_WORKTREE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let root = std::env::temp_dir().join(format!(
             "afd_isolated_same_name_{}",
             std::process::id()
@@ -866,6 +1055,7 @@ spec_dir = ".factory/specs/"
     #[test]
     fn agent_worktree_path_uses_owner_repo_layout() {
         let cfg = Config {
+            task_bead_id: None,
             target_repo: "owner/repo".into(),
             ao_project: None,
             base_branch: "main".into(),

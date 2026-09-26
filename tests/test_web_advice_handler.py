@@ -1569,9 +1569,20 @@ class TestFailOpenContract:
 
         if scenario == "missing_pr_url":
             ctx.state.pop("pr_url", None)
+            # This input-validation case must not rediscover a PR from the
+            # checkout.  Discovery is an integration seam and can otherwise
+            # turn the missing-input case into a live transport review.
+            monkeypatch.setattr(
+                "runner.handler_web_advice._seed_web_advice_state",
+                lambda _ctx: {"ok": True},
+            )
             node = Node(name="web_advice", attrs={"type": "web_advice"})
         elif scenario == "unparseable_pr_url":
             ctx.state["pr_url"] = "garbage"
+            monkeypatch.setattr(
+                "runner.handler_web_advice._seed_web_advice_state",
+                lambda _ctx: {"ok": True},
+            )
             node = Node(name="web_advice", attrs={"type": "web_advice"})
         elif scenario == "trivial_diff":
             monkeypatch.setattr(
