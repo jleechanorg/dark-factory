@@ -308,6 +308,7 @@ pub fn snapshot_with_comments(pr: u64, comments: Vec<PrComment>) -> PrSnapshot {
         coderabbit_approved: true,
         bugbot_error_count: 0,
         unresolved_thread_count: Some(0),
+        unresolved_threads: Some(Vec::new()),
         head_sha: "deadbeef".into(),
         body: String::new(),
         comments,
