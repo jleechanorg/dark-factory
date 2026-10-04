@@ -25,12 +25,12 @@ pr_green_live_session_is_busy() { return 1; }
 if pr_green_delivery_recovery_identity wa 1 wa-1 native-session-123 /work; then exit 1; fi
 [[ "$(pr_green_delivery_pending_status wa 1)" == pending ]]
 echo 'PASS: native PTY fails closed without tmux, missing ack preserves duplicate suppression'
-# A Chat or unknown mode never enters restore/send or native registration.
+# Chat never enters terminal transport or native registration.
 pr_green_session_record() { printf '%s\n' '{"id":"wa-1","isTerminated":false}'; }
 pr_green_session_mode() { printf '%s\n' chat; }
 ao() { echo 'FAIL: unsupported Chat transport used' >&2; exit 99; }
 rc=0; pr_green_reuse_session wa 1 repair >/dev/null 2>&1 || rc=$?
-[[ "$rc" == 3 && -f "$tmp/wa-1.json" ]]
+[[ "$rc" == 4 && -f "$tmp/wa-1.json" ]]
 # Restore the real busy helper for focused native task-boundary evidence.
 source "$ROOT/jobs/jleechanorg-pr-green/session-reuse.sh"
 pr_green_runtime_handle() { printf '%s\n' ptyhost-v1:opaque; }
@@ -47,6 +47,7 @@ pr_green_live_session_is_busy wa wa-1
 pr_green_live_session_is_busy wa wa-1
 # Legacy tmux dispatch remains on its existing path.
 pr_green_runtime_handle() { printf '%s\n' legacy-runtime; }
+pr_green_tmux_socket_for_handle() { printf 'default\n'; }
 tmux() { case "$1" in has-session) return 0;; capture-pane) printf '%s\n' 'Working (2s)';; *) return 99;; esac; }
 pr_green_live_session_is_busy wa wa-1
-echo 'PASS: Chat refused, native started/completed/partial/missing boundaries fenced, legacy busy detection preserved'
+echo 'PASS: Chat pending preserved, native started/completed/partial/missing boundaries fenced, legacy busy detection preserved'

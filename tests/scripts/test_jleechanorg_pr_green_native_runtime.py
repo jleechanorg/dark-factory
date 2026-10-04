@@ -18,6 +18,21 @@ class NativeRuntimeTests(unittest.TestCase):
         self.view = dict(id='wa-1', projectId='wa', isTerminated=False, mode='tui',
                          terminalGeneration='launch-1', terminalHandleId='ptyhost-v1:opaque', activity={'state': 'idle'})
 
+    def test_named_socket_requires_verified_packaged_daemon(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); proc = root / 'proc'; entry = proc / '123'; entry.mkdir(parents=True)
+            exe = root / 'resources/daemon/ao'; exe.parent.mkdir(parents=True); exe.touch()
+            (entry / 'exe').symlink_to(exe)
+            (entry / 'cmdline').write_bytes(b'ao\0daemon\0')
+            (entry / 'stat').write_text('123 (ao) ' + ' '.join(['0'] * 20))
+            (entry / 'environ').write_bytes(b'AO_TMUX_SOCKET_NAME=ao\0SECRET=do-not-output\0')
+            run = root / 'running.json'; run.write_text('{"pid":123}')
+            self.assertEqual(module.daemon_tmux_socket(run, proc), 'ao')
+            with patch.object(module, 'starttime', side_effect=['first', 'second']), self.assertRaises(ValueError):
+                module.daemon_tmux_socket(run, proc)
+            (entry / 'cmdline').write_bytes(b'ao\0spawn\0')
+            with self.assertRaises(ValueError): module.daemon_tmux_socket(run, proc)
+
     def test_exact_generation_and_tui_required(self):
         module.validate(self.row, self.view)
         for change in ({'terminalGeneration': 'old-launch'}, {'id': 'reused-id'},

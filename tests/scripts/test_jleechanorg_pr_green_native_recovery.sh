@@ -76,6 +76,7 @@ curl() {
   printf '%s\n' '{"status":"ok"}'
 }
 
+pr_green_tmux_socket_for_handle() { printf "default\n"; }
 tmux() {
   case "$1 $2" in
     "list-panes -t") printf '%s\n' "$live_pid" ;;

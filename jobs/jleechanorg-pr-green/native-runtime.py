@@ -40,6 +40,30 @@ def starttime(entry):
     return stat[stat.rfind(')') + 2:].split()[19]
 
 
+def daemon_tmux_socket(run_file, proc=Path('/proc')):
+    path = Path(run_file)
+    before = path.read_bytes()
+    pid = json.loads(before)['pid']
+    if type(pid) is not int or pid <= 1:
+        raise ValueError('invalid daemon PID')
+    entry = proc / str(pid)
+    generation = starttime(entry)
+    if entry.stat().st_uid != os.getuid():
+        raise ValueError('daemon owner mismatch')
+    exe = str((entry / 'exe').resolve())
+    args = (entry / 'cmdline').read_bytes().split(b'\0')
+    if not exe.endswith('/resources/daemon/ao') or len(args) < 2 or args[1] != b'daemon':
+        raise ValueError('not the packaged daemon')
+    # Read only the requested runtime setting into the result; never emit env.
+    env = dict(part.split(b'=', 1) for part in (entry / 'environ').read_bytes().split(b'\0') if b'=' in part)
+    socket = env.get(b'AO_TMUX_SOCKET_NAME', b'').decode()
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', socket) or socket == 'default':
+        raise ValueError('named tmux socket unavailable')
+    if path.read_bytes() != before or starttime(entry) != generation:
+        raise ValueError('daemon changed during observation')
+    return socket
+
+
 def view(api, session):
     url = urlsplit(api)
     if url.scheme != 'http' or url.hostname not in ('127.0.0.1', 'localhost') or url.username or url.password or url.query or url.fragment or url.path not in ('', '/'):
@@ -109,6 +133,8 @@ def observe(db, api, project, session):
 
 if __name__ == '__main__':
     try:
+        if len(sys.argv) == 3 and sys.argv[1] == '--tmux-socket':
+            print(daemon_tmux_socket(sys.argv[2])); sys.exit(0)
         if len(sys.argv) == 5 and sys.argv[1] == '--mode':
             print(session_mode(*sys.argv[2:])); sys.exit(0)
         if len(sys.argv) != 5:
