@@ -153,9 +153,20 @@ class ChatDeliveryTests(unittest.TestCase):
             self.assertEqual(m.deliver(None, *self.args[1:]), 4)
 
     def test_busy_session_does_not_enqueue_another_repair(self):
-        with patch.object(m, 'validate', return_value=(self.snapshot(), self.owner)):
-            self.assertEqual(m.deliver(*self.args), 0)
-        self.assertFalse(self.path.exists())
+        for controller, state in [('busy', 'completed'), ('ready', 'running'), ('ready', 'queued')]:
+            with self.subTest(controller=controller, state=state):
+                snapshot = self.snapshot(state); snapshot['controller'] = controller
+                with patch.object(m, 'validate', return_value=(snapshot, self.owner)):
+                    self.assertEqual(m.deliver(*self.args), 5)
+                self.assertFalse(self.path.exists())
+
+    def test_unready_controller_is_unconfirmed_not_delivered_or_busy(self):
+        for controller in ('connecting', 'error', None):
+            with self.subTest(controller=controller):
+                snapshot = self.snapshot('completed'); snapshot['controller'] = controller
+                with patch.object(m, 'validate', return_value=(snapshot, self.owner)):
+                    self.assertEqual(m.deliver(*self.args), 4)
+                self.assertFalse(self.path.exists())
 
     def test_confirmed_initial_provider_turn_clears_pending_without_post(self):
         m.save(self.path, {'session': self.owner['id'], 'initial': True, 'text': 'repair'})

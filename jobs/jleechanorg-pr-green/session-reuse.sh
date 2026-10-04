@@ -1188,8 +1188,13 @@ pr_green_reuse_session() {
   local mode
   mode="$(pr_green_session_mode "$project_id" "$session_id" 2>/dev/null || true)"
   if [[ "$mode" == chat ]]; then
-    pr_green_chat_delivery "$project_id" "$pr_number" "$session_id" "$prompt"
-    return $?
+    local chat_rc=0
+    pr_green_chat_delivery "$project_id" "$pr_number" "$session_id" "$prompt" || chat_rc=$?
+    case "$chat_rc" in
+      0) printf '%s\n' reused; return 0 ;;
+      5) printf '%s\n' busy_deferred; return 0 ;;
+      *) return "$chat_rc" ;;
+    esac
   fi
   if [[ "$mode" != tui ]]; then
     printf '%s\n' "AO session $session_id is Chat or its mode is unverified; suppressing terminal delivery and duplicate spawn" >&2

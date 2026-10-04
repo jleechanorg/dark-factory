@@ -238,8 +238,10 @@ def _deliver_locked(api, db, project, session, home, path, text, initial=False):
         pending = {'session': session, 'owner': owner, 'text': text, 'initial': True}
         save(path, pending)
     else:
-        if snapshot.get('controller') != 'ready' or any(t.get('state') in ('running', 'queued') for t in snapshot.get('turns', [])):
-            return 0
+        if snapshot.get('controller') == 'busy' or any(t.get('state') in ('running', 'queued') for t in snapshot.get('turns', [])):
+            return 5
+        if snapshot.get('controller') != 'ready':
+            return 4
         request = uuid.uuid4().hex
         pending = {'session': session, 'owner': owner, 'text': text, 'request': request}
         save(path, pending)
