@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Supported Chat delivery with durable handles and provider-backed receipts."""
 from datetime import datetime
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -84,6 +85,7 @@ def validate(api, db, project, session, home):
     snapshot = api.request('sessions/' + session + '/conversation?limit=500')
     if snapshot.get('sessionId') != session or snapshot.get('mode') != 'chat' or snapshot.get('harness') != 'codex':
         raise ValueError('conversation identity mismatch')
+    precise_turn_times(db, entry, snapshot)
     if row(db, project, session) != entry:
         raise ValueError('controller changed during observation')
     return snapshot, entry
@@ -97,6 +99,32 @@ def timestamp(value):
         raise ValueError('invalid timezone-aware timestamp')
     whole = datetime.fromisoformat(match[1] + match[3].replace('Z', '+00:00'))
     return int(whole.timestamp()), int((match[2] or '').ljust(9, '0'))
+
+
+def precise_turn_times(db, owner, snapshot):
+    # v0.13.3's public DTO truncates requestedAt to seconds. Recover precision
+    # only from the exact persisted turn, bound to this session/controller and
+    # provider turn. Async admission may have an empty stored generation;
+    # current conversation ownership is still mandatory. Never round admission
+    # backward to make a receipt pass.
+    with sqlite3.connect(Path(db).resolve().as_uri() + '?mode=ro', uri=True) as conn:
+        for turn in snapshot.get('turns', []):
+            if not turn.get('providerTurnId'):
+                continue
+            stored = conn.execute(
+                'SELECT t.requested_at FROM conversation_turns t '
+                'JOIN conversations c ON c.id=t.conversation_id '
+                'WHERE t.id=? AND t.handled_by_session_id=? '
+                "AND (t.controller_generation=? OR t.controller_generation='') "
+                'AND t.provider_turn_id=? AND t.rolled_back_at IS NULL '
+                'AND c.id=? AND c.current_session_id=? AND c.project_id=?',
+                (turn['id'], owner['id'], owner['controller_generation'], turn['providerTurnId'],
+                 snapshot.get('conversationId'), owner['id'], owner['project_id'])).fetchone()
+            if stored is None:
+                continue
+            if timestamp(stored[0])[0] != timestamp(turn['requestedAt'])[0]:
+                raise ValueError('public and persisted turn timestamps disagree')
+            turn['requestedAt'] = stored[0]
 
 
 def acknowledged(snapshot, text, turn_id=None, initial_owner=None):
@@ -131,6 +159,20 @@ def save(path, data):
 
 
 def deliver(api, db, project, session, home, path, text, initial=False):
+    # Serialize the complete observation/persist/send sequence across processes.
+    # Keep the lock inode after use so a concurrent caller cannot lock a new
+    # inode while an earlier delivery still owns the original one.
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path.with_name(path.name + '.lock'), os.O_WRONLY | os.O_CREAT, 0o600)
+    with os.fdopen(fd, 'w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 4
+        return _deliver_locked(api, db, project, session, home, path, text, initial)
+
+
+def _deliver_locked(api, db, project, session, home, path, text, initial=False):
     if initial and not path.exists():
         save(path, {"session": session, "text": text, "initial": True})
     snapshot, owner = validate(api, db, project, session, home)

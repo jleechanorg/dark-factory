@@ -487,7 +487,7 @@ pr_green_native_runtime_observation() {
 pr_green_daemon_tmux_socket() {
   local helper
   helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/native-runtime.py"
-  python3 "$helper" --tmux-socket "${AO_RUN_FILE:-$HOME/.ao/running.json}"
+  python3 "$helper" --tmux-socket "${PR_GREEN_AO_RUN_FILE:-${AO_RUN_FILE:-$HOME/.ao/running.json}}"
 }
 
 pr_green_tmux_socket_for_handle() {
@@ -743,6 +743,10 @@ pr_green_delivery_clear_pending() {
 pr_green_delivery_pending_status() {
   local project_id="$1" pr_number="$2" path pending listing count envelope legacy_envelope native_id workspace
   path="$(pr_green_delivery_pending_path "$project_id" "$pr_number")" || return 1
+  # Chat receipts reserve the PR even when AO temporarily omits its session.
+  # Only the Chat receipt observer may retire this reservation. Empty or
+  # malformed ledgers must not authorize a new worker either.
+  [[ ! -e "${path}.chat" ]] || { printf '%s\n' pending; return 0; }
   [[ -s "$path" ]] || { printf '%s\n' none; return 0; }
   pending="$(cat -- "$path" 2>/dev/null || true)"
   native_id="$(jq -r '.native_id // empty' <<<"$pending" 2>/dev/null || true)"

@@ -1,4 +1,5 @@
 import importlib.util
+import fcntl
 from pathlib import Path
 import tempfile
 import unittest
@@ -19,6 +20,51 @@ class ChatDeliveryTests(unittest.TestCase):
     def snapshot(self, state='running', provider='p1', text='repair'):
         return {'controller': 'busy', 'turns': [{'id': 't1', 'providerTurnId': provider, 'state': state, 'requestedAt': '2026-10-04T18:00:01Z'}],
                 'messages': [{'role': 'user', 'text': text, 'turnId': 't1'}]}
+
+    def test_overlapping_delivery_preserves_the_current_owner(self):
+        with self.path.with_name(self.path.name + '.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(m, 'validate', side_effect=AssertionError('concurrent delivery must not inspect or send')):
+                self.assertEqual(m.deliver(*self.args), 4)
+        self.assertFalse(self.path.exists())
+
+    def test_precise_stored_turn_time_resolves_same_second_admission(self):
+        db = str(Path(self.tmp.name) / 'ao.db')
+        with m.sqlite3.connect(db) as conn:
+            conn.execute('CREATE TABLE conversation_turns(id, handled_by_session_id, provider_turn_id, controller_generation, requested_at, rolled_back_at, conversation_id)')
+            conn.execute('CREATE TABLE conversations(id, current_session_id, project_id)')
+            conn.execute('INSERT INTO conversations VALUES(?,?,?)', ('c1', self.owner['id'], self.owner['project_id']))
+            conn.execute("INSERT INTO conversation_turns VALUES(?,?,?,?,?,NULL,'c1')",
+                         ('t1', self.owner['id'], 'p1', 'g1', '2026-10-04 18:00:01.200000001 +0000 UTC'))
+        owner = self.owner | {'created_at': '2026-10-04 18:00:01.200000000 +0000 UTC'}
+        snapshot = self.snapshot()
+        snapshot['conversationId'] = 'c1'
+        m.precise_turn_times(db, owner, snapshot)
+        self.assertTrue(m.acknowledged(snapshot, 'repair', initial_owner=owner))
+        self.assertFalse(m.acknowledged(snapshot, 'repair', initial_owner=owner | {'created_at': '2026-10-04 18:00:01.200000002 +0000 UTC'}))
+        # Async provisioning records an empty generation and does not rewrite
+        # it when the provider is bound. Current conversation ownership still
+        # must match before its exact stored time may be used.
+        with m.sqlite3.connect(db) as conn:
+            conn.execute("UPDATE conversation_turns SET controller_generation='' ")
+        snapshot = self.snapshot(); snapshot['conversationId'] = 'c1'
+        m.precise_turn_times(db, owner, snapshot)
+        self.assertTrue(m.acknowledged(snapshot, 'repair', initial_owner=owner))
+        with m.sqlite3.connect(db) as conn:
+            conn.execute("UPDATE conversation_turns SET controller_generation='g1' ")
+        # A different generation or provider turn cannot lend its timestamp.
+        for changed in ({'controller_generation': 'old'}, {'id': 'other-session'}):
+            snapshot = self.snapshot(); snapshot['conversationId'] = 'c1'
+            m.precise_turn_times(db, owner | changed, snapshot)
+            self.assertFalse(m.acknowledged(snapshot, 'repair', initial_owner=owner))
+        snapshot = self.snapshot(provider='other-provider-turn'); snapshot['conversationId'] = 'c1'
+        m.precise_turn_times(db, owner, snapshot)
+        self.assertFalse(m.acknowledged(snapshot, 'repair', initial_owner=owner))
+        # A public/store disagreement must fail closed, not rewrite history.
+        snapshot = self.snapshot()
+        snapshot['conversationId'] = 'c1'
+        snapshot['turns'][0]['requestedAt'] = '2026-10-04T18:00:02Z'
+        with self.assertRaises(ValueError): m.precise_turn_times(db, owner, snapshot)
 
     def test_queued_receipt_is_not_provider_ack(self):
         self.assertFalse(m.acknowledged(self.snapshot('queued'), 'repair'))

@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source "$(dirname "$0")/../../jobs/jleechanorg-pr-green/session-reuse.sh"
+# API and tmux discovery must use the same explicit daemon run-file override.
+(
+  export PR_GREEN_AO_RUN_FILE=/managed/running.json AO_RUN_FILE=/other/running.json
+  python3() {
+    [[ "$2" == --tmux-socket && "$3" == /managed/running.json ]] || return 99
+    printf 'managed\n'
+  }
+  [[ "$(pr_green_daemon_tmux_socket)" == managed ]]
+)
 pr_green_daemon_tmux_socket() { printf 'ao\n'; }
 named_exists=1; legacy=0
 calls=$(mktemp); trap 'rm -f "$calls"' EXIT
