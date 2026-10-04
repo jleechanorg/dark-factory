@@ -464,10 +464,34 @@ pr_green_process_codex_home() {
   return 1
 }
 
+# A Chat controller has different delivery evidence; never guess that it is a
+# terminal session. Missing databases/rows fail closed, including on old AO.
+pr_green_session_mode() {
+  local helper
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/native-runtime.py"
+  python3 "$helper" --mode "${PR_GREEN_AO_DB_PATH:-$HOME/.ao/data/ao.db}" "$1" "$2"
+}
+
+# Native PTY inspection uses the public session generation and narrowly scoped
+# read-only process/database evidence. Never feed opaque PTY handles to tmux.
+pr_green_native_runtime_observation() {
+  local api_base helper db
+  api_base="$(pr_green_ao_api_base)" || return 1
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/native-runtime.py"
+  db="${PR_GREEN_AO_DB_PATH:-$HOME/.ao/data/ao.db}"
+  python3 "$helper" "$db" "$api_base" "$1" "$2"
+}
+
 pr_green_live_codex_home() {
   local project_id="$1" session_id="$2" runtime_handle pane_pid
   runtime_handle="$(pr_green_runtime_handle "$project_id" "$session_id" || true)"
   [[ -n "$runtime_handle" ]] || return 1
+  if [[ "$runtime_handle" == ptyhost-v1:* ]]; then
+    local observed
+    observed="$(pr_green_native_runtime_observation "$project_id" "$session_id")" || return 1
+    jq -er '.home | select(length > 0)' <<<"$observed"
+    return
+  fi
   pane_pid="$(tmux list-panes -t "$runtime_handle" -F '#{pane_pid}' 2>/dev/null | head -n 1)"
   [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 1
   local workspace="$3"
@@ -814,6 +838,10 @@ pr_green_delivery_recovery_identity() {
   pr_green_live_session_is_busy "$project_id" "$session_id" && return 2
   runtime_handle="$(pr_green_runtime_handle "$project_id" "$session_id" 2>/dev/null || true)"
   [[ -n "$runtime_handle" && ( -z "$expected_runtime" || "$runtime_handle" == "$expected_runtime" ) ]] || return 1
+  if [[ "$runtime_handle" == ptyhost-v1:* ]]; then
+    printf '%s\n' "Native PTY composer recovery unavailable; preserving pending delivery" >&2
+    return 1
+  fi
   pane_ids="$(tmux list-panes -t "$runtime_handle" -F '#{pane_id}' 2>/dev/null || true)"
   [[ -n "$pane_ids" && "$pane_ids" != *$'\n'* ]] || return 1
   pane_id="$pane_ids"
@@ -1029,6 +1057,28 @@ pr_green_live_session_is_busy() {
 
   runtime_handle="$(pr_green_runtime_handle "$project_id" "$session_id" || true)"
   [[ -n "$runtime_handle" ]] || return 1
+  if [[ "$runtime_handle" == ptyhost-v1:* ]]; then
+    local observed row workspace native_id listing line home relative latest boundary=''
+    observed="$(pr_green_native_runtime_observation "$project_id" "$session_id" 2>/dev/null)" || return 0
+    [[ "$(jq -r '.activity' <<<"$observed")" == idle ]] || return 0
+    native_id="$(jq -r '.nativeId' <<<"$observed")"
+    [[ -n "$native_id" ]] || return 0
+    row="$(pr_green_session_recovery_row "$project_id" "$session_id")" || return 0
+    workspace="${row%%|*}"
+    listing="$(pr_green_find_native_rollouts "$workspace" '' "$native_id" 2>/dev/null)" || return 0
+    [[ "${listing%%$'\n'*}" == "$native_id" ]] || return 0
+    while IFS= read -r line; do
+      [[ "$line" == *$'\t'* ]] || continue
+      home="${line#*$'\t'}"
+      relative="${home#*$'\t'}"; home="${home%%$'\t'*}"
+      latest="$(jq -r 'select(.type == "event_msg") | .payload.type | select(. == "task_started" or . == "task_complete" or . == "task_completed" or . == "turn_aborted")' "$home/$relative" 2>/dev/null | tail -n 1)" || return 0
+      [[ -n "$latest" ]] || return 0
+      [[ "$latest" != task_started ]] || return 0
+      boundary="$latest"
+    done <<<"$listing"
+    [[ -n "$boundary" ]] || return 0
+    return 1
+  fi
   tmux has-session -t "$runtime_handle" 2>/dev/null || return 1
   pane="$(tmux capture-pane -p -t "$runtime_handle" -S -80 2>/dev/null || true)"
   grep -Eq 'Working \(|Waiting for agents|Waiting for background terminal' <<<"$pane"
@@ -1071,6 +1121,10 @@ pr_green_reuse_session() {
 
   session_id="$(jq -r '.id // empty' <<<"$record")"
   [[ -n "$session_id" ]] || return 1
+  if [[ "$(pr_green_session_mode "$project_id" "$session_id" 2>/dev/null || true)" != tui ]]; then
+    printf '%s\n' "AO session $session_id is Chat or its mode is unverified; suppressing terminal delivery and duplicate spawn" >&2
+    return 3
+  fi
   terminated="$(jq -r 'if (.isTerminated // false) then "true" else "false" end' <<<"$record")"
 
   if [[ "$terminated" == "true" ]]; then

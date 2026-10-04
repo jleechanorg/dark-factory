@@ -514,7 +514,7 @@ EOF
   # deferred instead of producing concurrent-spawn refusals.
   mkdir -p "$AO_SPAWN_LOCK_DIR"
   ao_spawn_lock="$AO_SPAWN_LOCK_DIR/jleechanorg-pr-green-ao-${project_id}.lock"
-  spawn_cmd=(flock -n "$ao_spawn_lock" ao spawn --project "$project_id" --claim-pr "$number" --name "$session_name" --harness codex --prompt "$prompt")
+  spawn_cmd=(flock -n "$ao_spawn_lock" ao spawn --project "$project_id" --claim-pr "$number" --name "$session_name" --harness codex --mode tui --prompt "$prompt")
   attempted=$((attempted + 1))
   spawn_err="$(mktemp)"
   # The Go AO CLI creates and claims the worker, then returns. Wait for that
