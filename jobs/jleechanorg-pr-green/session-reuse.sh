@@ -1140,6 +1140,21 @@ pr_green_chat_admission() {
   printf '%s' "$prompt" | python3 "$helper" "${args[@]}"
 }
 
+pr_green_chat_spawn_receipt() {
+  local project="$1" number="$2" prompt="$3" helper path
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"
+  path="$(pr_green_delivery_pending_path "$project" "$number")" || return 4
+  printf '%s' "$prompt" | python3 "$helper" --spawn-receipt-path "${path}.chat"
+}
+
+pr_green_chat_reserved_session() {
+  local helper path
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"
+  path="$(pr_green_delivery_pending_path "$1" "$2")" || return 4
+  [[ ! -e "$path" && -e "${path}.chat" ]] || return 4
+  python3 "$helper" --reserved-session "${path}.chat"
+}
+
 pr_green_chat_prepare_restore() {
   local project="$1" number="$2" session="$3" prompt="$4" helper api home path
   helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"
@@ -1184,6 +1199,19 @@ pr_green_reuse_session() {
 
   record="$(pr_green_session_record "$project_id" "$pr_number" 2>/dev/null || true)"
   if [[ -z "$record" ]]; then
+    # The exact original native receipt can survive a missing session-list row.
+    # Initial delivery only observes that ID through direct API/DB/process proof;
+    # it never restores, spawns, or replays a provider message. Keep its ledger
+    # while listing is absent so another sweep cannot admit a duplicate.
+    local reserved_session reserved_rc=0
+    if reserved_session="$(pr_green_chat_reserved_session "$project_id" "$pr_number" 2>/dev/null)"; then
+      pr_green_chat_delivery "$project_id" "$pr_number" "$reserved_session" "$prompt" observe-initial || reserved_rc=$?
+      case "$reserved_rc" in
+        0|6) printf '%s\n' receipt_recovered; return 0 ;;
+        5) printf '%s\n' busy_deferred; return 0 ;;
+        *) return 4 ;;
+      esac
+    fi
     pending_status="$(pr_green_delivery_pending_status "$project_id" "$pr_number" 2>/dev/null || true)"
     case "$pending_status" in
       acked) pr_green_delivery_clear_pending "$project_id" "$pr_number" || return 4 ;;

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -244,27 +245,89 @@ def delivery_lock(path):
         yield
 
 
+def _spawn_receipt(path, pending):
+    token = pending.get('spawnReceipt')
+    if not isinstance(token, str) or not re.fullmatch(r'[a-f0-9]{32}', token):
+        raise ValueError('native spawn receipt unavailable')
+    receipt = path.with_name(path.name + '.spawn-' + token + '.log')
+    fd = os.open(receipt, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'r') as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 1024 * 1024):
+            raise ValueError('native spawn receipt identity mismatch')
+        os.fsync(stream.fileno())
+        output = stream.read()
+    return receipt, output
+
+
+def spawn_receipt_path(path, text):
+    with delivery_lock(path):
+        pending = json.loads(path.read_text())
+        if pending.get('initial') is not True or pending.get('session') != '' or pending.get('text') != text:
+            raise ValueError('spawn admission identity mismatch')
+        return _spawn_receipt(path, pending)[0]
+
+
+def _spawn_receipt_session(path, pending):
+    _, output = _spawn_receipt(path, pending)
+    ids = set(re.findall(r'^spawned session ([A-Za-z0-9._-]+) [^\n]*\n', output, re.M))
+    return next(iter(ids)) if len(ids) == 1 else None
+
+
+def _recover_spawn_reservation(path, pending):
+    if pending.get('initial') is True and pending.get('session') == '' and pending.get('spawnReceipt'):
+        session = _spawn_receipt_session(path, pending)
+        if session:
+            pending['session'] = session
+            save(path, pending)
+
+
+def reserved_session(path):
+    with delivery_lock(path):
+        pending = json.loads(path.read_text())
+        if pending.get('initial') is not True:
+            raise ValueError('initial spawn reservation required')
+        _recover_spawn_reservation(path, pending)
+        session = pending.get('session')
+        if not isinstance(session, str) or not re.fullmatch(r'[A-Za-z0-9._-]+', session):
+            raise ValueError('exact native spawn identity unavailable')
+        return session
+
+
 def admission(path, text, session=None):
     """Reserve before spawn; bind only to the explicit native spawn receipt.
 
     Anonymous reservations deliberately do not expire: a failed CLI transport
     does not prove AO failed to create the session. Recovery may repeat binding
-    with the original exact native spawn receipt and unchanged prompt, then let
-    deliver validate the native owner and provider receipt. Never delete/retry
-    solely because the CLI failed or a session listing is empty.
+    with the original exact native spawn receipt and unchanged prompt. The
+    private per-attempt CLI output remains on disk; delivery can recover its
+    exact session ID after a controller crash, then validate the native owner
+    and provider turn. Completely missing receipts still require investigation.
+    Never delete/retry solely because the CLI failed or a session listing is empty.
     """
     try:
         with delivery_lock(path):
             if session is None:
                 if path.exists():
                     return 4
-                save(path, {'session': '', 'text': text, 'initial': True})
+                token = uuid.uuid4().hex
+                receipt = path.with_name(path.name + '.spawn-' + token + '.log')
+                fd = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                # save() fsyncs the containing directory before any spawn.
+                save(path, {'session': '', 'text': text, 'initial': True, 'spawnReceipt': token})
             else:
                 if not re.fullmatch(r'[A-Za-z0-9._-]+', session):
                     return 4
                 pending = json.loads(path.read_text())
                 if (pending.get('initial') is not True or pending.get('text') != text
                         or pending.get('session') not in ('', session)):
+                    return 4
+                if pending.get('spawnReceipt') and _spawn_receipt_session(path, pending) != session:
                     return 4
                 pending['session'] = session
                 save(path, pending)
@@ -289,15 +352,20 @@ def prepare_restore(api, db, project, session, home, path, text):
         return 4
 
 
-def deliver(api, db, project, session, home, path, text, initial=False):
+def deliver(api, db, project, session, home, path, text, initial=False, retain_initial=False):
     try:
         with delivery_lock(path):
-            return _deliver_locked(api, db, project, session, home, path, text, initial)
+            return _deliver_locked(api, db, project, session, home, path, text, initial, retain_initial)
     except BlockingIOError:
         return 4
 
 
-def _deliver_locked(api, db, project, session, home, path, text, initial=False):
+def _deliver_locked(api, db, project, session, home, path, text, initial=False, retain_initial=False):
+    if retain_initial:
+        observed = json.loads(path.read_text()) if path.exists() else {}
+        if (observed.get('initial') is not True
+                or not set(observed).issubset({'session', 'text', 'initial', 'spawnReceipt', 'owner', 'scope'})):
+            return 4
     if initial and not path.exists():
         save(path, {"session": session, "text": text, "initial": True})
     snapshot, owner = validate(api, db, project, session, home)
@@ -305,6 +373,7 @@ def _deliver_locked(api, db, project, session, home, path, text, initial=False):
     pending = None
     if path.exists():
         pending = json.loads(path.read_text())
+        _recover_spawn_reservation(path, pending)
         if pending.get('session') != session or pending.get('scope', home) != home or (pending.get('owner') is not None and pending['owner'] != owner):
             return 4
         if pending.get('restore'):
@@ -337,7 +406,9 @@ def _deliver_locked(api, db, project, session, home, path, text, initial=False):
                 pending['owner'] = owner; save(path, pending)
             text = pending['text']
             if (pending.get('initial') or pending.get('turnId')) and acknowledged(snapshot, text, pending.get('turnId'), owner if pending.get('initial') else None):
-                path.unlink(); return 0 if text == requested_text else 6
+                if not retain_initial:
+                    path.unlink()
+                return 0 if text == requested_text else 6
             if not pending.get("initial"):
                 # No replay on timeout, uncertain transport, missing or queued receipt.
                 try:
@@ -377,7 +448,9 @@ def _deliver_locked(api, db, project, session, home, path, text, initial=False):
         if current_owner != owner:
             return 4
         if acknowledged(current, text, pending.get('turnId'), owner if pending.get('initial') else None):
-            path.unlink(); return 0 if text == requested_text else 6
+            if not retain_initial:
+                path.unlink()
+            return 0 if text == requested_text else 6
     return 4
 
 
@@ -386,6 +459,12 @@ if __name__ == '__main__':
         if len(sys.argv) in (3, 4) and sys.argv[1] == '--admission':
             code = admission(Path(sys.argv[2]), sys.stdin.read(), sys.argv[3] if len(sys.argv) == 4 else None)
             sys.exit(code)
+        if len(sys.argv) == 3 and sys.argv[1] == '--reserved-session':
+            print(reserved_session(Path(sys.argv[2])))
+            sys.exit(0)
+        if len(sys.argv) == 3 and sys.argv[1] == '--spawn-receipt-path':
+            print(spawn_receipt_path(Path(sys.argv[2]), sys.stdin.read()))
+            sys.exit(0)
         if len(sys.argv) == 8 and sys.argv[1] == '--prepare-restore':
             base, db, project, session, home, pending = sys.argv[2:]
             if not all(re.fullmatch(r'[A-Za-z0-9._-]+', item) for item in (project, session)):
@@ -395,7 +474,8 @@ if __name__ == '__main__':
         if not all(re.fullmatch(r'[A-Za-z0-9._-]+', item) for item in (project, session)):
             raise ValueError('invalid identity')
         # Prompt comes over stdin, avoiding process argument/log disclosure.
-        code = deliver(API(base), db, project, session, home, Path(pending), sys.stdin.read(), initial == 'initial')
+        code = deliver(API(base), db, project, session, home, Path(pending), sys.stdin.read(),
+                       initial in ('initial', 'observe-initial'), initial == 'observe-initial')
         sys.exit(code)
     except (OSError, ValueError, KeyError, sqlite3.Error, subprocess.CalledProcessError) as error:
         print('Chat delivery unconfirmed: ' + type(error).__name__, file=sys.stderr)

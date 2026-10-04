@@ -513,7 +513,7 @@ PATH="$mock_bin:$PATH" HOME="$fixture_dir/home-concurrent-one" CODEX_HOME="$conc
   AO_CALLS="$concurrent_root/one/ao.log" GH_CALLS="$concurrent_root/one/gh.log" \
   bash "$JOB" >"$concurrent_root/one/out" 2>"$concurrent_root/one/err" &
 first_pid=$!
-for _ in {1..50}; do [[ -e "$marker" ]] && break; sleep 0.02; done
+for _ in {1..250}; do [[ -e "$marker" ]] && break; sleep 0.02; done
 if [[ ! -e "$marker" ]]; then
   : >"$release"
   kill "$first_pid" 2>/dev/null || true
@@ -633,6 +633,8 @@ done
 [[ ! -e "$lost_metrics/ao.log.unreserved" ]] || { echo 'FAIL: spawn occurred before durable reservation'; exit 1; }
 [[ "$(grep -c '^spawn$' "$lost_metrics/ao.log")" == 1 ]] || { echo 'FAIL: lost listing spawned a duplicate worker'; exit 1; }
 [[ "$(jq -r .session "$lost_metrics/pending-delivery/repo-a-44.json.chat")" == repo-a-65 ]]
+receipt_token="$(jq -r .spawnReceipt "$lost_metrics/pending-delivery/repo-a-44.json.chat")"
+[[ "$(cat "$lost_metrics/pending-delivery/repo-a-44.json.chat.spawn-$receipt_token.log")" == 'spawned session repo-a-65 (idle) (claimed https://github.com/jleechanorg/repo-a/pull/44)' ]]
 [[ "$(jq -sr 'last.delivery_unconfirmed' "$lost_metrics/runs.jsonl")" == 1 ]]
 
 echo 'jleechanorg-pr-green discovery: PASS'

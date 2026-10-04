@@ -71,3 +71,19 @@ pr_green_session_record() { return 0; }
 rc=0; pr_green_reuse_session worldarchitect.ai 123 repair || rc=$?
 [[ "$rc" == 4 && -e "${path}.chat" ]]
 printf 'PASS: terminated Chat restores exact owner only after admission and native preflight, unresolved and ambiguous states remain reserved\n'
+
+# Exact persisted native spawn evidence permits direct owner observation even
+# when session ls temporarily omits the created session. No send/restore/spawn.
+pr_green_session_record() { return 0; }
+pr_green_chat_admission worldarchitect.ai 124 'original repair'
+receipt="$(pr_green_chat_spawn_receipt worldarchitect.ai 124 'original repair')"
+printf '%s\n' 'spawned session worldarchitect.ai-71 (idle) (claimed PR)' > "$receipt"
+pr_green_chat_delivery() {
+  [[ "$1 $2 $3 $4 $5" == 'worldarchitect.ai 124 worldarchitect.ai-71 current repair observe-initial' ]] || return 99
+  return 6
+}
+for sweep in 1 2; do
+  action="$(pr_green_reuse_session worldarchitect.ai 124 'current repair')"
+  [[ "$action" == receipt_recovered ]]
+done
+printf 'PASS: missing session listing recovers exact native spawn receipt for direct owner validation\n'

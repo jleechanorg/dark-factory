@@ -162,6 +162,8 @@ class ChatDeliveryTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
         with patch.object(m, 'validate', return_value=(self.snapshot(), self.owner)):
             self.assertEqual(m.deliver(*self.args), 4)
+        if not m.json.loads(self.path.read_text())['session']:
+            m.spawn_receipt_path(self.path, 'repair').write_text('spawned session ' + self.owner['id'] + ' (idle)\n')
         self.assertEqual(m.admission(self.path, 'repair', self.owner['id']), 0)
         self.assertEqual(m.admission(self.path, 'repair', 'different-session'), 4)
         with patch.object(m, 'validate', return_value=(self.snapshot(), self.owner)):
@@ -170,6 +172,8 @@ class ChatDeliveryTests(unittest.TestCase):
 
     def test_bound_initial_admission_waits_for_provider_without_post(self):
         self.assertEqual(m.admission(self.path, 'repair'), 0)
+        if not m.json.loads(self.path.read_text())['session']:
+            m.spawn_receipt_path(self.path, 'repair').write_text('spawned session ' + self.owner['id'] + ' (idle)\n')
         self.assertEqual(m.admission(self.path, 'repair', self.owner['id']), 0)
         class NoPost:
             def request(self, *args): raise AssertionError('initial admission must only observe')
@@ -221,6 +225,8 @@ class ChatDeliveryTests(unittest.TestCase):
             server.shutdown(); server.server_close(); thread.join(timeout=2)
         self.addCleanup(cleanup)
         self.assertEqual(m.admission(self.path, 'repair'), 0)
+        if not m.json.loads(self.path.read_text())['session']:
+            m.spawn_receipt_path(self.path, 'repair').write_text('spawned session ' + owner['id'] + ' (idle)\n')
         self.assertEqual(m.admission(self.path, 'repair', owner['id']), 0)
         profile = m.profile
         with patch.object(m, 'profile', side_effect=lambda value, home: profile(value, home, proc)), patch.object(m.time, 'sleep'):
@@ -236,6 +242,7 @@ class ChatDeliveryTests(unittest.TestCase):
         class NoPost:
             def request(self, *args): raise AssertionError('initial admission must only observe')
         m.admission(self.path, 'repair')
+        m.spawn_receipt_path(self.path, 'repair').write_text('spawned session ' + self.owner['id'] + ' (idle)\n')
         m.admission(self.path, 'repair', self.owner['id'])
         with patch.object(m, 'validate', side_effect=[(self.empty, self.owner)] + [(old, self.owner)] * 10) as validate, patch.object(m.time, 'sleep'):
             self.assertEqual(m.deliver(NoPost(), *self.args[1:], initial=True), 4)
@@ -252,6 +259,71 @@ class ChatDeliveryTests(unittest.TestCase):
         self.assertEqual(m.admission(self.path, 'repair', 'session-one\nsession-two'), 4)
         self.assertEqual(m.admission(self.path, 'wrong prompt', self.owner['id']), 4)
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_durable_spawn_receipt_recovers_after_controller_loses_binding(self):
+        self.assertEqual(m.admission(self.path, 'repair'), 0)
+        receipt = m.spawn_receipt_path(self.path, 'repair')
+        self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+        receipt.write_text('spawned session ' + self.owner['id'] + ' (idle) (claimed PR)\n')
+        class NoPost:
+            def request(self, *args): raise AssertionError('recovery must never send again')
+        with patch.object(m, 'validate', return_value=(self.snapshot(), self.owner)):
+            self.assertEqual(m.deliver(NoPost(), *self.args[1:]), 0)
+        self.assertFalse(self.path.exists())
+        self.assertTrue(receipt.exists(), 'retain original native evidence after acknowledgment')
+
+    def test_spawn_receipt_ambiguity_and_failure_never_release_reservation(self):
+        self.assertEqual(m.admission(self.path, 'repair'), 0)
+        receipt = m.spawn_receipt_path(self.path, 'repair')
+        original = self.path.read_bytes()
+        for output in ('', 'Spawn queue is full\n', 'spawned session one (idle)\nspawned session two (idle)\n',
+                       'spawned session ' + self.owner['id'] + ' (idle)'):
+            receipt.write_text(output)
+            with patch.object(m, 'validate', return_value=(self.snapshot(), self.owner)):
+                self.assertEqual(m.deliver(*self.args), 4)
+            self.assertEqual(self.path.read_bytes(), original)
+            self.assertEqual(m.admission(self.path, 'repair'), 4)
+        with self.assertRaises(ValueError): m.spawn_receipt_path(self.path, 'changed prompt')
+        receipt.unlink(); receipt.symlink_to(self.path)
+        with self.assertRaises(OSError): m.spawn_receipt_path(self.path, 'repair')
+
+    def test_initial_binding_requires_unique_complete_matching_native_receipt(self):
+        m.admission(self.path, 'repair')
+        receipt = m.spawn_receipt_path(self.path, 'repair')
+        for output in ('', 'spawned session ' + self.owner['id'] + ' (idle)',
+                       'spawned session another (idle)\n',
+                       'spawned session ' + self.owner['id'] + ' (idle)\nspawned session another (idle)\n'):
+            receipt.write_text(output)
+            self.assertEqual(m.admission(self.path, 'repair', self.owner['id']), 4)
+            self.assertEqual(m.json.loads(self.path.read_text())['session'], '')
+        receipt.write_text('spawned session ' + self.owner['id'] + ' (idle)\n')
+        self.assertEqual(m.reserved_session(self.path), self.owner['id'])
+        if not m.json.loads(self.path.read_text())['session']:
+            m.spawn_receipt_path(self.path, 'repair').write_text('spawned session ' + self.owner['id'] + ' (idle)\n')
+        self.assertEqual(m.admission(self.path, 'repair', self.owner['id']), 0)
+
+    def test_missing_listing_observation_retains_owner_across_two_sweeps(self):
+        m.admission(self.path, 'repair')
+        m.spawn_receipt_path(self.path, 'repair').write_text('spawned session ' + self.owner['id'] + ' (idle)\n')
+        class NoPost:
+            def request(self, *args): raise AssertionError('observation must not send')
+        for sweep in range(2):
+            with patch.object(m, 'validate', return_value=(self.snapshot(), self.owner)):
+                self.assertEqual(m.deliver(NoPost(), *self.args[1:], initial=True, retain_initial=True), 0)
+            self.assertEqual(m.reserved_session(self.path), self.owner['id'])
+            self.assertEqual(m.admission(self.path, 'repair'), 4)
+        # Once normal list-backed observation resumes, ordinary cleanup works.
+        with patch.object(m, 'validate', return_value=(self.snapshot(), self.owner)):
+            self.assertEqual(m.deliver(NoPost(), *self.args[1:]), 0)
+        self.assertFalse(self.path.exists())
+
+    def test_observe_initial_rejects_mixed_ledger_before_any_api_call(self):
+        for field in ('restore', 'request', 'turnId'):
+            m.save(self.path, {'session': self.owner['id'], 'initial': True, 'text': 'repair', field: {}})
+            original = self.path.read_bytes()
+            with patch.object(m, 'validate', side_effect=AssertionError('mixed ledger must not contact API')):
+                self.assertEqual(m.deliver(*self.args, initial=True, retain_initial=True), 4)
+            self.assertEqual(self.path.read_bytes(), original)
 
     def test_queued_receipt_is_not_provider_ack(self):
         self.assertFalse(m.acknowledged(self.snapshot('queued'), 'repair'))

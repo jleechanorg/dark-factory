@@ -538,13 +538,20 @@ EOF
     exec 9>&-
     continue
   fi
+  # Retain private per-attempt native output for exact-ID recovery after a crash.
   spawn_cmd=(ao spawn --project "$project_id" --claim-pr "$number" --name "$session_name" --harness codex --mode chat --prompt "$prompt")
+  if ! spawn_err="$(pr_green_chat_spawn_receipt "$project_id" "$number" "$prompt")"; then
+    delivery_unconfirmed=$((delivery_unconfirmed + 1))
+    record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" delivery_unconfirmed chat_admission_pending
+    pr_green_release_admission_lock
+    exec 9>&-
+    continue
+  fi
   attempted=$((attempted + 1))
-  spawn_err="$(mktemp)"
   # The Go AO CLI creates and claims the worker, then returns. Wait for that
   # command while the global admission lock is held; never infer dispatch from
   # a still-running process.
-  "${spawn_cmd[@]}" >"$spawn_err" 2>&1 &
+  "${spawn_cmd[@]}" >>"$spawn_err" 2>&1 &
   spawn_pid=$!
   spawn_rc=0
   wait "$spawn_pid" || spawn_rc=$?
@@ -559,7 +566,6 @@ EOF
       if [[ -z "$spawned_session" ]] || ! pr_green_chat_admission "$project_id" "$number" "$prompt" "$spawned_session"; then
         record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_unverified
         pr_green_release_admission_lock
-        rm -f "$spawn_err"
         continue
       fi
       if spawned_record="$(pr_green_session_record "$project_id" "$number")" && [[ "$(jq -r .id <<<"$spawned_record")" == "$spawned_session" ]]; then
@@ -568,32 +574,27 @@ EOF
           record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" delivery_unconfirmed chat_provider_unconfirmed
           delivery_unconfirmed=$((delivery_unconfirmed + 1))
           pr_green_release_admission_lock
-          rm -f "$spawn_err"
           continue
         fi
         echo "$LOG_PREFIX dispatched $repo#$number (AO session acknowledged)"
         dispatched=$((dispatched + 1))
         pr_green_release_admission_lock
-        rm -f "$spawn_err"
         reconcile_pr "$repo" "$number" "$url" "$live_state" dispatched || true
         continue
       fi
       echo "$LOG_PREFIX AO spawn acknowledged but durable session row was not observable for $repo#$number" >&2
       record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_unverified
       pr_green_release_admission_lock
-      rm -f "$spawn_err"
       continue
     fi
     echo "$LOG_PREFIX AO spawn returned an unverified acknowledgement for $repo#$number; no duplicate retry" >&2
     record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_unverified
     pr_green_release_admission_lock
-    rm -f "$spawn_err"
     continue
   fi
   record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_failed
   echo "$LOG_PREFIX AO spawn failed for $repo#$number (rc=$spawn_rc)" >&2
   pr_green_release_admission_lock
-  rm -f "$spawn_err"
 done <<< "$ordered_prs"
 
 jq -n --argjson ts "$run_started" --argjson analyzed "$analyzed" \
