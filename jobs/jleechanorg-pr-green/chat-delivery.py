@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.request
@@ -91,6 +92,74 @@ def validate(api, db, project, session, home):
     if row(db, project, session) != entry:
         raise ValueError('controller changed during observation')
     return snapshot, entry
+
+
+def restore_preflight(api, db, project, session, home, proc=Path('/proc')):
+    """Read-only proof before AO may resume an existing terminated Chat owner."""
+    owner = row(db, project, session)
+    if (owner['is_terminated'] != 1 or owner['session_mode'] != 'chat'
+            or owner['harness'] != 'codex' or not owner['provider_conversation_id']):
+        raise ValueError('terminated native Chat owner unavailable')
+    def public_matches():
+        view = api.request('sessions/' + session)['session']
+        return (view.get('id') == session and view.get('projectId') == project
+                and view.get('mode') == 'chat' and view.get('harness') == 'codex'
+                and view.get('isTerminated') is True)
+    if not public_matches():
+        raise ValueError('terminated owner disagrees with public session')
+    workspace = Path(owner['workspace_path'])
+    if (not workspace.is_absolute() or not workspace.is_dir() or workspace.is_symlink()
+            or workspace.stat().st_uid != os.getuid() or not (workspace / '.git').is_file()):
+        raise ValueError('existing owned worktree required')
+    project_view = api.request('projects/' + project)
+    config = project_view.get('project', {})
+    if project_view.get('status') != 'ok' or config.get('id') != project:
+        raise ValueError('trusted project repository unavailable')
+    repository = Path(config.get('path', ''))
+    if not repository.is_absolute() or not repository.is_dir():
+        raise ValueError('existing configured repository required')
+    configured = config.get('config', {}).get('env', {})
+    scopes = ([configured.get('CODEX_HOME')] if isinstance(configured, dict) else
+              [item[len('CODEX_HOME='):] for item in configured if isinstance(item, str) and item.startswith('CODEX_HOME=')])
+    if scopes != [home]:
+        raise ValueError('configured Chat account scope mismatch')
+    def common_git(path):
+        value = subprocess.check_output(['git', '-C', str(path), 'rev-parse', '--path-format=absolute', '--git-common-dir'], text=True).strip()
+        return Path(value).resolve()
+    if common_git(workspace) != common_git(repository):
+        raise ValueError('worktree belongs to a different project repository')
+    registered = subprocess.check_output(['git', '-C', str(repository), 'worktree', 'list', '--porcelain'], text=True)
+    if 'worktree ' + str(workspace) not in registered.splitlines():
+        raise ValueError('workspace is not a registered worktree')
+    matched = False
+    for name in ('state_5.sqlite', 'state.sqlite'):
+        path = Path(home) / name
+        if not path.is_file():
+            continue
+        with sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True) as conn:
+            thread = conn.execute('SELECT cwd FROM threads WHERE id=?', (owner['provider_conversation_id'],)).fetchone()
+        if thread is not None:
+            if thread[0] != str(workspace):
+                raise ValueError('scoped provider workspace mismatch')
+            matched = True
+    if not matched:
+        raise ValueError('exact provider thread unavailable in intended account scope')
+    for process in proc.iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            env = dict(x.split(b'=', 1) for x in (process / 'environ').read_bytes().split(b'\0') if b'=' in x)
+            args = (process / 'cmdline').read_bytes().split(b'\0')
+            if env.get(b'AO_SESSION_ID') == session.encode() and b'app-server' in args:
+                raise ValueError('existing Chat host still owns terminated session')
+        except OSError:
+            continue
+    if (row(db, project, session) != owner or not public_matches()
+            or api.request('projects/' + project) != project_view):
+        raise ValueError('terminated ownership or project changed during preflight')
+    return owner
 
 
 def timestamp(value):
@@ -204,6 +273,22 @@ def admission(path, text, session=None):
         return 4
 
 
+def prepare_restore(api, db, project, session, home, path, text):
+    """Reserve the existing owner before the non-idempotent native restore."""
+    try:
+        with delivery_lock(path):
+            if path.exists():
+                return 4
+            owner = restore_preflight(api, db, project, session, home)
+            identity = {key: owner[key] for key in ('id', 'project_id', 'workspace_path',
+                        'provider_conversation_id', 'harness', 'session_mode')}
+            save(path, {'session': session, 'restore': identity, 'scope': home, 'text': text,
+                        'request': uuid.uuid4().hex})
+            return 0
+    except BlockingIOError:
+        return 4
+
+
 def deliver(api, db, project, session, home, path, text, initial=False):
     try:
         with delivery_lock(path):
@@ -216,30 +301,55 @@ def _deliver_locked(api, db, project, session, home, path, text, initial=False):
     if initial and not path.exists():
         save(path, {"session": session, "text": text, "initial": True})
     snapshot, owner = validate(api, db, project, session, home)
+    requested_text = text
     pending = None
     if path.exists():
         pending = json.loads(path.read_text())
-        if pending.get('session') != session or (pending.get('owner') is not None and pending['owner'] != owner):
+        if pending.get('session') != session or pending.get('scope', home) != home or (pending.get('owner') is not None and pending['owner'] != owner):
             return 4
-        if pending.get('owner') is None:
-            if not pending.get('initial'):
+        if pending.get('restore'):
+            required = {'id', 'project_id', 'workspace_path', 'provider_conversation_id', 'harness', 'session_mode'}
+            if not isinstance(pending['restore'], dict) or set(pending['restore']) != required:
                 return 4
-            pending['owner'] = owner; save(path, pending)
-        text = pending['text']
-        if (pending.get('initial') or pending.get('turnId')) and acknowledged(snapshot, text, pending.get('turnId'), owner if pending.get('initial') else None):
-            path.unlink(); return 0
-        if not pending.get("initial"):
-            # No replay on timeout, uncertain transport, missing or queued receipt.
-            try:
-                receipt = api.request('sessions/' + session + '/conversation/steer-or-send',
-                                      {'clientMessageId': pending['request'], 'recoverOnly': True})
-                if receipt.get('outcome') != 'sent' or not receipt.get('turnId'):
+            if any(owner.get(key) != value for key, value in pending['restore'].items()):
+                return 4
+            if snapshot.get('controller') == 'busy' or any(t.get('state') in ('running', 'queued') for t in snapshot.get('turns', [])):
+                return 5
+            if snapshot.get('controller') != 'ready':
+                return 4
+            # Successful native restore rotates the controller generation, but
+            # must preserve the exact provider conversation/workspace/account.
+            # Persist the ordinary pending request before its one initial POST.
+            text = pending['text']
+            pending = {'session': session, 'owner': owner, 'scope': home, 'text': text, 'request': pending['request']}
+            save(path, pending)
+            if row(db, project, session) != owner:
+                return 4
+            receipt = api.request('sessions/' + session + '/conversation/steer-or-send',
+                                  {'text': text, 'clientMessageId': pending['request']})
+            if receipt.get('outcome') != 'sent' or not receipt.get('turnId'):
+                return 4
+            pending['turnId'] = receipt['turnId']; save(path, pending)
+        else:
+            if pending.get('owner') is None:
+                if not pending.get('initial'):
                     return 4
-                pending['turnId'] = receipt['turnId']; save(path, pending)
-            except (OSError, ValueError):
-                return 4
-        # A bound initial admission only observes below. Provisioning may not
-        # have attached the provider turn when the CLI first returns its ID.
+                pending['owner'] = owner; save(path, pending)
+            text = pending['text']
+            if (pending.get('initial') or pending.get('turnId')) and acknowledged(snapshot, text, pending.get('turnId'), owner if pending.get('initial') else None):
+                path.unlink(); return 0 if text == requested_text else 6
+            if not pending.get("initial"):
+                # No replay on timeout, uncertain transport, missing or queued receipt.
+                try:
+                    receipt = api.request('sessions/' + session + '/conversation/steer-or-send',
+                                          {'clientMessageId': pending['request'], 'recoverOnly': True})
+                    if receipt.get('outcome') != 'sent' or not receipt.get('turnId'):
+                        return 4
+                    pending['turnId'] = receipt['turnId']; save(path, pending)
+                except (OSError, ValueError):
+                    return 4
+            # A bound initial admission only observes below. Provisioning may not
+            # have attached the provider turn when the CLI first returns its ID.
     elif initial:
         # Spawn carries the initial prompt. Observe it; never send a second copy.
         if acknowledged(snapshot, text, initial_owner=owner):
@@ -267,7 +377,7 @@ def _deliver_locked(api, db, project, session, home, path, text, initial=False):
         if current_owner != owner:
             return 4
         if acknowledged(current, text, pending.get('turnId'), owner if pending.get('initial') else None):
-            path.unlink(); return 0
+            path.unlink(); return 0 if text == requested_text else 6
     return 4
 
 
@@ -276,12 +386,17 @@ if __name__ == '__main__':
         if len(sys.argv) in (3, 4) and sys.argv[1] == '--admission':
             code = admission(Path(sys.argv[2]), sys.stdin.read(), sys.argv[3] if len(sys.argv) == 4 else None)
             sys.exit(code)
+        if len(sys.argv) == 8 and sys.argv[1] == '--prepare-restore':
+            base, db, project, session, home, pending = sys.argv[2:]
+            if not all(re.fullmatch(r'[A-Za-z0-9._-]+', item) for item in (project, session)):
+                raise ValueError('invalid identity')
+            sys.exit(prepare_restore(API(base), db, project, session, home, Path(pending), sys.stdin.read()))
         base, db, project, session, home, pending, initial = sys.argv[1:]
         if not all(re.fullmatch(r'[A-Za-z0-9._-]+', item) for item in (project, session)):
             raise ValueError('invalid identity')
         # Prompt comes over stdin, avoiding process argument/log disclosure.
         code = deliver(API(base), db, project, session, home, Path(pending), sys.stdin.read(), initial == 'initial')
         sys.exit(code)
-    except (OSError, ValueError, KeyError, sqlite3.Error) as error:
+    except (OSError, ValueError, KeyError, sqlite3.Error, subprocess.CalledProcessError) as error:
         print('Chat delivery unconfirmed: ' + type(error).__name__, file=sys.stderr)
         sys.exit(4)

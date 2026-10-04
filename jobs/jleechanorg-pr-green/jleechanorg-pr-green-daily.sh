@@ -232,6 +232,7 @@ selected=0
 reused=0
 restored=0
 busy_deferred=0
+receipt_recovered=0
 cooldown_deferred=0
 admission_deferred=0
 recovery_blocked=0
@@ -456,6 +457,11 @@ EOF
       pr_green_release_admission_lock
       echo "$LOG_PREFIX restored and reused AO session for $repo#$number"
         ;;
+      receipt_recovered)
+      receipt_recovered=$((receipt_recovered + 1))
+      pr_green_release_admission_lock
+      echo "$LOG_PREFIX recovered an earlier receipt for $repo#$number; current prompt deferred"
+        ;;
       busy_deferred)
       busy_deferred=$((busy_deferred + 1))
       pr_green_release_admission_lock
@@ -601,7 +607,7 @@ jq -n --argjson ts "$run_started" --argjson analyzed "$analyzed" \
   --argjson admission_deferred "$admission_deferred" \
   --argjson recovery_blocked "$recovery_blocked" \
   --argjson delivery_unconfirmed "$delivery_unconfirmed" \
-  --argjson fixed_confirmed "$fixed_confirmed" \
-  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, analysis_failed:$analysis_failed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, busy_deferred:$busy_deferred, cooldown_deferred:$cooldown_deferred, admission_deferred:$admission_deferred, recovery_blocked:$recovery_blocked, delivery_unconfirmed:$delivery_unconfirmed, fixed_confirmed:$fixed_confirmed}' \
+  --argjson fixed_confirmed "$fixed_confirmed" --argjson receipt_recovered "$receipt_recovered" \
+  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, analysis_failed:$analysis_failed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, busy_deferred:$busy_deferred, cooldown_deferred:$cooldown_deferred, admission_deferred:$admission_deferred, recovery_blocked:$recovery_blocked, delivery_unconfirmed:$delivery_unconfirmed, fixed_confirmed:$fixed_confirmed, receipt_recovered:$receipt_recovered}' \
   >> "$METRICS_DIR/runs.jsonl"
-echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored busy_deferred=$busy_deferred cooldown_deferred=$cooldown_deferred recovery_blocked=$recovery_blocked delivery_unconfirmed=$delivery_unconfirmed fixed_confirmed=$fixed_confirmed"
+echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored busy_deferred=$busy_deferred cooldown_deferred=$cooldown_deferred recovery_blocked=$recovery_blocked delivery_unconfirmed=$delivery_unconfirmed fixed_confirmed=$fixed_confirmed receipt_recovered=$receipt_recovered"

@@ -1101,9 +1101,10 @@ pr_green_live_session_is_busy() {
   runtime_handle="$(pr_green_runtime_handle "$project_id" "$session_id" || true)"
   [[ -n "$runtime_handle" ]] || return 1
   if [[ "$runtime_handle" == ptyhost-v1:* ]]; then
-    local observed row workspace native_id listing line home relative latest boundary=''
+    local observed row workspace native_id listing line home relative latest live_home boundary=''
     observed="$(pr_green_native_runtime_observation "$project_id" "$session_id" 2>/dev/null)" || return 0
     [[ "$(jq -r '.activity' <<<"$observed")" == idle ]] || return 0
+    live_home="$(jq -er '.home | select(length > 0)' <<<"$observed")" || return 0
     native_id="$(jq -r '.nativeId' <<<"$observed")"
     [[ -n "$native_id" ]] || return 0
     row="$(pr_green_session_recovery_row "$project_id" "$session_id")" || return 0
@@ -1114,6 +1115,8 @@ pr_green_live_session_is_busy() {
       [[ "$line" == *$'\t'* ]] || continue
       home="${line#*$'\t'}"
       relative="${home#*$'\t'}"; home="${home%%$'\t'*}"
+      # Copies in another profile are historical, not the current controller.
+      [[ "$home" == "$live_home" ]] || continue
       latest="$(jq -r 'select(.type == "event_msg") | .payload.type | select(. == "task_started" or . == "task_complete" or . == "task_completed" or . == "turn_aborted")' "$home/$relative" 2>/dev/null | tail -n 1)" || return 0
       [[ -n "$latest" ]] || return 0
       [[ "$latest" != task_started ]] || return 0
@@ -1137,6 +1140,15 @@ pr_green_chat_admission() {
   printf '%s' "$prompt" | python3 "$helper" "${args[@]}"
 }
 
+pr_green_chat_prepare_restore() {
+  local project="$1" number="$2" session="$3" prompt="$4" helper api home path
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"
+  home="${CODEX_HOME:-${PR_GREEN_CODEX_HOME:-$HOME/.codex-dark-factory}}"
+  api="$(pr_green_ao_api_base)" || return 1
+  path="$(pr_green_delivery_pending_path "$project" "$number")" || return 1
+  printf '%s' "$prompt" | python3 "$helper" --prepare-restore "$api" "${PR_GREEN_AO_DB_PATH:-$HOME/.ao/data/ao.db}" "$project" "$session" "$home" "${path}.chat"
+}
+
 pr_green_chat_delivery() {
   local project="$1" number="$2" session="$3" prompt="$4" initial="${5:-reuse}" helper api path
   helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"
@@ -1150,7 +1162,7 @@ pr_green_chat_delivery() {
 
 # Reuse a live session, or restore a terminated one and then send it the
 # current prompt. Return codes:
-#   0 — live/restore prompt sent, or a visibly busy live session was deferred
+#   0 — action printed: reused/restored, busy_deferred, or receipt_recovered
 #   1 — no matching session; caller may spawn
 #   2 — existing session accepted recovery/restore but did not accept the
 #       prompt (including an ambiguous restore failure); caller must not spawn
@@ -1185,15 +1197,32 @@ pr_green_reuse_session() {
 
   session_id="$(jq -r '.id // empty' <<<"$record")"
   [[ -n "$session_id" ]] || return 1
+  terminated="$(jq -r 'if (.isTerminated // false) then "true" else "false" end' <<<"$record")"
   local mode
   mode="$(pr_green_session_mode "$project_id" "$session_id" 2>/dev/null || true)"
   if [[ "$mode" == chat ]]; then
-    local chat_rc=0
+    local chat_rc=0 chat_action=reused chat_pending
+    if [[ "$terminated" == true ]]; then
+      chat_pending="$(pr_green_delivery_pending_path "$project_id" "$pr_number")" || return 4
+      [[ ! -e "$chat_pending" && ! -e "${chat_pending}.chat" ]] || return 4
+      if declare -F pr_green_before_restore_admission >/dev/null 2>&1; then
+        pr_green_before_restore_admission "$project_id" "$pr_number" "$session_id" || return 2
+      fi
+      pr_green_chat_prepare_restore "$project_id" "$pr_number" "$session_id" "$prompt" || return 3
+      # Restore the same native Chat session, never fallback to a new worker.
+      # AO serializes this operation and resumes the exact provider conversation.
+      if ! restore_output="$(ao session restore "$session_id" -p "$project_id" 2>&1)"; then
+        printf '%s\n' "AO Chat restore uncertain for $session_id; preserving existing owner" >&2
+        return 2
+      fi
+      chat_action=restored
+    fi
     pr_green_chat_delivery "$project_id" "$pr_number" "$session_id" "$prompt" || chat_rc=$?
     case "$chat_rc" in
-      0) printf '%s\n' reused; return 0 ;;
+      0) printf '%s\n' "$chat_action"; return 0 ;;
+      6) printf '%s\n' receipt_recovered; return 0 ;;
       5) printf '%s\n' busy_deferred; return 0 ;;
-      *) return "$chat_rc" ;;
+      *) return 4 ;;
     esac
   fi
   if [[ "$mode" != tui ]]; then

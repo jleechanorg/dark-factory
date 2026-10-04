@@ -1,5 +1,6 @@
 import importlib.util
 import fcntl
+import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 from pathlib import Path
@@ -40,6 +41,74 @@ class ChatDeliveryTests(unittest.TestCase):
         with self.assertRaises(ValueError): m.profile(owner | {'id': 'other-session'}, '/scoped', proc)
         (d / 'exe').unlink(); (d / 'exe').symlink_to('/bin/unrelated (deleted)')
         with self.assertRaises(ValueError): m.profile(owner, '/scoped', proc)
+
+    def test_restore_preflight_requires_exact_existing_workspace_and_scoped_thread(self):
+        # SYNTHETIC AO API; real SQLite and Git registered-worktree inspection.
+        root = Path(self.tmp.name); source = root / 'repository'; source.mkdir()
+        def git(*args):
+            subprocess.run(['git', '-C', str(source), *args], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        git('init'); git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-m', 'fixture')
+        work = root / 'worker'; git('worktree', 'add', '--detach', str(work))
+        home = root / 'scope'; home.mkdir(); proc = root / 'proc'; proc.mkdir()
+        owner = self.owner | {'harness': 'codex', 'is_terminated': 1, 'session_mode': 'chat',
+            'workspace_path': str(work), 'provider_conversation_id': 'native-thread'}
+        db = root / 'ao.db'
+        with m.sqlite3.connect(db) as conn:
+            conn.execute('CREATE TABLE sessions(' + ','.join(owner) + ')')
+            conn.execute('INSERT INTO sessions VALUES(' + ','.join('?' for _ in owner) + ')', list(owner.values()))
+        with m.sqlite3.connect(home / 'state_5.sqlite') as conn:
+            conn.execute('CREATE TABLE threads(id,cwd)'); conn.execute('INSERT INTO threads VALUES(?,?)', ('native-thread', str(work)))
+        project_path = [str(source)]
+        class API:
+            def request(inner, path):
+                if path.startswith('projects/'):
+                    return {'status': 'ok', 'project': {'id': owner['project_id'], 'path': project_path[0], 'config': {'env': {'CODEX_HOME': str(home)}}}}
+                return {'session': {'id': owner['id'], 'projectId': owner['project_id'], 'mode': 'chat', 'harness': 'codex', 'isTerminated': True}}
+        args = (API(), str(db), owner['project_id'], owner['id'], str(home), proc)
+        m.restore_preflight(*args)
+        other = root / 'other-project'; other.mkdir()
+        subprocess.run(['git', '-C', str(other), 'init'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        project_path[0] = str(other)
+        with self.assertRaises(ValueError): m.restore_preflight(*args)
+        project_path[0] = str(source)
+        with m.sqlite3.connect(home / 'state_5.sqlite') as conn: conn.execute("UPDATE threads SET cwd='/unrelated'")
+        with self.assertRaises(ValueError): m.restore_preflight(*args)
+        with m.sqlite3.connect(home / 'state_5.sqlite') as conn: conn.execute('UPDATE threads SET cwd=?', (str(work),))
+        git('worktree', 'remove', str(work))
+        with self.assertRaises(ValueError): m.restore_preflight(*args)
+        self.assertFalse(work.exists(), 'preflight must never recreate a removed worktree')
+
+    def test_old_pending_receipt_does_not_count_new_prompt_as_delivered(self):
+        m.save(self.path, {'session': self.owner['id'], 'initial': True, 'text': 'repair'})
+        with patch.object(m, 'validate', return_value=(self.snapshot(), self.owner)):
+            self.assertEqual(m.deliver(*self.args[:-1], 'repair at new head'), 6)
+        self.assertFalse(self.path.exists())
+
+    def test_restore_reservation_survives_uncertainty_and_sends_once_when_ready(self):
+        old = self.owner | {'provider_conversation_id': 'thread', 'workspace_path': '/work', 'harness': 'codex', 'session_mode': 'chat', 'is_terminated': 1}
+        with patch.object(m, 'restore_preflight', return_value=old):
+            self.assertEqual(m.prepare_restore(None, '/db', old['project_id'], old['id'], '/scoped', self.path, 'repair'), 0)
+            before = self.path.read_bytes()
+            self.assertEqual(m.prepare_restore(None, '/db', old['project_id'], old['id'], '/scoped', self.path, 'repair'), 4)
+        self.assertEqual(self.path.read_bytes(), before)
+        current = old | {'is_terminated': 0, 'controller_generation': 'restored-generation'}
+        class API:
+            calls = []
+            def request(inner, path, body):
+                inner.calls.append(body)
+                return {'outcome': 'sent', 'turnId': 't1'}
+        api = API()
+        with patch.object(m, 'validate', return_value=(self.empty, current | {'provider_conversation_id': 'wrong-thread'})):
+            self.assertEqual(m.deliver(api, *self.args[1:]), 4)
+        self.assertEqual(api.calls, [])
+        with patch.object(m, 'validate', return_value=(self.snapshot(), current)):
+            self.assertEqual(m.deliver(api, *self.args[1:]), 5)
+        self.assertEqual(self.path.read_bytes(), before)
+        with patch.object(m, 'validate', side_effect=[(self.empty, current), (self.snapshot(), current)]), patch.object(m, 'row', return_value=current), patch.object(m.time, 'sleep'):
+            self.assertEqual(m.deliver(api, *self.args[1:]), 0)
+        self.assertEqual(len(api.calls), 1)
+        self.assertEqual(api.calls[0]['text'], 'repair')
+        self.assertFalse(self.path.exists())
 
     def test_overlapping_delivery_preserves_the_current_owner(self):
         with self.path.with_name(self.path.name + '.lock').open('w') as lock:

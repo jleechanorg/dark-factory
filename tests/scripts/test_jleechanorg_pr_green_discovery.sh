@@ -270,6 +270,7 @@ run_case() {
     return 1
   }
   run_json="$(jq -s 'last' "$metrics/runs.jsonl")"
+  [[ "$(jq -r '.receipt_recovered' <<<"$run_json")" == 0 ]] || { echo "FAIL: recovered receipt counter missing from metrics" >&2; return 1; }
   [[ "$(jq -r '.discovered' <<<"$run_json")" == "$expected_discovered" ]] || {
     echo "FAIL: $name discovered $(jq -r '.discovered' <<<"$run_json"), expected $expected_discovered" >&2
     return 1
