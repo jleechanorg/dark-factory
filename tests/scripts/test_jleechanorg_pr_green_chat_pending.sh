@@ -3,6 +3,9 @@ set -euo pipefail
 source "$(dirname "$0")/../../jobs/jleechanorg-pr-green/session-reuse.sh"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 export PR_GREEN_DELIVERY_STATE_DIR="$tmp"
+# Missing-list observation must never inspect the developer runtime.
+export PR_GREEN_AO_RUN_FILE="$tmp/no-runtime.json"
+export PR_GREEN_AO_DB_PATH="$tmp/fixture.db"
 # A transient empty AO listing must not admit a second worker when an
 # initial Chat prompt still has a durable unresolved receipt.
 pr_green_session_record() { return 0; }
