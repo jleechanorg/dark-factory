@@ -1,5 +1,7 @@
 import importlib.util
 import fcntl
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
 from pathlib import Path
 import tempfile
 import unittest
@@ -79,6 +81,84 @@ class ChatDeliveryTests(unittest.TestCase):
             self.assertEqual(m.deliver(*self.args), 0)
         self.assertFalse(self.path.exists())
 
+    def test_bound_initial_admission_waits_for_provider_without_post(self):
+        self.assertEqual(m.admission(self.path, 'repair'), 0)
+        self.assertEqual(m.admission(self.path, 'repair', self.owner['id']), 0)
+        class NoPost:
+            def request(self, *args): raise AssertionError('initial admission must only observe')
+        with patch.object(m, 'validate', side_effect=[(self.empty, self.owner), (self.snapshot(), self.owner)]) as validate, patch.object(m.time, 'sleep'):
+            self.assertEqual(m.deliver(NoPost(), *self.args[1:], initial=True), 0)
+        self.assertEqual(validate.call_count, 2)
+        self.assertFalse(self.path.exists())
+
+    def test_delayed_initial_receipt_through_http_sqlite_and_process_guard(self):
+        # SYNTHETIC CONTRACT FIXTURE: external AO HTTP and /proc records only.
+        # Real API decoding, SQLite ownership, process guard, locks and ledger.
+        root = Path(self.tmp.name); work = root / 'work'; work.mkdir()
+        proc = root / 'proc'; entry = proc / '123'; entry.mkdir(parents=True)
+        (entry / 'stat').write_text('123 (codex) S ' + ' '.join(['0'] * 18 + ['123']))
+        (entry / 'exe').symlink_to('/bin/codex'); (entry / 'cwd').symlink_to(work)
+        (entry / 'cmdline').write_bytes(b'codex\0app-server\0')
+        (entry / 'environ').write_bytes(('AO_SESSION_ID=' + self.owner['id'] + '\0AO_PROJECT_ID=' + self.owner['project_id'] + '\0CODEX_HOME=/scoped\0').encode())
+        owner = self.owner | {'harness': 'codex', 'is_terminated': 0, 'session_mode': 'chat',
+                              'workspace_path': str(work), 'provider_conversation_id': 'provider-conversation',
+                              'created_at': '2026-10-04 18:00:01.100000001 +0000 UTC'}
+        db = str(root / 'native.db')
+        with m.sqlite3.connect(db) as conn:
+            conn.execute('CREATE TABLE sessions(' + ','.join(owner) + ')')
+            conn.execute('INSERT INTO sessions VALUES(' + ','.join('?' for _ in owner) + ')', list(owner.values()))
+            conn.execute('CREATE TABLE conversation_turns(id, handled_by_session_id, provider_turn_id, controller_generation, requested_at, rolled_back_at, conversation_id)')
+            conn.execute('CREATE TABLE conversations(id, current_session_id, project_id)')
+            conn.execute('INSERT INTO conversations VALUES(?,?,?)', ('c1', owner['id'], owner['project_id']))
+            conn.execute("INSERT INTO conversation_turns VALUES(?,?,?,?,?,NULL,'c1')", ('t1', owner['id'], 'p1', 'g1', '2026-10-04 18:00:01.200000001 +0000 UTC'))
+        identity = {'conversationId': 'c1', 'sessionId': owner['id'], 'mode': 'chat', 'harness': 'codex'}
+        ready = self.snapshot() | identity
+        public_session = {'session': {'id': owner['id'], 'projectId': owner['project_id'], 'mode': 'chat', 'isTerminated': False}}
+        counts = {'conversation': 0, 'posts': 0}
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_POST(self):
+                counts['posts'] += 1; self.send_error(500)
+            def do_GET(handler):
+                if '/conversation?' in handler.path:
+                    counts['conversation'] += 1
+                    payload = (self.empty | identity) if counts['conversation'] == 1 else ready
+                else:
+                    payload = public_session
+                raw = m.json.dumps(payload).encode()
+                handler.send_response(200); handler.send_header('Content-Type', 'application/json')
+                handler.send_header('Content-Length', str(len(raw))); handler.end_headers(); handler.wfile.write(raw)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True); thread.start()
+        def cleanup():
+            server.shutdown(); server.server_close(); thread.join(timeout=2)
+        self.addCleanup(cleanup)
+        self.assertEqual(m.admission(self.path, 'repair'), 0)
+        self.assertEqual(m.admission(self.path, 'repair', owner['id']), 0)
+        profile = m.profile
+        with patch.object(m, 'profile', side_effect=lambda value, home: profile(value, home, proc)), patch.object(m.time, 'sleep'):
+            rc = m.deliver(m.API('http://127.0.0.1:' + str(server.server_port)), db,
+                           owner['project_id'], owner['id'], '/scoped', self.path, 'repair', initial=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(counts, {'conversation': 2, 'posts': 0})
+        self.assertFalse(self.path.exists())
+
+    def test_initial_poll_keeps_admission_time_and_owner_fences(self):
+        old = self.snapshot()
+        old['turns'][0]['requestedAt'] = '2026-10-04T17:59:59Z'
+        class NoPost:
+            def request(self, *args): raise AssertionError('initial admission must only observe')
+        m.admission(self.path, 'repair')
+        m.admission(self.path, 'repair', self.owner['id'])
+        with patch.object(m, 'validate', side_effect=[(self.empty, self.owner)] + [(old, self.owner)] * 10) as validate, patch.object(m.time, 'sleep'):
+            self.assertEqual(m.deliver(NoPost(), *self.args[1:], initial=True), 4)
+        self.assertEqual(validate.call_count, 11)
+        self.assertTrue(self.path.exists())
+        with patch.object(m, 'validate', side_effect=[(self.empty, self.owner), (self.snapshot(), self.owner | {'controller_generation': 'new'})]) as validate, patch.object(m.time, 'sleep'):
+            self.assertEqual(m.deliver(NoPost(), *self.args[1:]), 4)
+        self.assertEqual(validate.call_count, 2)
+        self.assertTrue(self.path.exists())
+
     def test_ambiguous_spawn_identity_does_not_bind_admission(self):
         self.assertEqual(m.admission(self.path, 'repair'), 0)
         before = self.path.read_bytes()
@@ -124,7 +204,7 @@ class ChatDeliveryTests(unittest.TestCase):
         self.assertTrue(pending['initial']); self.assertEqual(pending['text'], 'repair')
         class NoPost:
             def request(self, *args): raise AssertionError('initial prompt must never resend')
-        with patch.object(m, 'validate', return_value=(self.empty, self.owner)):
+        with patch.object(m, 'validate', return_value=(self.empty, self.owner)), patch.object(m.time, 'sleep'):
             self.assertEqual(m.deliver(NoPost(), *self.args[1:]), 4)
 
     def test_timeout_recovery_contacts_no_provider_and_keeps_same_handle(self):

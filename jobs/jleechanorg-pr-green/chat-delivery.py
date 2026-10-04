@@ -175,7 +175,14 @@ def delivery_lock(path):
 
 
 def admission(path, text, session=None):
-    """Reserve before spawn; bind only to the explicit native spawn receipt."""
+    """Reserve before spawn; bind only to the explicit native spawn receipt.
+
+    Anonymous reservations deliberately do not expire: a failed CLI transport
+    does not prove AO failed to create the session. Recovery may repeat binding
+    with the original exact native spawn receipt and unchanged prompt, then let
+    deliver validate the native owner and provider receipt. Never delete/retry
+    solely because the CLI failed or a session listing is empty.
+    """
     try:
         with delivery_lock(path):
             if session is None:
@@ -220,17 +227,18 @@ def _deliver_locked(api, db, project, session, home, path, text, initial=False):
         text = pending['text']
         if (pending.get('initial') or pending.get('turnId')) and acknowledged(snapshot, text, pending.get('turnId'), owner if pending.get('initial') else None):
             path.unlink(); return 0
-        if pending.get("initial"):
-            return 4
-        # No replay on timeout, uncertain transport, missing or queued receipt.
-        try:
-            receipt = api.request('sessions/' + session + '/conversation/steer-or-send',
-                                  {'clientMessageId': pending['request'], 'recoverOnly': True})
-            if receipt.get('outcome') != 'sent' or not receipt.get('turnId'):
+        if not pending.get("initial"):
+            # No replay on timeout, uncertain transport, missing or queued receipt.
+            try:
+                receipt = api.request('sessions/' + session + '/conversation/steer-or-send',
+                                      {'clientMessageId': pending['request'], 'recoverOnly': True})
+                if receipt.get('outcome') != 'sent' or not receipt.get('turnId'):
+                    return 4
+                pending['turnId'] = receipt['turnId']; save(path, pending)
+            except (OSError, ValueError):
                 return 4
-            pending['turnId'] = receipt['turnId']; save(path, pending)
-        except (OSError, ValueError):
-            return 4
+        # A bound initial admission only observes below. Provisioning may not
+        # have attached the provider turn when the CLI first returns its ID.
     elif initial:
         # Spawn carries the initial prompt. Observe it; never send a second copy.
         if acknowledged(snapshot, text, initial_owner=owner):
@@ -257,7 +265,7 @@ def _deliver_locked(api, db, project, session, home, path, text, initial=False):
         current, current_owner = validate(api, db, project, session, home)
         if current_owner != owner:
             return 4
-        if acknowledged(current, text, pending.get('turnId')):
+        if acknowledged(current, text, pending.get('turnId'), owner if pending.get('initial') else None):
             path.unlink(); return 0
     return 4
 

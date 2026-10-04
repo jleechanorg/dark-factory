@@ -64,6 +64,8 @@ class NativeRuntimeTests(unittest.TestCase):
                 (d / 'environ').write_bytes(b'\0'.join((k+'='+v).encode() for k,v in env.items()))
             process(123)
             self.assertEqual(module.process_home(row, root), '/scoped-codex')
+            with patch.object(module.os, 'getuid', return_value=(root / '123').stat().st_uid + 1), self.assertRaises(ValueError):
+                module.process_home(row, root)
             process(124, 'stale')
             self.assertEqual(module.process_home(row, root), '/scoped-codex')
             (root / '124/environ').write_bytes((root / '123/environ').read_bytes())

@@ -96,6 +96,8 @@ def process_home(row, proc=Path('/proc')):
             continue
         try:
             before = starttime(entry)
+            if entry.stat().st_uid != os.getuid():
+                continue
             env = dict(part.split(b'=', 1) for part in (entry / 'environ').read_bytes().split(b'\0') if b'=' in part)
             if (env.get(b'AO_SESSION_ID') != row['id'].encode()
                     or env.get(b'AO_PROJECT_ID') != row['project_id'].encode()
