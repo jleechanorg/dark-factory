@@ -71,6 +71,22 @@ class NativeRuntimeTests(unittest.TestCase):
             (root / '124/environ').write_bytes((root / '123/environ').read_bytes())
             with self.assertRaises(ValueError): module.process_home(row, root)
 
+    def test_running_unlinked_codex_preserves_native_launch_identity(self):
+        # Synthetic /proc records; replacing a binary must not discard its owner.
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); d = root / '123'; d.mkdir(); work = root / 'work'; work.mkdir()
+            row = self.row | {'workspace_path': str(work)}
+            (d / 'stat').write_text('123 (codex) S ' + ' '.join(['0'] * 18 + ['123']))
+            (d / 'exe').symlink_to('/bin/codex (deleted)'); (d / 'cwd').symlink_to(work)
+            (d / 'cmdline').write_bytes(b'codex\0')
+            (d / 'environ').write_bytes(b'AO_SESSION_ID=wa-1\0AO_PROJECT_ID=wa\0AO_RUNTIME_LAUNCH_ID=launch-1\0CODEX_HOME=/scope')
+            self.assertEqual(module.process_home(row, root), '/scope')
+            with patch.object(module.os, 'getuid', return_value=d.stat().st_uid + 1), self.assertRaises(ValueError):
+                module.process_home(row, root)
+            with self.assertRaises(ValueError): module.process_home(row | {'runtime_launch_id': 'other'}, root)
+            (d / 'exe').unlink(); (d / 'exe').symlink_to('/bin/unrelated (deleted)')
+            with self.assertRaises(ValueError): module.process_home(row, root)
+
     def test_database_generation_change_during_observation_refused(self):
         with patch.object(module, 'snapshot', side_effect=[self.row, self.row | {'runtime_launch_id': 'replacement'}]), patch.object(module, 'view', return_value=self.view), patch.object(module, 'process_home', return_value='/scoped'):
             with self.assertRaises(ValueError): module.observe('/db', 'http://127.0.0.1:3001', 'wa', 'wa-1')

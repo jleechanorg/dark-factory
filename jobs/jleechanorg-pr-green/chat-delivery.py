@@ -59,7 +59,8 @@ def profile(entry, home, proc=Path('/proc')):
                 continue
             env = dict(x.split(b'=', 1) for x in (process / 'environ').read_bytes().split(b'\0') if b'=' in x)
             args = (process / 'cmdline').read_bytes().split(b'\0')
-            exe = (process / 'exe').resolve().name
+            # Linux retains a running image after an upgrade unlinks its file.
+            exe = (process / 'exe').resolve().name.removesuffix(' (deleted)')
             if (env.get(b'AO_SESSION_ID') != entry['id'].encode()
                     or env.get(b'AO_PROJECT_ID') != entry['project_id'].encode()
                     or env.get(b'CODEX_HOME') != home.encode()

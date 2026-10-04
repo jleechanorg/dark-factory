@@ -104,7 +104,8 @@ def process_home(row, proc=Path('/proc')):
                     or env.get(b'AO_RUNTIME_LAUNCH_ID') != row['runtime_launch_id'].encode()
                     or str((entry / 'cwd').resolve()) != row['workspace_path']):
                 continue
-            exe = (entry / 'exe').resolve().name
+            # Linux retains a running image after an upgrade unlinks its file.
+            exe = (entry / 'exe').resolve().name.removesuffix(' (deleted)')
             args = (entry / 'cmdline').read_bytes().split(b'\0')
             if not (exe == 'codex' or exe.startswith('codex-') or
                     (exe == 'node' and any(part.endswith(b'/codex.js') for part in args))):

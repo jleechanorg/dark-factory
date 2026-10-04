@@ -23,6 +23,24 @@ class ChatDeliveryTests(unittest.TestCase):
         return {'controller': 'busy', 'turns': [{'id': 't1', 'providerTurnId': provider, 'state': state, 'requestedAt': '2026-10-04T18:00:01Z'}],
                 'messages': [{'role': 'user', 'text': text, 'turnId': 't1'}]}
 
+    def test_running_unlinked_codex_preserves_process_identity_checks(self):
+        # Synthetic /proc records reproduce Linux's executable replacement marker.
+        root = Path(self.tmp.name); proc = root / 'proc'; d = proc / '123'; d.mkdir(parents=True)
+        work = root / 'work'; work.mkdir()
+        owner = self.owner | {'workspace_path': str(work)}
+        (d / 'stat').write_text('123 (codex) S ' + ' '.join(['0'] * 18 + ['123']))
+        (d / 'exe').symlink_to('/bin/codex (deleted)')
+        (d / 'cwd').symlink_to(work)
+        (d / 'cmdline').write_bytes(b'codex\0app-server\0')
+        (d / 'environ').write_bytes(('AO_SESSION_ID=' + owner['id'] + '\0AO_PROJECT_ID=' + owner['project_id'] + '\0CODEX_HOME=/scoped\0').encode())
+        m.profile(owner, '/scoped', proc)
+        with patch.object(m.os, 'getuid', return_value=d.stat().st_uid + 1), self.assertRaises(ValueError):
+            m.profile(owner, '/scoped', proc)
+        with self.assertRaises(ValueError): m.profile(owner, '/other-account', proc)
+        with self.assertRaises(ValueError): m.profile(owner | {'id': 'other-session'}, '/scoped', proc)
+        (d / 'exe').unlink(); (d / 'exe').symlink_to('/bin/unrelated (deleted)')
+        with self.assertRaises(ValueError): m.profile(owner, '/scoped', proc)
+
     def test_overlapping_delivery_preserves_the_current_owner(self):
         with self.path.with_name(self.path.name + '.lock').open('w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
