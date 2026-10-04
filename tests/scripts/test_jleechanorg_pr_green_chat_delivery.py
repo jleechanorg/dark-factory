@@ -325,6 +325,105 @@ class ChatDeliveryTests(unittest.TestCase):
                 self.assertEqual(m.deliver(*self.args, initial=True, retain_initial=True), 4)
             self.assertEqual(self.path.read_bytes(), original)
 
+    def historical_initial_fixture(self, terminated=1):
+        previous = self.owner | {'is_terminated': 0, 'harness': 'codex', 'session_mode': 'chat',
+                    'provider_conversation_id': 'provider-thread', 'workspace_path': '/work'}
+        current = previous | {'is_terminated': terminated, 'controller_generation': 'g2'}
+        db = str(Path(self.tmp.name) / 'historical.db')
+        with m.sqlite3.connect(db) as conn:
+            conn.execute('CREATE TABLE sessions(' + ','.join(current) + ')')
+            conn.execute('INSERT INTO sessions VALUES(' + ','.join('?' for _ in current) + ')', list(current.values()))
+            conn.execute('CREATE TABLE conversation_turns(id, handled_by_session_id, provider_turn_id, controller_generation, requested_at, rolled_back_at, conversation_id)')
+            conn.execute('CREATE TABLE conversations(id, current_session_id, project_id)')
+            conn.execute('INSERT INTO conversations VALUES(?,?,?)', ('c1', current['id'], current['project_id']))
+            conn.execute("INSERT INTO conversation_turns VALUES(?,?,?,?,?,NULL,'c1')",
+                         ('t1', current['id'], 'p1', previous['controller_generation'], '2026-10-04 18:00:01.123456789 +0000 UTC'))
+        snapshot = self.snapshot('completed') | {'sessionId': current['id'], 'mode': 'chat', 'harness': 'codex', 'conversationId': 'c1'}
+        m.save(self.path, {'session': current['id'], 'text': 'repair', 'initial': True, 'owner': previous, 'scope': '/scoped',
+            'initialTurn': {'id': 't1', 'providerTurnId': 'p1', 'conversationId': 'c1', 'controllerGeneration': 'g1'}})
+        class ReadOnly:
+            calls = []
+            def request(inner, path, body=None):
+                self.assertIsNone(body)
+                self.assertEqual(path, 'sessions/' + current['id'] + '/conversation?limit=500')
+                inner.calls.append(path)
+                return snapshot
+        return db, previous, current, snapshot, ReadOnly()
+
+    def test_terminated_initial_receipt_reconciles_exact_persisted_provider_turn(self):
+        db, previous, current, snapshot, api = self.historical_initial_fixture()
+        with patch.object(m, 'restore_preflight', return_value=current) as proof:
+            self.assertEqual(m.reconcile_initial(api, db, current['project_id'], current['id'], '/scoped', self.path), 0)
+        proof.assert_called_once()
+        self.assertFalse(self.path.exists())
+        self.assertEqual(len(api.calls), 1)
+
+    def test_generation_rotation_reconciles_only_unchanged_native_owner(self):
+        db, previous, current, snapshot, api = self.historical_initial_fixture(terminated=0)
+        with patch.object(m, 'validate', return_value=(snapshot, current)):
+            self.assertEqual(m.reconcile_initial(api, db, current['project_id'], current['id'], '/scoped', self.path), 0)
+        self.assertFalse(self.path.exists())
+
+    def test_historical_initial_requires_database_binding_and_immutable_owner(self):
+        db, previous, current, snapshot, api = self.historical_initial_fixture()
+        original = self.path.read_bytes()
+        for scope in (None, '/other-account'):
+            pending = m.json.loads(original)
+            if scope is None: pending.pop('scope')
+            else: pending['scope'] = scope
+            m.save(self.path, pending)
+            with patch.object(m, 'row', side_effect=AssertionError('unproven scope must not inspect')):
+                self.assertEqual(m.reconcile_initial(api, db, current['project_id'], current['id'], '/scoped', self.path), 4)
+        self.path.write_bytes(original)
+        snapshot['turns'][0]['state'] = 'failed'
+        with patch.object(m, 'restore_preflight', return_value=current):
+            self.assertEqual(m.reconcile_initial(api, db, current['project_id'], current['id'], '/scoped', self.path), 4)
+        snapshot['turns'][0]['state'] = 'completed'
+        with m.sqlite3.connect(db) as conn: conn.execute("UPDATE conversation_turns SET controller_generation='unrelated'")
+        with patch.object(m, 'restore_preflight', return_value=current):
+            self.assertEqual(m.reconcile_initial(api, db, current['project_id'], current['id'], '/scoped', self.path), 4)
+        self.assertEqual(self.path.read_bytes(), original)
+        with m.sqlite3.connect(db) as conn: conn.execute("UPDATE conversation_turns SET controller_generation='g1'")
+        for field in ('provider_conversation_id', 'workspace_path', 'created_at'):
+            m.save(self.path, {'session': current['id'], 'text': 'repair', 'initial': True, 'owner': previous | {field: 'different'}, 'scope': '/scoped',
+                'initialTurn': {'id': 't1', 'providerTurnId': 'p1', 'conversationId': 'c1', 'controllerGeneration': 'g1'}})
+            before = self.path.read_bytes()
+            with patch.object(m, 'restore_preflight', return_value=current):
+                self.assertEqual(m.reconcile_initial(api, db, current['project_id'], current['id'], '/scoped', self.path), 4)
+            self.assertEqual(self.path.read_bytes(), before)
+        m.save(self.path, {'session': current['id'], 'text': 'repair', 'initial': True, 'request': 'ordinary'})
+        with patch.object(m, 'row', side_effect=AssertionError('mixed ledger must be rejected before inspection')):
+            self.assertEqual(m.reconcile_initial(api, db, current['project_id'], current['id'], '/scoped', self.path), 4)
+
+    def test_historical_matching_import_is_not_original_initial_turn(self):
+        db, previous, current, snapshot, api = self.historical_initial_fixture()
+        pending = m.json.loads(self.path.read_text())
+        pending['initialTurn'] = {'id': 'original-turn', 'providerTurnId': 'original-provider',
+                                  'conversationId': 'c1', 'controllerGeneration': 'g1'}
+        m.save(self.path, pending)
+        with patch.object(m, 'restore_preflight', return_value=current):
+            self.assertEqual(m.reconcile_initial(api, db, current['project_id'], current['id'], '/scoped', self.path), 4)
+        self.assertTrue(self.path.exists())
+
+    def test_queued_original_turn_is_pinned_before_later_native_termination(self):
+        db, previous, current, snapshot, api = self.historical_initial_fixture()
+        with m.sqlite3.connect(db) as conn:
+            conn.execute("UPDATE sessions SET is_terminated=0, controller_generation='g1'")
+            conn.execute("UPDATE conversation_turns SET provider_turn_id=''")
+        snapshot['controller'] = 'busy'; snapshot['turns'][0]['state'] = 'queued'; snapshot['turns'][0]['providerTurnId'] = ''
+        pending = m.json.loads(self.path.read_text()); del pending['initialTurn']; m.save(self.path, pending)
+        with patch.object(m, 'validate', return_value=(snapshot, previous)), patch.object(m.time, 'sleep'):
+            self.assertEqual(m.deliver(api, db, previous['project_id'], previous['id'], '/scoped', self.path, 'repair', initial=True), 4)
+        pending = m.json.loads(self.path.read_text())
+        self.assertEqual(pending['initialTurn'], {'id': 't1', 'providerTurnId': '', 'conversationId': 'c1', 'controllerGeneration': 'g1'})
+        with m.sqlite3.connect(db) as conn:
+            conn.execute("UPDATE sessions SET is_terminated=1, controller_generation='g2'")
+            conn.execute("UPDATE conversation_turns SET provider_turn_id='p1'")
+        snapshot['controller'] = 'terminated'; snapshot['turns'][0]['state'] = 'completed'; snapshot['turns'][0]['providerTurnId'] = 'p1'
+        with patch.object(m, 'restore_preflight', return_value=current):
+            self.assertEqual(m.reconcile_initial(api, db, current['project_id'], current['id'], '/scoped', self.path), 0)
+        self.assertFalse(self.path.exists())
+
     def test_queued_receipt_is_not_provider_ack(self):
         self.assertFalse(m.acknowledged(self.snapshot('queued'), 'repair'))
         self.assertFalse(m.acknowledged(self.snapshot(provider=''), 'repair'))

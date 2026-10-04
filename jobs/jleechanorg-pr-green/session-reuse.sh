@@ -1155,6 +1155,16 @@ pr_green_chat_reserved_session() {
   python3 "$helper" --reserved-session "${path}.chat"
 }
 
+pr_green_chat_reconcile_initial() {
+  local project="$1" number="$2" session="$3" helper api home path
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"
+  home="${CODEX_HOME:-${PR_GREEN_CODEX_HOME:-$HOME/.codex-dark-factory}}"
+  path="$(pr_green_delivery_pending_path "$project" "$number")" || return 4
+  [[ ! -e "$path" && -e "${path}.chat" ]] || return 4
+  api="$(pr_green_ao_api_base)" || return 4
+  python3 "$helper" --reconcile-initial "$api" "${PR_GREEN_AO_DB_PATH:-$HOME/.ao/data/ao.db}" "$project" "$session" "$home" "${path}.chat"
+}
+
 pr_green_chat_prepare_restore() {
   local project="$1" number="$2" session="$3" prompt="$4" helper api home path
   helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"
@@ -1230,6 +1240,13 @@ pr_green_reuse_session() {
   mode="$(pr_green_session_mode "$project_id" "$session_id" 2>/dev/null || true)"
   if [[ "$mode" == chat ]]; then
     local chat_rc=0 chat_action=reused chat_pending
+    # A list-backed exact owner may have completed its initial provider turn
+    # before termination/rotation. Retire only that proven historical receipt;
+    # defer the current prompt and any restore until the next sweep.
+    if pr_green_chat_reconcile_initial "$project_id" "$pr_number" "$session_id"; then
+      printf '%s\n' receipt_recovered
+      return 0
+    fi
     if [[ "$terminated" == true ]]; then
       chat_pending="$(pr_green_delivery_pending_path "$project_id" "$pr_number")" || return 4
       [[ ! -e "$chat_pending" && ! -e "${chat_pending}.chat" ]] || return 4

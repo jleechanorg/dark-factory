@@ -173,12 +173,13 @@ def timestamp(value):
     return int(whole.timestamp()), int((match[2] or '').ljust(9, '0'))
 
 
-def precise_turn_times(db, owner, snapshot):
+def precise_turn_times(db, owner, snapshot, only_bound=False):
     # v0.13.3's public DTO truncates requestedAt to seconds. Recover precision
     # only from the exact persisted turn, bound to this session/controller and
     # provider turn. Async admission may have an empty stored generation;
     # current conversation ownership is still mandatory. Never round admission
     # backward to make a receipt pass.
+    bound = set()
     with sqlite3.connect(Path(db).resolve().as_uri() + '?mode=ro', uri=True) as conn:
         for turn in snapshot.get('turns', []):
             if not turn.get('providerTurnId'):
@@ -197,6 +198,9 @@ def precise_turn_times(db, owner, snapshot):
             if timestamp(stored[0])[0] != timestamp(turn['requestedAt'])[0]:
                 raise ValueError('public and persisted turn timestamps disagree')
             turn['requestedAt'] = stored[0]
+            bound.add(turn['id'])
+    if only_bound:
+        snapshot['turns'] = [turn for turn in snapshot.get('turns', []) if turn['id'] in bound]
 
 
 def acknowledged(snapshot, text, turn_id=None, initial_owner=None):
@@ -336,6 +340,93 @@ def admission(path, text, session=None):
         return 4
 
 
+def pin_initial_turn(db, owner, snapshot, path, pending, home):
+    """Pin queued initial identity while its original native owner is verified."""
+    if (not pending.get('initial') or pending.get('initialTurn')
+            or not snapshot.get('conversationId') or pending.get('text') != owner['prompt']):
+        return
+    turns = {t['id']: t for t in snapshot.get('turns', []) if not t.get('rolledBack')}
+    candidates = {message.get('turnId') for message in snapshot.get('messages', [])
+                  if message.get('role') == 'user' and message.get('text') == pending['text']}
+    matches = []
+    with sqlite3.connect(Path(db).resolve().as_uri() + '?mode=ro', uri=True) as conn:
+        for turn_id in candidates & turns.keys():
+            turn = turns[turn_id]
+            stored = conn.execute(
+                'SELECT t.provider_turn_id,t.requested_at FROM conversation_turns t '
+                'JOIN conversations c ON c.id=t.conversation_id '
+                'WHERE t.id=? AND t.handled_by_session_id=? '
+                "AND (t.controller_generation=? OR t.controller_generation='') "
+                'AND t.rolled_back_at IS NULL AND c.id=? AND c.current_session_id=? AND c.project_id=?',
+                (turn_id, owner['id'], owner['controller_generation'], snapshot['conversationId'], owner['id'], owner['project_id'])).fetchone()
+            if (stored is None or timestamp(stored[1]) < timestamp(owner['created_at'])
+                    or timestamp(stored[1])[0] != timestamp(turn['requestedAt'])[0]
+                    or (turn.get('providerTurnId') and turn['providerTurnId'] != stored[0])):
+                continue
+            matches.append({'id': turn_id, 'providerTurnId': stored[0],
+                            'conversationId': snapshot['conversationId'], 'controllerGeneration': owner['controller_generation']})
+    if len(matches) == 1 and row(db, owner['project_id'], owner['id']) == owner:
+        pending['initialTurn'] = matches[0]
+        pending['scope'] = home
+        save(path, pending)
+
+
+def reconcile_initial(api, db, project, session, home, path):
+    """Read-only native evidence can retire an initial receipt after an epoch change.
+
+    Provider messages are never sent here. Preserve the original generation for
+    stored-turn proof, independently verify current immutable owner/account, and
+    reject failed, rolled-back or unbound historical turns. Ordinary pending
+    sends keep their existing generation fence and are never handled here.
+    """
+    try:
+        with delivery_lock(path):
+            pending = json.loads(path.read_text())
+            if (pending.get('initial') is not True or pending.get('session') != session
+                    or pending.get('scope') != home
+                    or not set(pending).issubset({'session', 'text', 'initial', 'spawnReceipt', 'owner', 'scope', 'initialTurn'})):
+                return 4
+            provenance = pending.get('initialTurn')
+            if (not isinstance(provenance, dict)
+                    or set(provenance) != {'id', 'providerTurnId', 'conversationId', 'controllerGeneration'}
+                    or not isinstance(pending.get('owner'), dict)
+                    or not all(isinstance(provenance[k], str) and provenance[k] for k in ('id', 'conversationId', 'controllerGeneration'))
+                    or (provenance['providerTurnId'] is not None and not isinstance(provenance['providerTurnId'], str))
+                    or provenance['controllerGeneration'] != pending['owner'].get('controller_generation')):
+                return 4
+            current = row(db, project, session)
+            if current['is_terminated']:
+                owner = restore_preflight(api, db, project, session, home)
+                snapshot = api.request('sessions/' + session + '/conversation?limit=500')
+            else:
+                snapshot, owner = validate(api, db, project, session, home)
+            if (snapshot.get('sessionId') != session or snapshot.get('mode') != 'chat'
+                    or snapshot.get('harness') != 'codex'):
+                return 4
+            original = pending.get('owner', owner)
+            immutable = set(owner) - {'is_terminated', 'controller_generation'}
+            if (not isinstance(original, dict) or set(original) != set(owner)
+                    or any(original[key] != owner[key] for key in immutable)):
+                return 4
+            # Native import timestamps are import time, not send time. Only the
+            # original turn pinned before epoch change may acknowledge this ledger.
+            if snapshot.get('conversationId') != provenance['conversationId']:
+                return 4
+            snapshot['turns'] = [turn for turn in snapshot.get('turns', [])
+                                 if turn['id'] == provenance['id']
+                                 and (not provenance['providerTurnId']
+                                      or turn.get('providerTurnId') == provenance['providerTurnId'])]
+            precise_turn_times(db, original, snapshot, only_bound=True)
+            if not acknowledged(snapshot, pending.get('text'), provenance['id'], initial_owner=original):
+                return 4
+            if row(db, project, session) != owner:
+                return 4
+            path.unlink()
+            return 0
+    except BlockingIOError:
+        return 4
+
+
 def prepare_restore(api, db, project, session, home, path, text):
     """Reserve the existing owner before the non-idempotent native restore."""
     try:
@@ -364,7 +455,7 @@ def _deliver_locked(api, db, project, session, home, path, text, initial=False, 
     if retain_initial:
         observed = json.loads(path.read_text()) if path.exists() else {}
         if (observed.get('initial') is not True
-                or not set(observed).issubset({'session', 'text', 'initial', 'spawnReceipt', 'owner', 'scope'})):
+                or not set(observed).issubset({'session', 'text', 'initial', 'spawnReceipt', 'owner', 'scope', 'initialTurn'})):
             return 4
     if initial and not path.exists():
         save(path, {"session": session, "text": text, "initial": True})
@@ -403,9 +494,10 @@ def _deliver_locked(api, db, project, session, home, path, text, initial=False, 
             if pending.get('owner') is None:
                 if not pending.get('initial'):
                     return 4
-                pending['owner'] = owner; save(path, pending)
+                pending['owner'] = owner; pending['scope'] = home; save(path, pending)
             text = pending['text']
-            if (pending.get('initial') or pending.get('turnId')) and acknowledged(snapshot, text, pending.get('turnId'), owner if pending.get('initial') else None):
+            pin_initial_turn(db, owner, snapshot, path, pending, home)
+            if (pending.get('initial') or pending.get('turnId')) and acknowledged(snapshot, text, pending.get('turnId') or pending.get('initialTurn', {}).get('id'), owner if pending.get('initial') else None):
                 if not retain_initial:
                     path.unlink()
                 return 0 if text == requested_text else 6
@@ -447,7 +539,8 @@ def _deliver_locked(api, db, project, session, home, path, text, initial=False, 
         current, current_owner = validate(api, db, project, session, home)
         if current_owner != owner:
             return 4
-        if acknowledged(current, text, pending.get('turnId'), owner if pending.get('initial') else None):
+        pin_initial_turn(db, owner, current, path, pending, home)
+        if acknowledged(current, text, pending.get('turnId') or pending.get('initialTurn', {}).get('id'), owner if pending.get('initial') else None):
             if not retain_initial:
                 path.unlink()
             return 0 if text == requested_text else 6
@@ -465,6 +558,11 @@ if __name__ == '__main__':
         if len(sys.argv) == 3 and sys.argv[1] == '--spawn-receipt-path':
             print(spawn_receipt_path(Path(sys.argv[2]), sys.stdin.read()))
             sys.exit(0)
+        if len(sys.argv) == 8 and sys.argv[1] == '--reconcile-initial':
+            base, db, project, session, home, pending = sys.argv[2:]
+            if not all(re.fullmatch(r'[A-Za-z0-9._-]+', item) for item in (project, session)):
+                raise ValueError('invalid identity')
+            sys.exit(reconcile_initial(API(base), db, project, session, home, Path(pending)))
         if len(sys.argv) == 8 and sys.argv[1] == '--prepare-restore':
             base, db, project, session, home, pending = sys.argv[2:]
             if not all(re.fullmatch(r'[A-Za-z0-9._-]+', item) for item in (project, session)):

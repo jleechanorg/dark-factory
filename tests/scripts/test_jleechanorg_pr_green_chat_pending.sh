@@ -90,3 +90,13 @@ for sweep in 1 2; do
   [[ "$action" == receipt_recovered ]]
 done
 printf 'PASS: missing session listing recovers exact native spawn receipt for direct owner validation\n'
+
+# Historical initial receipt reconciliation is list-backed and read-only. A
+# confirmed receipt defers current work; it does not restore or send in this run.
+pr_green_session_record() { printf '%s\n' '{"id":"worldarchitect.ai-71","isTerminated":true}'; }
+pr_green_chat_reconcile_initial() { [[ "$1 $2 $3" == 'worldarchitect.ai 124 worldarchitect.ai-71' ]]; }
+pr_green_before_restore_admission() { printf 'unexpected restore\n' > "$tmp/unexpected"; return 99; }
+pr_green_chat_delivery() { printf 'unexpected delivery\n' > "$tmp/unexpected"; return 99; }
+action="$(pr_green_reuse_session worldarchitect.ai 124 'current repair')"
+[[ "$action" == receipt_recovered && ! -e "$tmp/unexpected" ]]
+printf 'PASS: terminated initial receipt reconciles before any restore or new delivery\n'
