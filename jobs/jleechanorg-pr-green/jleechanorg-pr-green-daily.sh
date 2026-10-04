@@ -514,7 +514,25 @@ EOF
   # deferred instead of producing concurrent-spawn refusals.
   mkdir -p "$AO_SPAWN_LOCK_DIR"
   ao_spawn_lock="$AO_SPAWN_LOCK_DIR/jleechanorg-pr-green-ao-${project_id}.lock"
-  spawn_cmd=(flock -n "$ao_spawn_lock" ao spawn --project "$project_id" --claim-pr "$number" --name "$session_name" --harness codex --mode chat --prompt "$prompt")
+  exec 9>"$ao_spawn_lock"
+  if ! flock -n 9; then
+    admission_deferred=$((admission_deferred + 1))
+    record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" no_change admission_cap_deferred
+    pr_green_release_admission_lock
+    exec 9>&-
+    continue
+  fi
+  # Persist ownership before invoking a non-idempotent spawn. Even a lost CLI
+  # response or missing session-list row must leave a duplicate-suppression
+  # reservation. Unknown admissions stay reserved for evidence-based recovery.
+  if ! pr_green_chat_admission "$project_id" "$number" "$prompt"; then
+    delivery_unconfirmed=$((delivery_unconfirmed + 1))
+    record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" delivery_unconfirmed chat_admission_pending
+    pr_green_release_admission_lock
+    exec 9>&-
+    continue
+  fi
+  spawn_cmd=(ao spawn --project "$project_id" --claim-pr "$number" --name "$session_name" --harness codex --mode chat --prompt "$prompt")
   attempted=$((attempted + 1))
   spawn_err="$(mktemp)"
   # The Go AO CLI creates and claims the worker, then returns. Wait for that
@@ -524,12 +542,21 @@ EOF
   spawn_pid=$!
   spawn_rc=0
   wait "$spawn_pid" || spawn_rc=$?
+  exec 9>&-
   if [[ -s "$spawn_err" ]]; then
     cat "$spawn_err" >&2
     # Require both the acknowledged output and the project-scoped durable row.
     if pr_green_spawn_output_is_success "$spawn_err"; then
-      if spawned_record="$(pr_green_session_record "$project_id" "$number")"; then
-        spawned_session="$(jq -r .id <<<"$spawned_record")"
+      # The current Go CLI returns the created session ID. A generic success
+      # line without one cannot authorize binding an anonymous reservation.
+      spawned_session="$(sed -nE 's/^spawned session ([A-Za-z0-9._-]+) .*/\1/p' "$spawn_err" | sort -u)"
+      if [[ -z "$spawned_session" ]] || ! pr_green_chat_admission "$project_id" "$number" "$prompt" "$spawned_session"; then
+        record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" dispatch_failed spawn_unverified
+        pr_green_release_admission_lock
+        rm -f "$spawn_err"
+        continue
+      fi
+      if spawned_record="$(pr_green_session_record "$project_id" "$number")" && [[ "$(jq -r .id <<<"$spawned_record")" == "$spawned_session" ]]; then
         if ! pr_green_chat_delivery "$project_id" "$number" "$spawned_session" "$prompt" initial; then
           echo "$LOG_PREFIX Chat spawn exists but provider turn is unconfirmed for $repo#$number; suppressing duplicate" >&2
           record_outcome "$repo" "$number" "$url" "$live_state" "$live_state" delivery_unconfirmed chat_provider_unconfirmed

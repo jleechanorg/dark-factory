@@ -66,6 +66,26 @@ class ChatDeliveryTests(unittest.TestCase):
         snapshot['turns'][0]['requestedAt'] = '2026-10-04T18:00:02Z'
         with self.assertRaises(ValueError): m.precise_turn_times(db, owner, snapshot)
 
+    def test_admission_reserves_before_spawn_and_requires_explicit_binding(self):
+        self.assertEqual(m.admission(self.path, 'repair'), 0)
+        before = self.path.read_bytes()
+        self.assertEqual(m.admission(self.path, 'replacement'), 4)
+        self.assertEqual(self.path.read_bytes(), before)
+        with patch.object(m, 'validate', return_value=(self.snapshot(), self.owner)):
+            self.assertEqual(m.deliver(*self.args), 4)
+        self.assertEqual(m.admission(self.path, 'repair', self.owner['id']), 0)
+        self.assertEqual(m.admission(self.path, 'repair', 'different-session'), 4)
+        with patch.object(m, 'validate', return_value=(self.snapshot(), self.owner)):
+            self.assertEqual(m.deliver(*self.args), 0)
+        self.assertFalse(self.path.exists())
+
+    def test_ambiguous_spawn_identity_does_not_bind_admission(self):
+        self.assertEqual(m.admission(self.path, 'repair'), 0)
+        before = self.path.read_bytes()
+        self.assertEqual(m.admission(self.path, 'repair', 'session-one\nsession-two'), 4)
+        self.assertEqual(m.admission(self.path, 'wrong prompt', self.owner['id']), 4)
+        self.assertEqual(self.path.read_bytes(), before)
+
     def test_queued_receipt_is_not_provider_ack(self):
         self.assertFalse(m.acknowledged(self.snapshot('queued'), 'repair'))
         self.assertFalse(m.acknowledged(self.snapshot(provider=''), 'repair'))

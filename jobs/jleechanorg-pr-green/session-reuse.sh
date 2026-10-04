@@ -1127,6 +1127,16 @@ pr_green_live_session_is_busy() {
   grep -Eq 'Working \(|Waiting for agents|Waiting for background terminal' <<<"$pane"
 }
 
+pr_green_chat_admission() {
+  local project="$1" number="$2" prompt="$3" session="${4:-}" helper path
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"
+  path="$(pr_green_delivery_pending_path "$project" "$number")" || return 4
+  [[ ! -s "$path" ]] || return 4
+  local -a args=(--admission "${path}.chat")
+  [[ -z "$session" ]] || args+=("$session")
+  printf '%s' "$prompt" | python3 "$helper" "${args[@]}"
+}
+
 pr_green_chat_delivery() {
   local project="$1" number="$2" session="$3" prompt="$4" initial="${5:-reuse}" helper api path
   helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"

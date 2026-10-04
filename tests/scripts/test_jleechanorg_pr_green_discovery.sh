@@ -148,6 +148,12 @@ if [[ "${PR_GREEN_REGISTER_PROJECT:-0}" == 1 ]]; then
 fi
 if [[ "${PR_GREEN_BUSY_FAIRNESS:-0}" == 1 ]]; then
   if [[ "$1" == spawn ]]; then
+    if [[ "${PR_GREEN_LOST_SPAWN_LIST:-0}" == 1 ]]; then
+      printf '%s\n' spawn >> "$AO_CALLS"
+      [[ -s "$PR_GREEN_METRICS_DIR/pending-delivery/repo-a-44.json.chat" ]] || : > "${AO_CALLS}.unreserved"
+      printf '%s\n' 'spawned session repo-a-65 (idle) (claimed https://github.com/jleechanorg/repo-a/pull/44)'
+      exit 0
+    fi
     if [[ "${PR_GREEN_SPAWN_FAILURE:-0}" == 1 ]]; then
       [[ "${PR_GREEN_SPAWN_FAILURE_OUTPUT:-0}" == 1 ]] && printf '%s\n' 'spawn failed'
       exit 23
@@ -163,6 +169,10 @@ if [[ "${PR_GREEN_BUSY_FAIRNESS:-0}" == 1 ]]; then
   fi
   case "$1 $2" in
     "session ls")
+      if [[ "${PR_GREEN_LOST_SPAWN_LIST:-0}" == 1 ]]; then
+        printf '%s\n' '{"data":[]}'
+        exit 0
+      fi
       if [[ "${PR_GREEN_CAP_TERMINATED_RESTORE:-0}" == 1 ]]; then
         printf '%s\n' '{"data":[{"id":"terminated-44","displayName":"pr-44","isTerminated":true,"status":"pr_open"}]}'
         exit 0
@@ -604,5 +614,24 @@ if grep -Eq 'session kill|stale_recovery|outside AO-managed worktree directories
   echo 'FAIL: Go AO job retained unsupported stale-session kill/retry path' >&2
   exit 1
 fi
+
+# A successful native spawn followed by a temporarily missing session listing
+# is still an owned admission. Persist before the spawn and keep that exact ID
+# reserved across a second complete scheduler run.
+lost_metrics="$fixture_dir/metrics-lost-spawn-list"
+mkdir -p "$lost_metrics"
+: > "$lost_metrics/ao.db"
+for iteration in 1 2; do
+  PATH="$mock_bin:$PATH" HOME="$fixture_dir/home-lost-spawn-list" CODEX_HOME="$failure_codex" \
+    PR_GREEN_DISCOVERY_CASE=cap PR_GREEN_BUSY_FAIRNESS=1 PR_GREEN_LOST_SPAWN_LIST=1 \
+    PR_GREEN_AO_DB_PATH="$lost_metrics/ao.db" PR_GREEN_AO_SPAWN_LOCK_DIR="$lost_metrics/locks" \
+    PR_GREEN_METRICS_DIR="$lost_metrics" PR_GREEN_MAX_PRS=1 PR_GREEN_DRY_RUN=0 \
+    AO_CALLS="$lost_metrics/ao.log" GH_CALLS="$lost_metrics/gh.log" \
+    bash "$JOB" > "$lost_metrics/run-$iteration.out" 2> "$lost_metrics/run-$iteration.err"
+done
+[[ ! -e "$lost_metrics/ao.log.unreserved" ]] || { echo 'FAIL: spawn occurred before durable reservation'; exit 1; }
+[[ "$(grep -c '^spawn$' "$lost_metrics/ao.log")" == 1 ]] || { echo 'FAIL: lost listing spawned a duplicate worker'; exit 1; }
+[[ "$(jq -r .session "$lost_metrics/pending-delivery/repo-a-44.json.chat")" == repo-a-65 ]]
+[[ "$(jq -sr 'last.delivery_unconfirmed' "$lost_metrics/runs.jsonl")" == 1 ]]
 
 echo 'jleechanorg-pr-green discovery: PASS'

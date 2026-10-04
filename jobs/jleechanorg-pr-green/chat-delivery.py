@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Supported Chat delivery with durable handles and provider-backed receipts."""
+from contextlib import contextmanager
 from datetime import datetime
 import fcntl
 import json
@@ -154,22 +155,53 @@ def save(path, data):
         with os.fdopen(fd, 'w') as stream:
             json.dump(data, stream); stream.flush(); os.fsync(stream.fileno())
         os.replace(tmp, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         tmp.unlink(missing_ok=True)
 
 
-def deliver(api, db, project, session, home, path, text, initial=False):
-    # Serialize the complete observation/persist/send sequence across processes.
-    # Keep the lock inode after use so a concurrent caller cannot lock a new
-    # inode while an earlier delivery still owns the original one.
+@contextmanager
+def delivery_lock(path):
+    # Keep the inode after use; concurrent callers must lock the same file.
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(path.with_name(path.name + '.lock'), os.O_WRONLY | os.O_CREAT, 0o600)
     with os.fdopen(fd, 'w') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return 4
-        return _deliver_locked(api, db, project, session, home, path, text, initial)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
+def admission(path, text, session=None):
+    """Reserve before spawn; bind only to the explicit native spawn receipt."""
+    try:
+        with delivery_lock(path):
+            if session is None:
+                if path.exists():
+                    return 4
+                save(path, {'session': '', 'text': text, 'initial': True})
+            else:
+                if not re.fullmatch(r'[A-Za-z0-9._-]+', session):
+                    return 4
+                pending = json.loads(path.read_text())
+                if (pending.get('initial') is not True or pending.get('text') != text
+                        or pending.get('session') not in ('', session)):
+                    return 4
+                pending['session'] = session
+                save(path, pending)
+            return 0
+    except BlockingIOError:
+        return 4
+
+
+def deliver(api, db, project, session, home, path, text, initial=False):
+    try:
+        with delivery_lock(path):
+            return _deliver_locked(api, db, project, session, home, path, text, initial)
+    except BlockingIOError:
+        return 4
 
 
 def _deliver_locked(api, db, project, session, home, path, text, initial=False):
@@ -230,6 +262,9 @@ def _deliver_locked(api, db, project, session, home, path, text, initial=False):
 
 if __name__ == '__main__':
     try:
+        if len(sys.argv) in (3, 4) and sys.argv[1] == '--admission':
+            code = admission(Path(sys.argv[2]), sys.stdin.read(), sys.argv[3] if len(sys.argv) == 4 else None)
+            sys.exit(code)
         base, db, project, session, home, pending, initial = sys.argv[1:]
         if not all(re.fullmatch(r'[A-Za-z0-9._-]+', item) for item in (project, session)):
             raise ValueError('invalid identity')
