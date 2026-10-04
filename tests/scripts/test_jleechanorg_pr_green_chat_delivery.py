@@ -33,6 +33,24 @@ class ChatDeliveryTests(unittest.TestCase):
         self.assertFalse(m.acknowledged(self.snapshot(), 'repair', initial_owner=self.owner | {'prompt': 'different'}))
         self.assertFalse(m.acknowledged(self.snapshot(), 'repair', initial_owner=self.owner | {'created_at': '2026-10-04T19:00:00Z'}))
 
+    def test_initial_ack_accepts_actual_go_sqlite_admission_timestamp(self):
+        owner = self.owner | {'created_at': '2026-10-04 18:00:00.162941244 +0000 UTC'}
+        self.assertTrue(m.acknowledged(self.snapshot(), 'repair', initial_owner=owner))
+        for stamp in ('2026-10-04 18:00:01.000000001 +0000 UTC',
+                      '2026-10-04 18:00:02 +0000 UTC', 'invalid',
+                      '2026-10-04T18:00:00'):
+            with self.subTest(stamp=stamp):
+                self.assertFalse(m.acknowledged(self.snapshot(), 'repair', initial_owner=owner | {'created_at': stamp}))
+
+    def test_initial_go_timestamp_receipt_clears_pending_without_post(self):
+        owner = self.owner | {'created_at': '2026-10-04 18:00:00.162941244 +0000 UTC'}
+        m.save(self.path, {'session': owner['id'], 'initial': True, 'text': 'repair', 'owner': owner})
+        class NoPost:
+            def request(self, *args): raise AssertionError('must observe without sending')
+        with patch.object(m, 'validate', return_value=(self.snapshot(), owner)):
+            self.assertEqual(m.deliver(NoPost(), *self.args[1:]), 0)
+        self.assertFalse(self.path.exists())
+
     def test_initial_spawn_failure_persists_no_resend_state(self):
         with patch.object(m, 'validate', side_effect=ValueError('connecting')):
             with self.assertRaises(ValueError): m.deliver(*self.args, initial=True)

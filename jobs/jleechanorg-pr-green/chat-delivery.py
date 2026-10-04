@@ -89,14 +89,24 @@ def validate(api, db, project, session, home):
     return snapshot, entry
 
 
+def timestamp(value):
+    """Compare RFC3339 API and Go SQLite times without dropping nanoseconds."""
+    value = re.sub(r' ([+-]\d{2})(\d{2}) [A-Za-z0-9_+:-]+$', r'\1:\2', value)
+    match = re.fullmatch(r'(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})', value)
+    if not match:
+        raise ValueError('invalid timezone-aware timestamp')
+    whole = datetime.fromisoformat(match[1] + match[3].replace('Z', '+00:00'))
+    return int(whole.timestamp()), int((match[2] or '').ljust(9, '0'))
+
+
 def acknowledged(snapshot, text, turn_id=None, initial_owner=None):
     turns = {t['id']: t for t in snapshot.get('turns', []) if not t.get('rolledBack')}
     for message in snapshot.get('messages', []):
         turn = turns.get(message.get('turnId'), {})
         if initial_owner is not None:
             try:
-                requested = datetime.fromisoformat(turn['requestedAt'].replace('Z', '+00:00'))
-                admitted = datetime.fromisoformat(initial_owner['created_at'].replace('Z', '+00:00'))
+                requested = timestamp(turn['requestedAt'])
+                admitted = timestamp(initial_owner['created_at'])
                 if initial_owner['prompt'] != text or requested < admitted:
                     continue
             except (ValueError, KeyError, TypeError):
