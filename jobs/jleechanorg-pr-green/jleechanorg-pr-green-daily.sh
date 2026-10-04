@@ -32,6 +32,8 @@ mkdir -p "$METRICS_DIR"
 mkdir -p "$AO_SPAWN_LOCK_DIR"
 exec 8>"$GLOBAL_ADMISSION_LOCK_FILE"
 run_started="${PR_GREEN_RUN_STARTED:-$(date +%s)}"
+export PR_GREEN_INSPECTION_RUN_STARTED="$run_started"
+inspection_diagnostics_dir="$(python3 "$SCRIPT_DIR/pr-inspection.py" --init "$METRICS_DIR" "$run_started")"
 analyzed=0
 analysis_failed=0
 actionable=0
@@ -224,7 +226,6 @@ fi
 
 if [[ -z "$prs" ]]; then
   echo "$LOG_PREFIX no recently updated open PRs"
-  exit 0
 fi
 
 dispatched=0
@@ -268,7 +269,7 @@ record_outcome() {
 
 reconcile_pr() {
   local repo="$1" number="$2" url="$3" before="$4" action="$5" after classification snapshot_path
-  after="$(pr_green_fetch_live_state "$url" 2>/dev/null || true)"
+  after="$(pr_green_fetch_live_state "$url" "$inspection_diagnostics_dir" reconciliation || true)"
   after="$(pr_green_apply_required_contract "$repo" "$after" "$url")"
   [[ -n "$after" ]] || { echo "$LOG_PREFIX unable to re-read $repo#$number after $action" >&2; return 1; }
   classification="$(pr_green_classify_outcome "$before" "$after")"
@@ -308,7 +309,7 @@ pr_green_register_project() {
 while IFS=$'\t' read -r repo number title url updated; do
   [[ -n "$repo" && -n "$number" ]] || continue
   : "$updated" # retained from discovery for the audit TSV ordering
-  live_state="$(pr_green_fetch_live_state "$url" 2>/dev/null || true)"
+  live_state="$(pr_green_fetch_live_state "$url" "$inspection_diagnostics_dir" || true)"
   live_state="$(pr_green_apply_required_contract "$repo" "$live_state" "$url")"
   if [[ -z "$live_state" ]]; then
     analysis_failed=$((analysis_failed + 1))
@@ -597,7 +598,13 @@ EOF
   pr_green_release_admission_lock
 done <<< "$ordered_prs"
 
-jq -n --argjson ts "$run_started" --argjson analyzed "$analyzed" \
+run_status=success
+if (( discovered_count == 0 )); then run_status=empty
+elif (( analysis_failed > 0 && analyzed == 0 )); then run_status=failed
+elif (( analysis_failed > 0 )); then run_status=partial
+fi
+jq -n --arg run_status "$run_status" --arg inspection_diagnostics_dir "$inspection_diagnostics_dir" \
+  --argjson ts "$run_started" --argjson analyzed "$analyzed" \
   --argjson analysis_failed "$analysis_failed" \
   --argjson discovered "$discovered_count" \
   --argjson actionable "$actionable" --argjson selected "$selected" \
@@ -609,6 +616,9 @@ jq -n --argjson ts "$run_started" --argjson analyzed "$analyzed" \
   --argjson recovery_blocked "$recovery_blocked" \
   --argjson delivery_unconfirmed "$delivery_unconfirmed" \
   --argjson fixed_confirmed "$fixed_confirmed" --argjson receipt_recovered "$receipt_recovered" \
-  '{ts:$ts, discovered:$discovered, analyzed:$analyzed, analysis_failed:$analysis_failed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, busy_deferred:$busy_deferred, cooldown_deferred:$cooldown_deferred, admission_deferred:$admission_deferred, recovery_blocked:$recovery_blocked, delivery_unconfirmed:$delivery_unconfirmed, fixed_confirmed:$fixed_confirmed, receipt_recovered:$receipt_recovered}' \
+  '{run_status:$run_status,inspection_diagnostics_dir:$inspection_diagnostics_dir,ts:$ts, discovered:$discovered, analyzed:$analyzed, analysis_failed:$analysis_failed, actionable:$actionable, selected:$selected, attempted:$attempted, dispatched:$dispatched, reused:$reused, restored:$restored, busy_deferred:$busy_deferred, cooldown_deferred:$cooldown_deferred, admission_deferred:$admission_deferred, recovery_blocked:$recovery_blocked, delivery_unconfirmed:$delivery_unconfirmed, fixed_confirmed:$fixed_confirmed, receipt_recovered:$receipt_recovered}' \
   >> "$METRICS_DIR/runs.jsonl"
-echo "$LOG_PREFIX summary analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored busy_deferred=$busy_deferred cooldown_deferred=$cooldown_deferred recovery_blocked=$recovery_blocked delivery_unconfirmed=$delivery_unconfirmed fixed_confirmed=$fixed_confirmed receipt_recovered=$receipt_recovered"
+echo "$LOG_PREFIX summary run_status=$run_status analysis_failed=$analysis_failed analyzed=$analyzed actionable=$actionable selected=$selected attempted=$attempted dispatched=$dispatched reused=$reused restored=$restored busy_deferred=$busy_deferred cooldown_deferred=$cooldown_deferred recovery_blocked=$recovery_blocked delivery_unconfirmed=$delivery_unconfirmed fixed_confirmed=$fixed_confirmed receipt_recovered=$receipt_recovered"
+
+# A discovered set that could not be inspected is an operational failure.
+[[ "$run_status" != failed ]] || exit 1
