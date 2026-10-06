@@ -4,6 +4,9 @@ set -euo pipefail
 job_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=session-reuse.sh
 source "$job_dir/session-reuse.sh"
+# This suite models legacy TUI rows; Chat mode has its own receipt tests.
+pr_green_session_mode() { printf '%s\n' tui; }
+pr_green_daemon_tmux_socket() { return 0; }
 
 fixture='{"data":[{"id":"wa-live","displayName":"pr-123","isTerminated":false,"status":"pr_open","updatedAt":"2026-09-23T00:00:00Z"}]}'
 session_get_fixture=''
@@ -113,7 +116,12 @@ curl() {
 # proves a visibly working pane is deferred before `ao send` is attempted.
 tmux() {
   case "$1 $2" in
-    "has-session -t") [[ "$3" == "$busy_runtime_handle" ]] ;;
+    "has-session -t")
+      case "$3" in
+        =worldarchitect-ai-123-native|=worldarchitect-ai-654-native|=worldarchitect-ai-321-native|=worldarchitect-ai-777-deadbeef) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
     "display-message -p") printf '%s:%s:%s\n' "$recovery_pane_mode" "$recovery_cursor_y" "$recovery_pane_height" ;;
     "list-panes -t") printf '%%12\n' ;;
     "capture-pane -p")
@@ -435,6 +443,8 @@ if grep -Eq '^send ' "$ao_calls_file"; then
   exit 1
 fi
 
+# The following fixtures are different idle terminal sessions.
+busy_pane_output=''
 fixture='{"data":[{"id":"wa-fallback","isTerminated":false,"status":"pr_open","updatedAt":"2026-09-23T00:02:00Z"}]}'
 session_get_fixture='{"session":{"id":"wa-fallback","displayName":"pr-654","isTerminated":false,"status":"pr_open","updatedAt":"2026-09-23T00:02:00Z"}}'
 : >"$ao_calls_file"

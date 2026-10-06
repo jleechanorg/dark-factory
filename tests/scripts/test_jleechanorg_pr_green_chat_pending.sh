@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/../../jobs/jleechanorg-pr-green/session-reuse.sh"
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+export PR_GREEN_DELIVERY_STATE_DIR="$tmp"
+# Missing-list observation must never inspect the developer runtime.
+export PR_GREEN_AO_RUN_FILE="$tmp/no-runtime.json"
+export PR_GREEN_AO_DB_PATH="$tmp/fixture.db"
+# A transient empty AO listing must not admit a second worker when an
+# initial Chat prompt still has a durable unresolved receipt.
+pr_green_session_record() { return 0; }
+path=$(pr_green_delivery_pending_path worldarchitect.ai 123)
+printf '%s\n' '{"session":"worldarchitect.ai-65","initial":true,"text":"repair"}' > "${path}.chat"
+[[ "$(pr_green_delivery_pending_status worldarchitect.ai 123)" == pending ]]
+rc=0; pr_green_reuse_session worldarchitect.ai 123 repair || rc=$?
+[[ "$rc" == 4 && -f "${path}.chat" ]]
+# Corrupt/empty Chat ledgers are reservations too; only actual receipt
+# observation may retire them.
+: > "${path}.chat"
+[[ "$(pr_green_delivery_pending_status worldarchitect.ai 123)" == pending ]]
+rc=0; pr_green_reuse_session worldarchitect.ai 123 repair || rc=$?
+[[ "$rc" == 4 && -f "${path}.chat" ]]
+rm "${path}.chat"
+[[ "$(pr_green_delivery_pending_status worldarchitect.ai 123)" == none ]]
+rc=0; pr_green_reuse_session worldarchitect.ai 123 repair || rc=$?
+[[ "$rc" == 1 ]]
+printf 'PASS: Chat receipt reserves missing session and malformed ledger fails closed\n'
+
+# Busy Chat is a deferral, never an acknowledged reuse. Preserve both genuine
+# delivery success and unconfirmed failures through the shell adapter.
+pr_green_session_record() { printf '%s\n' '{"id":"worldarchitect.ai-65"}'; }
+pr_green_session_mode() { printf '%s\n' chat; }
+pr_green_chat_delivery() { return 5; }
+action=$(pr_green_reuse_session worldarchitect.ai 123 repair)
+[[ "$action" == busy_deferred ]]
+pr_green_chat_delivery() { return 0; }
+action=$(pr_green_reuse_session worldarchitect.ai 123 repair)
+[[ "$action" == reused ]]
+pr_green_chat_delivery() { return 4; }
+rc=0; action=$(pr_green_reuse_session worldarchitect.ai 123 repair) || rc=$?
+[[ "$rc" == 4 && -z "$action" ]]
+pr_green_chat_delivery() { return 6; }
+action=$(pr_green_reuse_session worldarchitect.ai 123 repair)
+[[ "$action" == receipt_recovered ]]
+pr_green_chat_delivery() { return 1; }
+rc=0; pr_green_reuse_session worldarchitect.ai 123 repair || rc=$?
+[[ "$rc" == 4 ]]
+printf 'PASS: Chat busy and recovered receipt accounting are distinct from delivery; helper errors fail closed\n'
+
+# Terminated Chat keeps its exact session and provider conversation on restore.
+pr_green_session_record() { printf '%s\n' '{"id":"worldarchitect.ai-65","isTerminated":true}'; }
+pr_green_chat_prepare_restore() { printf 'preflight\n' >> "$tmp/calls"; printf '{}\n' > "${path}.chat"; }
+pr_green_before_restore_admission() { printf 'admission\n' >> "$tmp/calls"; }
+ao() { [[ "$*" == 'session restore worldarchitect.ai-65 -p worldarchitect.ai' ]] || return 99; printf 'restore\n' >> "$tmp/calls"; }
+pr_green_chat_delivery() { [[ -f "$tmp/calls" ]] && grep -q '^restore$' "$tmp/calls" || return 4; rm "${path}.chat"; return 0; }
+action=$(pr_green_reuse_session worldarchitect.ai 123 repair)
+[[ "$action" == restored ]]
+[[ "$(cat "$tmp/calls")" == $'admission\npreflight\nrestore' ]]
+# Any unresolved ledger blocks restore before any lifecycle change.
+rm "$tmp/calls"; : > "${path}.chat"
+rc=0; pr_green_reuse_session worldarchitect.ai 123 repair || rc=$?
+[[ "$rc" == 4 && ! -e "$tmp/calls" ]]; rm "${path}.chat"
+# Unproven native ownership must never create or restore a worker.
+pr_green_chat_prepare_restore() { return 1; }
+rc=0; pr_green_reuse_session worldarchitect.ai 123 repair || rc=$?
+[[ "$rc" == 3 && "$(cat "$tmp/calls")" == admission ]]
+rm "$tmp/calls"
+# An ambiguous same-session restore does not permit a new worker or a send.
+pr_green_chat_prepare_restore() { printf '{}\n' > "${path}.chat"; }
+ao() { printf 'restore-error\n' >> "$tmp/calls"; return 1; }
+rc=0; pr_green_reuse_session worldarchitect.ai 123 repair || rc=$?
+[[ "$rc" == 2 && -e "${path}.chat" && "$(cat "$tmp/calls")" == $'admission\nrestore-error' ]]
+pr_green_session_record() { return 0; }
+rc=0; pr_green_reuse_session worldarchitect.ai 123 repair || rc=$?
+[[ "$rc" == 4 && -e "${path}.chat" ]]
+printf 'PASS: terminated Chat restores exact owner only after admission and native preflight, unresolved and ambiguous states remain reserved\n'
+
+# Exact persisted native spawn evidence permits direct owner observation even
+# when session ls temporarily omits the created session. No send/restore/spawn.
+pr_green_session_record() { return 0; }
+pr_green_chat_admission worldarchitect.ai 124 'original repair'
+receipt="$(pr_green_chat_spawn_receipt worldarchitect.ai 124 'original repair')"
+printf '%s\n' 'spawned session worldarchitect.ai-71 (idle) (claimed PR)' > "$receipt"
+pr_green_chat_delivery() {
+  [[ "$1 $2 $3 $4 $5" == 'worldarchitect.ai 124 worldarchitect.ai-71 current repair observe-initial' ]] || return 99
+  return 6
+}
+for sweep in 1 2; do
+  action="$(pr_green_reuse_session worldarchitect.ai 124 'current repair')"
+  [[ "$action" == receipt_recovered ]]
+done
+printf 'PASS: missing session listing recovers exact native spawn receipt for direct owner validation\n'
+
+# Historical initial receipt reconciliation is list-backed and read-only. A
+# confirmed receipt defers current work; it does not restore or send in this run.
+pr_green_session_record() { printf '%s\n' '{"id":"worldarchitect.ai-71","isTerminated":true}'; }
+pr_green_chat_reconcile_initial() { [[ "$1 $2 $3" == 'worldarchitect.ai 124 worldarchitect.ai-71' ]]; }
+pr_green_before_restore_admission() { printf 'unexpected restore\n' > "$tmp/unexpected"; return 99; }
+pr_green_chat_delivery() { printf 'unexpected delivery\n' > "$tmp/unexpected"; return 99; }
+action="$(pr_green_reuse_session worldarchitect.ai 124 'current repair')"
+[[ "$action" == receipt_recovered && ! -e "$tmp/unexpected" ]]
+printf 'PASS: terminated initial receipt reconciles before any restore or new delivery\n'
