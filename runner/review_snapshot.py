@@ -77,7 +77,9 @@ def _snapshot_source(locator: "target_locator.Locator") -> tuple[pathlib.Path, s
 
 
 def _default_snapshot_root() -> pathlib.Path:
-    root = pathlib.Path.home() / ".dark-factory" / "review-snapshots"
+    # Snapshots are git worktrees: keep them under the machine-wide standard
+    # worktree root so worktree sweepers (7-day recency floor) cover them.
+    root = pathlib.Path.home() / ".worktrees" / "dark-factory-review-snapshots"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
