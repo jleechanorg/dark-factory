@@ -411,3 +411,12 @@ def test_non_snapshottable_scheme_refuses_before_launch_without_degrading_to_liv
     assert "git-resolvable" in result.output
     # No live-workdir fallback: `codex_workdir` was never set to `tmp_path`
     # or `ctx.workdir` for a verdict-gated node — the visit aborted first.
+
+
+def test_default_snapshot_root_is_under_standard_worktree_root(tmp_path, monkeypatch):
+    """Review snapshots are git worktrees, so they live under the machine-wide
+    standard worktree root (~/.worktrees), not a tool-private directory."""
+    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
+    root = rs._default_snapshot_root()
+    assert root == tmp_path / ".worktrees" / "dark-factory-review-snapshots"
+    assert root.is_dir()
