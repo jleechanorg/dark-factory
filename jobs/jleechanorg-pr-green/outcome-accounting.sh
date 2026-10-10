@@ -292,12 +292,16 @@ pr_green_apply_required_contract() {
     if [[ "$head_repo" != "$base_repo" ]]; then
       head_runs="$(pr_green_check_runs_for_repo "$head_repo" "$head_sha")" || { head_runs='[]'; app_sources_available=false; }
     fi
-    all_runs="$(jq -cn --argjson base "$base_runs" --argjson head "$head_runs" '$base + $head')" || { all_runs='[]'; app_sources_available=false; }
+    all_runs="$(printf '%s\n%s\n' "$base_runs" "$head_runs" | jq -cs '.[0] + .[1]')" || { all_runs='[]'; app_sources_available=false; }
   fi
 
+  local runs_file
+  runs_file="$(mktemp)"
+  printf '%s' "$all_runs" >"$runs_file"
   required_missing="$(jq -cn --argjson required "$required_inventory" --arg head_sha "$head_sha" \
       --argjson statuses "$(jq -c '.check_statuses // {}' <<<"$state")" \
-      --argjson runs "$all_runs" --argjson app_sources_available "$app_sources_available" '
+      --slurpfile runs "$runs_file" --argjson app_sources_available "$app_sources_available" '
+      ($runs[0] // []) as $runs |
       [$required[] | . as $item | select(if ($item.app_id == null) then
         (($statuses[$item.name] // "") != "SUCCESS")
       else (($app_sources_available | not) or (([
@@ -308,7 +312,8 @@ pr_green_apply_required_contract() {
             and ((.app.id | tostring) == ($item.app_id | tostring))))
       ] | sort_by([(.started_at // ""),(.completed_at // ""),(.id // 0)] ) | last
       | ((.status // "") | ascii_downcase) == "completed"
-        and ((.conclusion // "") | ascii_downcase) == "success") | not)) end) | $item.name] | unique')" || { pr_green_contract_pending "$state" required_check_contract_unavailable "$required_inventory"; return; }
+        and ((.conclusion // "") | ascii_downcase) == "success") | not)) end) | $item.name] | unique')" || { rm -f "$runs_file"; pr_green_contract_pending "$state" required_check_contract_unavailable "$required_inventory"; return; }
+  rm -f "$runs_file"
   final_state="$(jq -c --argjson required "$required_inventory" --argjson missing "$required_missing" \
       --argjson app_sources_available "$app_sources_available" '
       . + {required_checks: [$required[] | .name] | unique,
@@ -337,7 +342,12 @@ pr_green_apply_required_contract() {
 }
 
 pr_green_fetch_live_state() {
-  local url="$1" payload
+  local url="$1" payload diagnostics="${2:-}" phase="${3:-inspection}" helper
+  if [[ -n "$diagnostics" ]]; then
+    helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+    python3 "$helper/pr-inspection.py" --inspect "$url" "$diagnostics" "$helper/outcome-accounting.sh" "$phase"
+    return
+  fi
   payload="$(gh pr view "$url" --json headRefOid,mergeable,mergeStateStatus,statusCheckRollup,baseRefName,headRepository 2>/dev/null)" || return 1
   pr_green_state_from_pr_json <<<"$payload"
 }

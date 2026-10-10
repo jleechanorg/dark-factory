@@ -1,10 +1,10 @@
 [Unit]
-Description=8-hour jleechanorg PR repair Slack report
+Description=4-hour jleechanorg PR repair Slack report
 After=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=/bin/bash %h/projects/dark-factory/jobs/jleechanorg-pr-green/report.sh slack
 EnvironmentFile=-%h/.config/systemd/user/jleechanbrain-deploy-tokens.conf
-Environment=PR_GREEN_REPORT_WINDOW_HOURS=8
+Environment=PR_GREEN_REPORT_WINDOW_HOURS=4
 TimeoutStartSec=120

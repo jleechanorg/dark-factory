@@ -464,11 +464,69 @@ pr_green_process_codex_home() {
   return 1
 }
 
+# A Chat controller has different delivery evidence; never guess that it is a
+# terminal session. Missing databases/rows fail closed, including on old AO.
+pr_green_session_mode() {
+  local helper
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/native-runtime.py"
+  python3 "$helper" --mode "${PR_GREEN_AO_DB_PATH:-$HOME/.ao/data/ao.db}" "$1" "$2"
+}
+
+# Native PTY inspection uses the public session generation and narrowly scoped
+# read-only process/database evidence. Never feed opaque PTY handles to tmux.
+pr_green_native_runtime_observation() {
+  local api_base helper db
+  api_base="$(pr_green_ao_api_base)" || return 1
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/native-runtime.py"
+  db="${PR_GREEN_AO_DB_PATH:-$HOME/.ao/data/ao.db}"
+  python3 "$helper" "$db" "$api_base" "$1" "$2"
+}
+
+# Resolve an exact existing handle across the current packaged socket and the
+# legacy default. Two matches are ambiguous; never route to either in that case.
+pr_green_daemon_tmux_socket() {
+  local helper
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/native-runtime.py"
+  python3 "$helper" --tmux-socket "${PR_GREEN_AO_RUN_FILE:-${AO_RUN_FILE:-$HOME/.ao/running.json}}"
+}
+
+pr_green_tmux_socket_for_handle() {
+  local handle="$1" named found='' matches=0
+  [[ "$handle" =~ ^[[:alnum:]_-]+$ ]] || return 1
+  named="$(pr_green_daemon_tmux_socket 2>/dev/null || true)"
+  if [[ -n "$named" ]] && { tmux -L "$named" has-session -t "=$handle" 2>/dev/null || tmux -L "$named" has-session -t "$handle" 2>/dev/null; }; then
+    found="$named"; matches=$((matches + 1))
+  fi
+  if tmux has-session -t "=$handle" 2>/dev/null || tmux has-session -t "$handle" 2>/dev/null; then
+    found=default; matches=$((matches + 1))
+  fi
+  [[ "$matches" == 1 ]] || return 1
+  printf '%s\n' "$found"
+}
+
+pr_green_tmux_at() {
+  local socket="$1"; shift
+  if [[ "$socket" == default ]]; then
+    tmux "$@"
+  elif [[ "$socket" =~ ^[[:alnum:]_-]+$ ]]; then
+    tmux -L "$socket" "$@"
+  else
+    return 1
+  fi
+}
+
 pr_green_live_codex_home() {
-  local project_id="$1" session_id="$2" runtime_handle pane_pid
+  local project_id="$1" session_id="$2" runtime_handle pane_pid socket
   runtime_handle="$(pr_green_runtime_handle "$project_id" "$session_id" || true)"
   [[ -n "$runtime_handle" ]] || return 1
-  pane_pid="$(tmux list-panes -t "$runtime_handle" -F '#{pane_pid}' 2>/dev/null | head -n 1)"
+  if [[ "$runtime_handle" == ptyhost-v1:* ]]; then
+    local observed
+    observed="$(pr_green_native_runtime_observation "$project_id" "$session_id")" || return 1
+    jq -er '.home | select(length > 0)' <<<"$observed"
+    return
+  fi
+  socket="$(pr_green_tmux_socket_for_handle "$runtime_handle")" || return 1
+  pane_pid="$(pr_green_tmux_at "$socket" list-panes -t "=$runtime_handle" -F '#{pane_pid}' 2>/dev/null | head -n 1)"
   [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 1
   local workspace="$3"
   pr_green_process_codex_home "$pane_pid" "$workspace"
@@ -685,6 +743,10 @@ pr_green_delivery_clear_pending() {
 pr_green_delivery_pending_status() {
   local project_id="$1" pr_number="$2" path pending listing count envelope legacy_envelope native_id workspace
   path="$(pr_green_delivery_pending_path "$project_id" "$pr_number")" || return 1
+  # Chat receipts reserve the PR even when AO temporarily omits its session.
+  # Only the Chat receipt observer may retire this reservation. Empty or
+  # malformed ledgers must not authorize a new worker either.
+  [[ ! -e "${path}.chat" ]] || { printf '%s\n' pending; return 0; }
   [[ -s "$path" ]] || { printf '%s\n' none; return 0; }
   pending="$(cat -- "$path" 2>/dev/null || true)"
   native_id="$(jq -r '.native_id // empty' <<<"$pending" 2>/dev/null || true)"
@@ -771,11 +833,11 @@ pr_green_delivery_recovery_normalize() {
 }
 
 pr_green_delivery_recovery_capture() {
-  local pane_target="$1" shape mode cursor_y pane_height pane footer_line
-  shape="$(tmux display-message -p -t "$pane_target" '#{pane_in_mode}:#{cursor_y}:#{pane_height}' 2>/dev/null || true)"
+  local pane_target="$1" socket="$2" shape mode cursor_y pane_height pane footer_line
+  shape="$(pr_green_tmux_at "$socket" display-message -p -t "$pane_target" '#{pane_in_mode}:#{cursor_y}:#{pane_height}' 2>/dev/null || true)"
   IFS=: read -r mode cursor_y pane_height <<<"$shape"
   [[ "$mode" == 0 && "$cursor_y" =~ ^[0-9]+$ && "$pane_height" =~ ^[0-9]+$ && "$cursor_y" -lt "$pane_height" ]] || return 1
-  pane="$(tmux capture-pane -p -t "$pane_target" -S 0 -E "$((pane_height - 1))" 2>/dev/null || true)"
+  pane="$(pr_green_tmux_at "$socket" capture-pane -p -t "$pane_target" -S 0 -E "$((pane_height - 1))" 2>/dev/null || true)"
   footer_line="$(grep -En '^[[:space:]]*(\? for shortcuts|GPT-[0-9.]+-[[:alnum:]-]+[[:space:]]+high[[:space:]]+·[[:space:]]+~\/\.ao\/data\/worktrees\/[^·]+·[[:space:]]+Repair[[:space:]]+PR[[:space:]]+#[0-9]+[[:space:]]+tests[[:space:]]+⚠[[:space:]]*[0-9]+[[:space:]]+warnings?[[:space:]]*·[[:space:]]*f2[[:space:]]+to[[:space:]]+view)' <<<"$pane" | head -n 1 | cut -d: -f1 || true)"
   [[ "$footer_line" =~ ^[0-9]+$ && "$footer_line" -gt "$((cursor_y + 1))" ]] || return 1
   printf '%s\n' "$pane"
@@ -794,8 +856,8 @@ pr_green_delivery_recovery_composer_matches() {
 }
 
 pr_green_delivery_recovery_identity() {
-  local project_id="$1" pr_number="$2" session_id="$3" native_id="$4" workspace="$5" expected_runtime="${6:-}" expected_pane_id="${7:-}"
-  local record fresh_session row row_workspace row_native row_terminated live_home intended_home runtime_handle pane_id pane_ids
+  local project_id="$1" pr_number="$2" session_id="$3" native_id="$4" workspace="$5" expected_runtime="${6:-}" expected_pane_id="${7:-}" expected_socket="${8:-}"
+  local record fresh_session row row_workspace row_native row_terminated live_home intended_home runtime_handle pane_id pane_ids socket
   local -a row_fields=()
   record="$(pr_green_session_record "$project_id" "$pr_number" 2>/dev/null || true)"
   fresh_session="$(jq -r '.id // empty' <<<"$record" 2>/dev/null || true)"
@@ -814,12 +876,19 @@ pr_green_delivery_recovery_identity() {
   pr_green_live_session_is_busy "$project_id" "$session_id" && return 2
   runtime_handle="$(pr_green_runtime_handle "$project_id" "$session_id" 2>/dev/null || true)"
   [[ -n "$runtime_handle" && ( -z "$expected_runtime" || "$runtime_handle" == "$expected_runtime" ) ]] || return 1
-  pane_ids="$(tmux list-panes -t "$runtime_handle" -F '#{pane_id}' 2>/dev/null || true)"
+  if [[ "$runtime_handle" == ptyhost-v1:* ]]; then
+    printf '%s\n' "Native PTY composer recovery unavailable; preserving pending delivery" >&2
+    return 1
+  fi
+  socket="$(pr_green_tmux_socket_for_handle "$runtime_handle")" || return 1
+  [[ -z "$expected_socket" || "$socket" == "$expected_socket" ]] || return 1
+  pane_ids="$(pr_green_tmux_at "$socket" list-panes -t "=$runtime_handle" -F '#{pane_id}' 2>/dev/null || true)"
   [[ -n "$pane_ids" && "$pane_ids" != *$'\n'* ]] || return 1
   pane_id="$pane_ids"
   [[ "$pane_id" =~ ^%[0-9]+$ && ( -z "$expected_pane_id" || "$pane_id" == "$expected_pane_id" ) ]] || return 1
   PR_GREEN_DELIVERY_RECOVERY_RUNTIME="$runtime_handle"
   PR_GREEN_DELIVERY_RECOVERY_PANE_ID="$pane_id"
+  PR_GREEN_DELIVERY_RECOVERY_SOCKET="$socket"
 }
 
 pr_green_delivery_mark_recovery_attempted() {
@@ -842,7 +911,7 @@ pr_green_delivery_mark_recovery_attempted() {
 pr_green_delivery_submit_pending_recovery() {
   local project_id="$1" pr_number="$2" path pending session_id native_id workspace envelope legacy_envelope request_id
   local listing baseline runtime_handle pane region normalized second_pane second_region second_normalized pending_guard refreshed_pending
-  local state_dir evidence_path tmp claim_path marker_count current_ack pane_id refreshed_listing envelope_digest
+  local state_dir evidence_path tmp claim_path marker_count current_ack pane_id refreshed_listing envelope_digest socket
   path="$(pr_green_delivery_pending_path "$project_id" "$pr_number" 2>/dev/null || true)"
   [[ -s "$path" ]] || return 1
   pending="$(cat -- "$path" 2>/dev/null || true)"
@@ -869,12 +938,13 @@ pr_green_delivery_submit_pending_recovery() {
   fi
   runtime_handle="$PR_GREEN_DELIVERY_RECOVERY_RUNTIME"
   pane_id="$PR_GREEN_DELIVERY_RECOVERY_PANE_ID"
+  socket="$PR_GREEN_DELIVERY_RECOVERY_SOCKET"
   listing="$(pr_green_find_native_rollouts "$workspace" '' "$native_id" 2>/dev/null || true)"
   [[ -n "$listing" ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
   baseline="$(pr_green_delivery_ack_count "$listing" "$envelope" "$legacy_envelope" 2>/dev/null || true)"
   [[ "$baseline" =~ ^[0-9]+$ && "$baseline" == 0 ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
 
-  pane="$(pr_green_delivery_recovery_capture "$pane_id" 2>/dev/null || true)"
+  pane="$(pr_green_delivery_recovery_capture "$pane_id" "$socket" 2>/dev/null || true)"
   [[ -n "$pane" ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
   marker_count="$(grep -Ec '^[[:space:]]*›[[:space:]]' <<<"$pane" || true)"
   [[ "$marker_count" == 1 ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
@@ -893,12 +963,12 @@ pr_green_delivery_submit_pending_recovery() {
   pending="$(cat -- "$path" 2>/dev/null || true)"
   [[ "$(jq -c . <<<"$pending" 2>/dev/null || true)" == "$pending_guard" ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
   jq -e '(.submit_recovery_attempted_at // null) | numbers' <<<"$pending" >/dev/null 2>&1 && { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
-  if ! pr_green_delivery_recovery_identity "$project_id" "$pr_number" "$session_id" "$native_id" "$workspace" "$runtime_handle" "$pane_id"; then
+  if ! pr_green_delivery_recovery_identity "$project_id" "$pr_number" "$session_id" "$native_id" "$workspace" "$runtime_handle" "$pane_id" "$socket"; then
     rmdir -- "$claim_path" 2>/dev/null || true
     return 1
   fi
   [[ "$PR_GREEN_DELIVERY_RECOVERY_PANE_ID" == "$pane_id" ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
-  second_pane="$(pr_green_delivery_recovery_capture "$pane_id" 2>/dev/null || true)"
+  second_pane="$(pr_green_delivery_recovery_capture "$pane_id" "$socket" 2>/dev/null || true)"
   [[ -n "$second_pane" ]] || { rmdir -- "$claim_path" 2>/dev/null || true; return 1; }
   marker_count="$(grep -Ec '^[[:space:]]*›[[:space:]]' <<<"$second_pane" || true)"
   if [[ "$marker_count" != 1 ]]; then
@@ -930,7 +1000,8 @@ pr_green_delivery_submit_pending_recovery() {
     rmdir -- "$claim_path" 2>/dev/null || true
     return 1
   fi
-  tmux send-keys -t "$pane_id" Enter || return 1
+  [[ "$(pr_green_tmux_socket_for_handle "$runtime_handle")" == "$socket" ]] || return 1
+  pr_green_tmux_at "$socket" send-keys -t "$pane_id" Enter || return 1
   if pr_green_wait_for_delivery_ack "$refreshed_listing" "$envelope" "$legacy_envelope" "$baseline"; then
     if pr_green_delivery_clear_pending "$project_id" "$pr_number"; then
       rmdir -- "$claim_path" 2>/dev/null || true
@@ -1025,18 +1096,98 @@ pr_green_runtime_handle() {
 pr_green_live_session_is_busy() {
   local project_id="$1"
   local session_id="$2"
-  local runtime_handle pane
+  local runtime_handle pane socket
 
   runtime_handle="$(pr_green_runtime_handle "$project_id" "$session_id" || true)"
   [[ -n "$runtime_handle" ]] || return 1
-  tmux has-session -t "$runtime_handle" 2>/dev/null || return 1
-  pane="$(tmux capture-pane -p -t "$runtime_handle" -S -80 2>/dev/null || true)"
+  if [[ "$runtime_handle" == ptyhost-v1:* ]]; then
+    local observed row workspace native_id listing line home relative latest live_home boundary=''
+    observed="$(pr_green_native_runtime_observation "$project_id" "$session_id" 2>/dev/null)" || return 0
+    [[ "$(jq -r '.activity' <<<"$observed")" == idle ]] || return 0
+    live_home="$(jq -er '.home | select(length > 0)' <<<"$observed")" || return 0
+    native_id="$(jq -r '.nativeId' <<<"$observed")"
+    [[ -n "$native_id" ]] || return 0
+    row="$(pr_green_session_recovery_row "$project_id" "$session_id")" || return 0
+    workspace="${row%%|*}"
+    listing="$(pr_green_find_native_rollouts "$workspace" '' "$native_id" 2>/dev/null)" || return 0
+    [[ "${listing%%$'\n'*}" == "$native_id" ]] || return 0
+    while IFS= read -r line; do
+      [[ "$line" == *$'\t'* ]] || continue
+      home="${line#*$'\t'}"
+      relative="${home#*$'\t'}"; home="${home%%$'\t'*}"
+      # Copies in another profile are historical, not the current controller.
+      [[ "$home" == "$live_home" ]] || continue
+      latest="$(jq -r 'select(.type == "event_msg") | .payload.type | select(. == "task_started" or . == "task_complete" or . == "task_completed" or . == "turn_aborted")' "$home/$relative" 2>/dev/null | tail -n 1)" || return 0
+      [[ -n "$latest" ]] || return 0
+      [[ "$latest" != task_started ]] || return 0
+      boundary="$latest"
+    done <<<"$listing"
+    [[ -n "$boundary" ]] || return 0
+    return 1
+  fi
+  socket="$(pr_green_tmux_socket_for_handle "$runtime_handle")" || return 1
+  pane="$(pr_green_tmux_at "$socket" capture-pane -p -t "=$runtime_handle" -S -80 2>/dev/null || true)"
   grep -Eq 'Working \(|Waiting for agents|Waiting for background terminal' <<<"$pane"
+}
+
+pr_green_chat_admission() {
+  local project="$1" number="$2" prompt="$3" session="${4:-}" helper path
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"
+  path="$(pr_green_delivery_pending_path "$project" "$number")" || return 4
+  [[ ! -s "$path" ]] || return 4
+  local -a args=(--admission "${path}.chat")
+  [[ -z "$session" ]] || args+=("$session")
+  printf '%s' "$prompt" | python3 "$helper" "${args[@]}"
+}
+
+pr_green_chat_spawn_receipt() {
+  local project="$1" number="$2" prompt="$3" helper path
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"
+  path="$(pr_green_delivery_pending_path "$project" "$number")" || return 4
+  printf '%s' "$prompt" | python3 "$helper" --spawn-receipt-path "${path}.chat"
+}
+
+pr_green_chat_reserved_session() {
+  local helper path
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"
+  path="$(pr_green_delivery_pending_path "$1" "$2")" || return 4
+  [[ ! -e "$path" && -e "${path}.chat" ]] || return 4
+  python3 "$helper" --reserved-session "${path}.chat"
+}
+
+pr_green_chat_reconcile_initial() {
+  local project="$1" number="$2" session="$3" helper api home path
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"
+  home="${CODEX_HOME:-${PR_GREEN_CODEX_HOME:-$HOME/.codex-dark-factory}}"
+  path="$(pr_green_delivery_pending_path "$project" "$number")" || return 4
+  [[ ! -e "$path" && -e "${path}.chat" ]] || return 4
+  api="$(pr_green_ao_api_base)" || return 4
+  python3 "$helper" --reconcile-initial "$api" "${PR_GREEN_AO_DB_PATH:-$HOME/.ao/data/ao.db}" "$project" "$session" "$home" "${path}.chat"
+}
+
+pr_green_chat_prepare_restore() {
+  local project="$1" number="$2" session="$3" prompt="$4" helper api home path
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"
+  home="${CODEX_HOME:-${PR_GREEN_CODEX_HOME:-$HOME/.codex-dark-factory}}"
+  api="$(pr_green_ao_api_base)" || return 1
+  path="$(pr_green_delivery_pending_path "$project" "$number")" || return 1
+  printf '%s' "$prompt" | python3 "$helper" --prepare-restore "$api" "${PR_GREEN_AO_DB_PATH:-$HOME/.ao/data/ao.db}" "$project" "$session" "$home" "${path}.chat"
+}
+
+pr_green_chat_delivery() {
+  local project="$1" number="$2" session="$3" prompt="$4" initial="${5:-reuse}" helper api path
+  helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/chat-delivery.py"
+  api="$(pr_green_ao_api_base)" || return 4
+  path="$(pr_green_delivery_pending_path "$project" "$number")" || return 4
+  # A pending terminal delivery is never silently converted to Chat delivery.
+  [[ ! -s "$path" ]] || return 4
+  printf '%s' "$prompt" | python3 "$helper" "$api" "${PR_GREEN_AO_DB_PATH:-$HOME/.ao/data/ao.db}" \
+    "$project" "$session" "${CODEX_HOME:-${PR_GREEN_CODEX_HOME:-$HOME/.codex-dark-factory}}" "${path}.chat" "$initial"
 }
 
 # Reuse a live session, or restore a terminated one and then send it the
 # current prompt. Return codes:
-#   0 — live/restore prompt sent, or a visibly busy live session was deferred
+#   0 — action printed: reused/restored, busy_deferred, or receipt_recovered
 #   1 — no matching session; caller may spawn
 #   2 — existing session accepted recovery/restore but did not accept the
 #       prompt (including an ambiguous restore failure); caller must not spawn
@@ -1058,6 +1209,19 @@ pr_green_reuse_session() {
 
   record="$(pr_green_session_record "$project_id" "$pr_number" 2>/dev/null || true)"
   if [[ -z "$record" ]]; then
+    # The exact original native receipt can survive a missing session-list row.
+    # Initial delivery only observes that ID through direct API/DB/process proof;
+    # it never restores, spawns, or replays a provider message. Keep its ledger
+    # while listing is absent so another sweep cannot admit a duplicate.
+    local reserved_session reserved_rc=0
+    if reserved_session="$(pr_green_chat_reserved_session "$project_id" "$pr_number" 2>/dev/null)"; then
+      pr_green_chat_delivery "$project_id" "$pr_number" "$reserved_session" "$prompt" observe-initial || reserved_rc=$?
+      case "$reserved_rc" in
+        0|6) printf '%s\n' receipt_recovered; return 0 ;;
+        5) printf '%s\n' busy_deferred; return 0 ;;
+        *) return 4 ;;
+      esac
+    fi
     pending_status="$(pr_green_delivery_pending_status "$project_id" "$pr_number" 2>/dev/null || true)"
     case "$pending_status" in
       acked) pr_green_delivery_clear_pending "$project_id" "$pr_number" || return 4 ;;
@@ -1072,8 +1236,49 @@ pr_green_reuse_session() {
   session_id="$(jq -r '.id // empty' <<<"$record")"
   [[ -n "$session_id" ]] || return 1
   terminated="$(jq -r 'if (.isTerminated // false) then "true" else "false" end' <<<"$record")"
+  status="$(jq -r '.status // empty' <<<"$record")"
+  activity="$(jq -r '.activity // empty' <<<"$record")"
+  local mode
+  mode="$(pr_green_session_mode "$project_id" "$session_id" 2>/dev/null || true)"
+  mode="${mode:-tui}"
+  if [[ "$mode" == chat ]]; then
+    local chat_rc=0 chat_action=reused chat_pending
+    # A list-backed exact owner may have completed its initial provider turn
+    # before termination/rotation. Retire only that proven historical receipt;
+    # defer the current prompt and any restore until the next sweep.
+    if pr_green_chat_reconcile_initial "$project_id" "$pr_number" "$session_id"; then
+      printf '%s\n' receipt_recovered
+      return 0
+    fi
+    if [[ "$terminated" == true || "$status" == exited || "$activity" == exited ]]; then
+      chat_pending="$(pr_green_delivery_pending_path "$project_id" "$pr_number")" || return 4
+      [[ ! -e "$chat_pending" && ! -e "${chat_pending}.chat" ]] || return 4
+      if declare -F pr_green_before_restore_admission >/dev/null 2>&1; then
+        pr_green_before_restore_admission "$project_id" "$pr_number" "$session_id" || return 2
+      fi
+      pr_green_chat_prepare_restore "$project_id" "$pr_number" "$session_id" "$prompt" || return 3
+      # Restore the same native Chat session, never fallback to a new worker.
+      # AO serializes this operation and resumes the exact provider conversation.
+      if ! restore_output="$(ao session restore "$session_id" -p "$project_id" 2>&1)"; then
+        printf '%s\n' "AO Chat restore uncertain for $session_id; preserving existing owner" >&2
+        return 2
+      fi
+      chat_action=restored
+    fi
+    pr_green_chat_delivery "$project_id" "$pr_number" "$session_id" "$prompt" || chat_rc=$?
+    case "$chat_rc" in
+      0) printf '%s\n' "$chat_action"; return 0 ;;
+      6) printf '%s\n' receipt_recovered; return 0 ;;
+      5) printf '%s\n' busy_deferred; return 0 ;;
+      *) return 4 ;;
+    esac
+  fi
+  if [[ "$mode" != tui ]]; then
+    printf '%s\n' "AO session $session_id is Chat or its mode is unverified; suppressing terminal delivery and duplicate spawn" >&2
+    return 3
+  fi
 
-  if [[ "$terminated" == "true" ]]; then
+  if [[ "$terminated" == "true" || "$status" == "exited" || "$activity" == "exited" ]]; then
     if declare -F pr_green_before_restore_admission >/dev/null 2>&1; then
       pr_green_before_restore_admission "$project_id" "$pr_number" "$session_id" || {
         printf '%s\n' "AO terminated session $session_id is not admitted for restore; suppressing duplicate spawn" >&2

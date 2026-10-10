@@ -337,4 +337,16 @@ pr_green_test_view_count=0
 wa_state="$(pr_green_apply_required_contract worldarchitect.ai "${contract_state/head_repo_name\/jleechanorg\/example-repo/head_repo_name\":\"jleechanorg\/worldarchitect.ai}" https://github.com/jleechanorg/worldarchitect.ai/pull/1)"
 assert_eq "$(jq -r '.required_checks | sort | join(",")' <<<"$wa_state")" 'Green Gate,Tests Required Gate'
 
+# Regression: large check_runs payload (>128KB) must not trigger E2BIG (Argument list too long).
+pr_green_test_classic='{"required_status_checks":{"contexts":[],"checks":[{"context":"app-check","app_id":42}]}}'
+pr_green_test_rules='[]'
+pr_green_test_check_runs="$(python3 -c '
+import json
+large = [{"name": "app-check", "head_sha": "after", "status": "completed", "conclusion": "success", "app": {"id": 42}, "details_url": "https://example.com/" + "a"*500} for _ in range(300)]
+print(json.dumps([{"check_runs": large}]))
+')"
+large_runs_state="$(pr_green_apply_required_contract example-repo "$empty_status_state" https://github.com/jleechanorg/example-repo/pull/1)"
+assert_eq "$(jq -r '.verification_pending // false' <<<"$large_runs_state")" false
+assert_eq "$(jq -r '.required_checks_missing | length' <<<"$large_runs_state")" 0
+
 printf 'outcome accounting tests passed\n'
