@@ -2,8 +2,15 @@
 set -euo pipefail
 
 job_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+[[ -f "$job_dir/native-runtime.py" && -f "$job_dir/pr-inspection.py" ]] || {
+  printf 'clean checkout is missing required job runtime helpers\n' >&2
+  exit 1
+}
 # shellcheck source=session-reuse.sh
 source "$job_dir/session-reuse.sh"
+
+# Earlier legacy TUI fixtures use an explicit recognized native mode.
+pr_green_session_mode() { printf '%s\n' tui; }
 
 fixture='{"data":[{"id":"wa-live","displayName":"pr-123","isTerminated":false,"status":"pr_open","updatedAt":"2026-09-23T00:00:00Z"}]}'
 session_get_fixture=''
@@ -76,6 +83,8 @@ elif [[ "$*" == *"'wa-dead'"* ]]; then
   cat "$PR_GREEN_RECOVERY_STATE"
 elif [[ "$*" == *"'wa-dead-missing'"* ]]; then
   printf '%s\n' "$PR_GREEN_RECOVERY_WORKSPACE/missing||1"
+elif [[ "$*" == *"'wa-stale-chat'"* ]]; then
+  printf '%s\n' "${PR_GREEN_STALE_CHAT_DB_ROW:?}"
 fi
 EOF
 chmod +x "$recovery_bin/sqlite3"
@@ -701,5 +710,88 @@ fallback_result="$(pr_green_find_native_rollouts "$recovery_workspace" '2026-09-
   printf 'registry-unavailable fallback did not recover the legacy rollout\n' >&2
   exit 1
 }
+
+# A terminated Chat owner restores the same provider conversation after the
+# helper has confirmed its restore contract. The shell layer only coordinates
+# the same-session restore; it does not reimplement that contract.
+fixture='{"data":[{"id":"wa-stale-chat","displayName":"pr-458","isTerminated":true,"status":"exited","activity":"exited","updatedAt":"2026-09-23T00:04:00Z"}]}'
+export PR_GREEN_DELIVERY_STATE_DIR="$recovery_dir/stale-chat-delivery"
+mkdir -p "$PR_GREEN_DELIVERY_STATE_DIR"
+export PR_GREEN_STALE_CHAT_DB_ROW="$recovery_workspace|wa-stale-chat|1|2026-09-23T00:03:00Z"
+pr_green_session_mode() { printf '%s\n' chat; }
+pr_green_chat_reconcile_initial() { return 1; }
+# This stub models a successful real-helper contract for both exact paths.
+pr_green_chat_prepare_restore() {
+  [[ "${PR_GREEN_STALE_CHAT_HELPER_RESULT:-success}" == success ]]
+}
+pr_green_chat_delivery() { return 0; }
+stale_pending_path="$(pr_green_delivery_pending_path worldarchitect.ai 458)"
+rm -f -- "$stale_pending_path" "${stale_pending_path}.chat"
+
+# Missing native identity metadata cannot safely default a Chat session to TUI.
+pr_green_session_mode() { return 1; }
+set +e
+pr_green_reuse_session worldarchitect.ai 458 'unknown mode must not dispatch' >/dev/null 2>&1
+mode_rc=$?
+set -e
+[[ "$mode_rc" -ne 0 ]] && ! grep -Eq '^(spawn |send |session restore )' "$ao_calls_file" || {
+  printf 'unknown native session mode reached a dispatch path\n' >&2
+  exit 1
+}
+pr_green_session_mode() { printf '%s\n' chat; }
+
+# An intact workspace must retain the provider conversation.
+set +e
+restored_action="$(pr_green_reuse_session worldarchitect.ai 458 'restore existing Chat')"
+rc=$?
+set -e
+[[ "$rc" -eq 0 && "$restored_action" == restored ]] || {
+  printf 'intact Chat workspace did not take same-session restore (rc=%s action=%s)\n' "$rc" "$restored_action" >&2
+  exit 1
+}
+grep -q '^session restore wa-stale-chat -p worldarchitect.ai$' "$ao_calls_file" || {
+  printf 'intact terminated Chat workspace skipped restore\n' >&2
+  exit 1
+}
+: >"$ao_calls_file"
+
+# A missing exact workspace is also handled by the helper, then restored into
+# the same AO session rather than replaced with a new worker.
+export PR_GREEN_STALE_CHAT_DB_ROW="$recovery_workspace/missing||1|2026-09-23T00:03:00Z"
+set +e
+stale_restore_action="$(pr_green_reuse_session worldarchitect.ai 458 'restore missing Chat workspace')"
+rc=$?
+set -e
+[[ "$rc" -eq 0 && "$stale_restore_action" == restored ]] || {
+  printf 'terminated Chat owner with a helper-approved missing workspace did not restore same session (rc=%s action=%s)\n' "$rc" "$stale_restore_action" >&2
+  exit 1
+}
+grep -q '^session restore wa-stale-chat -p worldarchitect.ai$' "$ao_calls_file" || {
+  printf 'missing-worktree Chat session did not attempt same-session restore\n' >&2
+  exit 1
+}
+: >"$ao_calls_file"
+
+# A pending delivery ledger suppresses a new restore attempt.
+printf '%s\n' '{"project_id":"worldarchitect.ai","pr_number":458}' >"$stale_pending_path"
+set +e
+pr_green_reuse_session worldarchitect.ai 458 'ledger must suppress restore' >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -ne 1 ]] || {
+  printf 'pending JSON delivery ledger was bypassed\n' >&2
+  exit 1
+}
+rm -f -- "$stale_pending_path"
+printf '%s\n' '{"session_id":"wa-stale-chat"}' >"${stale_pending_path}.chat"
+set +e
+pr_green_reuse_session worldarchitect.ai 458 'chat ledger must suppress restore' >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -ne 1 ]] || {
+  printf 'pending JSON.chat delivery ledger was bypassed\n' >&2
+  exit 1
+}
+rm -f -- "${stale_pending_path}.chat"
 
 printf 'session reuse tests passed\n'
