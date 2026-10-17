@@ -1,0 +1,77 @@
+{
+  "schema_version": "br.doctor.schema_migration.recovery.v1",
+  "database_path": "/Users/jleechan/projects/worktree_factory_repair_contract/.beads/beads.db",
+  "backup_path": "/Users/jleechan/projects/worktree_factory_repair_contract/.beads/.br_recovery/schema-migrations/20261004T183343.352961Z-69159-0/recovery-before",
+  "backup_scope": "complete-family",
+  "stage": "private-recovery",
+  "raw_before": {
+    "components": [
+      {
+        "suffix": "",
+        "present": true,
+        "length": 4591616,
+        "sha256": "f375c72e1fdbef49dc708a281b1d4cd44151f28f621577ed7531fe9a4cf95b0c",
+        "unix_mode": 33152
+      },
+      {
+        "suffix": "-wal",
+        "present": true,
+        "length": 32,
+        "sha256": "cec2f50de38cbe465b3cbf0ee04038eae454c1e2cf9b0c59217c7858b8f14194",
+        "unix_mode": 33188
+      },
+      {
+        "suffix": "-shm",
+        "present": false,
+        "length": null,
+        "sha256": null,
+        "unix_mode": null
+      },
+      {
+        "suffix": "-journal",
+        "present": false,
+        "length": null,
+        "sha256": null,
+        "unix_mode": null
+      },
+      {
+        "suffix": "-wal-cert",
+        "present": false,
+        "length": null,
+        "sha256": null,
+        "unix_mode": null
+      },
+      {
+        "suffix": "-wal-cert-head",
+        "present": false,
+        "length": null,
+        "sha256": null,
+        "unix_mode": null
+      },
+      {
+        "suffix": "-fsqlite-ns-gate",
+        "present": true,
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "unix_mode": 33152
+      },
+      {
+        "suffix": "-fsqlite-ns-use",
+        "present": true,
+        "length": 40,
+        "sha256": "7c6e3440122f03ebce71522e52ecf821e181422b61bbed72ea99c785f39012d3",
+        "unix_mode": 33152
+      },
+      {
+        "suffix": ".fsqlite-migration-state",
+        "present": true,
+        "length": 85,
+        "sha256": "99038807d90187552a9a4422e804f7a53fa79e68ce87ecca27300a6628cc4bf8",
+        "unix_mode": 33188
+      }
+    ]
+  },
+  "raw_after": null,
+  "logical_after": null,
+  "error": null
+}
