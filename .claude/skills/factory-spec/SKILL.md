@@ -1,9 +1,9 @@
 ---
 name: factory-spec
-description: "Dark Factory two-phase spec workflow (/factory-spec, /fs): create a main spec (spec.md) AND an attractor spec (attractor_spec.md) via the spec_gen pipeline, review an existing spec of either kind, or display the pipeline node graphs — spec-review pipelines, factory gates, node types, edge conditions, handler mappings. Create mode runs dark-factory --pipeline slim/spec_gen.dot; both the main and attractor specs must be codex-cold-reviewed and pass before exit. Review and show modes are in-session only."
+description: "Display the Dark Factory pipeline node graphs — spec-review pipelines, factory gates, node types, edge conditions, and handler mappings. Use /factory-spec or /fs to quickly reference the spec graph structure without running a pipeline."
 ---
 
-# /factory-spec — Dark Factory Spec Workflow & Node Graph Reference
+# /factory_spec — Dark Factory Spec Node Graph Reference
 
 ## Install vs source
 
@@ -16,164 +16,33 @@ export DARK_FACTORY_HOME=~/projects/dark-factory
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-- **`/fs` / `/factory-spec`** — spec creation (via pipeline), review, or graph reference.
-- **`/f` / `/factory`** — run feature/implementation pipelines via `dark-factory`.
+- **`/fs` / `/factory-spec`** — graph reference + Step 0 classification + pipeline pick.
+- **`/f` / `/factory`** — run pipelines via `dark-factory` (see `dark-factory` skill).
 
 Pipelines and prompts resolve from `$DARK_FACTORY_HOME`; implementation work
 happens in the caller's cwd (`--workdir` defaults to cwd).
 
-This block is the **canonical install/setup copy** — the command files
-(`factory-spec.md`, `fs.md`) point here; do not maintain divergent copies.
-
-## Modes — what `/fs` / `/factory-spec` execute
-
-### Create mode (default: `/fs <spec description>`)
-
-**Two-phase spec generation.** By default, `/fs` produces BOTH a **main
-spec** (`spec.md`) AND an **attractor spec** (`attractor_spec.md`). The
-main spec describes the implementation path (acceptance criteria, test
-command, non-goals, lane-independence matrix). The attractor spec
-describes the convergence goal (stable end state the system must reach,
-plus the anti-attractor states it must NOT converge to). A cold
-adversarial codex reviewer signs off on **both** before exit. Pass
-`--skip-attractor` to produce only the main spec.
-
-1. Run **Step 0** (below): classify greenfield vs brownfield. Mandatory.
-   The classification output feeds the goal/context string passed to the pipeline.
-2. For brownfield tasks, encode rules 1–6 (delete-first, executor node for
-   deletion, net-LOC ≤ 0 guard, dead-code gate, same-call-site replace,
-   post-deletion proof) directly in the goal string.
-3. Report the proposed `--goal` string (classification + description) and ask
-   the user to confirm or modify **before** running.
-4. Run the spec-generation pipeline from the target project's cwd:
-
-   ```bash
-   export DARK_FACTORY_HOME=~/projects/dark-factory
-   export PATH="$HOME/.local/bin:$PATH"
-   dark-factory --pipeline slim/spec_gen.dot --goal "<Step-0 context + description>"
-   ```
-
-   The pipeline runs:
-
-   ```
-   start → explore_in → explore_fanout → {explore_concept, explore_auth,
-          explore_reuse, explore_risks} → explore_join → explore_stitch →
-          explore_out
-        → plan_main        [plan.md → spec.md]
-        → review_main      [codex cold review of spec.md]              ─┐
-        → plan_attractor   [plan_attractor.md → attractor_spec.md]     │ if main review fails → fix_main → review_main
-        → review_attractor [codex cold review of attractor_spec.md]    ─┐
-        → exit                                                            │ if attractor review fails → fix_attractor → review_attractor
-   ```
-
-   The attractor spec is generated **after** the main spec passes review
-   (sequential, not parallel), so the attractor spec can reference the
-   codex-signed-off `spec.md` for the consistency check. Both phases
-   must sign off before exit. The pipeline produces a reviewed `spec.md`
-   AND a reviewed `attractor_spec.md` without running any implement
-   node. Pass `--skip-attractor` to short-circuit the attractor phase.
-
-### Review mode (`/fs --review [spec_path]`)
-
-1. `spec_path` defaults to `spec/feature.md` relative to the caller's cwd.
-2. Read the spec and check, line-by-line: testable acceptance criteria;
-   greenfield/brownfield classification stated; brownfield rules 1–6 present
-   when applicable; pipeline named; goal stated as an observable output
-   (a PR, a passing named test, a deleted path — not "improve X").
-3. Report findings with line references and a verdict: `ready` or
-   `needs-changes` with the specific gaps. Do **not** run a pipeline.
-
-### Show mode (`/fs --show`)
-
-Display the pipeline graphs below. Read-only; no classification, no spec
-writes, no run.
-
-## Proof block (create mode, binary-backed)
-
-The default graph must preserve these nodes or their generated equivalents:
-main spec plan, independent cold review, bounded main-spec fix loop,
-attractor-spec plan, independent cold review, bounded attractor fix loop,
-and exit. An in-Claude prose-only workflow that claims a spec run without a
-logged binary invocation is not a valid run.
-
-End every `/fs` create-mode response with this proof block. Missing any
-required line means the run is unproven:
-
-```bash
-# Literal command run:
-cd /Users/jleechan/projects/<target-repo>
-DARK_FACTORY_HOME=~/projects/dark-factory \
-DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts \
-PATH="$HOME/.local/bin:$PATH" \
-dark-factory \
-  --pipeline pipelines/slim/spec_gen.dot \
-  --goal "<echo of $ARGUMENTS>" \
-  --backend <backend> \
-  --feature <feature> \
-  --cxdb ~/.dark-factory/cxdb.sqlite
-# Run ID: <id>
-# CXDB SHA: <sha>
-# Final outcome: <success|failure|exhausted|error>
-# Exit code: <integer>
-# Wall-clock: <duration>
-# Logs: <path>
-# Evidence envelope: <path>
-```
-
-Honesty rules:
-- Quote the **actual** `dark-factory` command run — no paraphrasing.
-- If the binary run fails, surface the trace and stop; don't assume "we can
-  fix the spec later" without feeding the full review output into the next
-  fix loop.
-- If `--backend echo` was used, label the run as a wiring smoke — echo-mode
-  review verdicts are not real LLM verdicts.
-- Do not claim an in-Claude workflow or `Skill()` result is a factory run.
-  The only valid proof is an actual `dark-factory` binary invocation plus
-  this proof block.
-- Reference/review/show modes (`--review`, `--review-attractor`, `--show`)
-  are in-session helpers, not binary runs — they do not emit this proof
-  block and must not be reported as a factory run.
-
-**Why binary-first is the default**: the user's 2026-06-27 clarification
-requires default binary invocation. Claude/workflow logic may build a
-dynamic DOT graph behind the binary, but the durable proof remains the DOT
-graph, CXDB, logs, and evidence envelope — same reasoning as `/f`.
-
 ## Pipeline selection (mandatory before `/f` or `/factory`)
 
-When `--pipeline` is omitted, `/f` and `/factory` default to `two_node` (`pipelines/slim/two_node.dot`). To opt into a non-default pipeline, pass explicit `--pipeline <name>`.
+Full decision table:
+`~/projects/dark-factory/docs/pipeline-selection.md`
+
+**Do not default every run to one `.dot`.** If the user did not pass `--pipeline`,
+classify the goal (Step 0 below) and pick from this quick guide:
 
 | Task | Pipeline |
 |------|----------|
-| **Default `/f` / `/factory` invocation** | `pipelines/slim/two_node.dot` (generic worker + controller cold reviewer) |
-| **Create a reviewed spec (main + attractor)** | `pipelines/slim/spec_gen.dot` ← `/fs` create mode (default) |
-| **Create only the main spec** | `pipelines/slim/spec_gen.dot` ← `/fs --skip-attractor` |
 | Smoke / wiring | `pipelines/factory/hello.dot` |
 | New feature (full loop) | `pipelines/slim/minimal_feature.dot` |
-| PR iteration (research + holdout) | `pipelines/slim/minimal_pr.dot` |
+| PR iteration (no holdout) | `pipelines/slim/minimal_pr.dot` |
 | Validate diff + holdout | `pipelines/factory/gates.dot` |
 | PR gates only | `pipelines/factory/pr_gates.dot` |
-| Spec review slim (legacy attractor) | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
-| Spec review full (legacy attractor) | `benchmarks/attractor-spec-review/pipelines/review_full.dot` |
+| Spec review slim | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
+| Spec review full | `benchmarks/attractor-spec-review/pipelines/review_full.dot` |
 | Brownfield replace/delete | custom goal + delete-first rules; often `minimal_feature.dot` or custom `.dot` |
 
-Short names for `--pipeline`: `two_node`, `spec_gen`, `gates`, `hello`, `pr_gates`,
-`minimal_pr`, `minimal_feature`, `review_slim`, `review_full`.
-
-**Repo-specific pipelines (target-repo subdir convention):** graphs that
-hardcode the target repo's own slash commands or repo-specific review
-lanes belong at `<target_repo>/dark-factory/pipelines/<name>.dot`, not
-in `~/projects/dark-factory/pipelines/`. The runner resolves bare
-filenames against `<workdir>/dark-factory/pipelines/` **before** falling
-through to `$DARK_FACTORY_HOME/pipelines/`, so an operator in the target
-repo can pass `--pipeline my_repo_lane.dot` and the runner finds it
-locally.
-
-**When `--pipeline` is omitted (auto-select path),** `/f` and `/factory`
-list the contents of `<workdir>/dark-factory/pipelines/` **before**
-falling back to the built-in decision table, so repo-specific graphs
-surface in the auto-select output. The convention is therefore
-discoverable, not just documentable.
+Short names for `--pipeline`: `gates`, `hello`, `pr_gates`, `minimal_pr`,
+`minimal_feature`, `review_slim`, `review_full`.
 
 Execution command (from target repo cwd):
 
@@ -311,12 +180,12 @@ start ──▶ holdout_eval ──(success)──▶ gate_es ──(success)─
 
 **Use when:** already-implemented diff needs Attractor-style 4-gate validation (requires holdout).
 
-### 3.5 `pr_gates.dot` — 3-Gate PR Validation (No Holdout)
+### 3.5 `pr_gates.dot` — PR Validation with Holdout
 
 ```
-start ──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ gate_cs ──▶ exit
-             │                      │
-             └──(fail)──▶ exit      └──(fail)──▶ exit
+start ──▶ holdout ──(success)──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ gate_cs ──▶ exit
+              │
+              └──(fail)──▶ fix ──▶ holdout
 ```
 
 | Node | Type | Handler | What it does |
@@ -325,7 +194,7 @@ start ──▶ gate_es ──(success)──▶ gate_er ──(success)──�
 | `gate_er` | `gate_er` | `claude --print /er` | Evidence review check |
 | `gate_cs` | `gate_code_standards` | `claude --print /code_standards` | ZFC + leveling + root-cause-first |
 
-**Use when:** validating an in-flight PR diff (like gates.dot; the actual `.dot` runs holdout as the first node per the Holdout-always policy, so pass `--feature <name>`).
+**Use when:** validating an in-flight PR diff with sealed behavioral holdouts.
 
 ### 4. `hello.dot` — Plan/Implement/Fix Loop
 
@@ -351,17 +220,19 @@ fix ──▶ test (loop)
 
 **Use when:** full production pipeline from scratch: test → review → holdout → evidence gates.
 
-### 6. `minimal_pr.dot` — Slim PR Iteration Factory (No Holdout)
+### 6. `minimal_pr.dot` — Slim PR Iteration Factory with Holdout
 
 ```
-start ──▶ explore ──▶ research ──▶ plan ──▶ implement ──▶ test ──(success)──▶ review ──(success)──▶ holdout ──(success)──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ exit
-                                                            │                  │                       │                      │                      │
-                                                            └──(fail)──▶ fix ◀─┴───────────────────────┴──────────────────────┴──────────────────────┘
+start ──▶ plan ──▶ implement ──▶ test ──(success)──▶ review ──(success)──▶ holdout ──(success)──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ exit
+                                    │                  │                  │                  │
+                                    └──(fail)──▶ fix ◀─┘                  │                  │
+                                                          └──(fail)──▶ fix ┘                  │
+                                                                               └──(fail)──▶ fix ┘
 
 fix ──▶ test (loop)
 ```
 
-**Use when:** in-flight PR iteration loop with parameterized test commands (`--state slim.test_command="..."`) and evidence checks. Holdout-always policy: this lane runs the sealed behavioral holdouts (requires `$DARK_FACTORY_HOLDOUTS`), and a classless `research` node (coder tier) digests explore findings before plan.
+**Use when:** in-flight PR iteration loop with parameterized test commands and sealed behavioral holdouts.
 
 ## Handler type registry
 
