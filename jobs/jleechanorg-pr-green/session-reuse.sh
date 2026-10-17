@@ -62,7 +62,7 @@ pr_green_session_recovery_row() {
   db="${PR_GREEN_AO_DB_PATH:-$HOME/.ao/data/ao.db}"
   [[ -r "$db" ]] || return 1
   sqlite3 -noheader "$db" \
-    "SELECT workspace_path || '|' || agent_session_id || '|' || is_terminated || '|' || created_at FROM sessions WHERE id = '${session_id//\'/\'\'}' AND project_id = '${project_id//\'/\'\'}' LIMIT 1;" \
+    "SELECT COALESCE(workspace_path, '') || '|' || COALESCE(agent_session_id, '') || '|' || COALESCE(is_terminated, 0) || '|' || COALESCE(created_at, '') FROM sessions WHERE id = '${session_id//\'/\'\'}' AND project_id = '${project_id//\'/\'\'}' LIMIT 1;" \
     2>/dev/null | head -n 1
 }
 
@@ -1239,8 +1239,17 @@ pr_green_reuse_session() {
   status="$(jq -r '.status // empty' <<<"$record")"
   activity="$(jq -r '.activity // empty' <<<"$record")"
   local mode
-  mode="$(pr_green_session_mode "$project_id" "$session_id" 2>/dev/null || true)"
-  mode="${mode:-tui}"
+  mode="$(pr_green_session_mode "$project_id" "$session_id" 2>/dev/null)" || {
+    printf '%s\n' "AO session mode unavailable for $session_id; suppressing dispatch" >&2
+    return 4
+  }
+  case "$mode" in
+    chat|tui) ;;
+    *)
+      printf '%s\n' "AO session mode is invalid for $session_id; suppressing dispatch" >&2
+      return 4
+      ;;
+  esac
   if [[ "$mode" == chat ]]; then
     local chat_rc=0 chat_action=reused chat_pending
     # A list-backed exact owner may have completed its initial provider turn
@@ -1256,9 +1265,12 @@ pr_green_reuse_session() {
       if declare -F pr_green_before_restore_admission >/dev/null 2>&1; then
         pr_green_before_restore_admission "$project_id" "$pr_number" "$session_id" || return 2
       fi
-      pr_green_chat_prepare_restore "$project_id" "$pr_number" "$session_id" "$prompt" || return 3
+      pr_green_chat_prepare_restore "$project_id" "$pr_number" "$session_id" "$prompt" || {
+        printf '%s\n' "AO Chat restore preflight failed for $session_id; preserving existing owner" >&2
+        return 3
+      }
       # Restore the same native Chat session, never fallback to a new worker.
-      # AO serializes this operation and resumes the exact provider conversation.
+      # AO serializes the restore of the exact provider conversation.
       if ! restore_output="$(ao session restore "$session_id" -p "$project_id" 2>&1)"; then
         printf '%s\n' "AO Chat restore uncertain for $session_id; preserving existing owner" >&2
         return 2

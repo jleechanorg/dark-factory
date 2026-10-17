@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+python3 "$ROOT/jobs/jleechanorg-pr-green/native-runtime-test.py" -q
 # shellcheck source=../../jobs/jleechanorg-pr-green/session-reuse.sh
 source "$ROOT/jobs/jleechanorg-pr-green/session-reuse.sh"
 
@@ -77,9 +78,18 @@ curl() {
 
 tmux() {
   case "$1 $2" in
+    "has-session -t") return 0 ;;
     "list-panes -t") printf '%s\n' "$live_pid" ;;
     *) printf 'unexpected tmux call: %s\n' "$*" >&2; return 1 ;;
   esac
+}
+
+# This test exercises process and rollout identity; the production socket
+# resolver requires a real packaged AO daemon process, so pin the test to its
+# explicit mock tmux server.
+pr_green_tmux_socket_for_handle() {
+  [[ "$1" == worldarchitect-ai-123-runtime ]] || return 1
+  printf '%s\n' default
 }
 
 pr_green_is_codex_process() {
