@@ -43,8 +43,10 @@ adversarial codex reviewer signs off on **both** before exit. Pass
 2. For brownfield tasks, encode rules 1–6 (delete-first, executor node for
    deletion, net-LOC ≤ 0 guard, dead-code gate, same-call-site replace,
    post-deletion proof) directly in the goal string.
-3. Report the proposed `--goal` string (classification + description) and ask
-   the user to confirm or modify **before** running.
+3. Construct the `--goal` string from the classification and supplied
+   description, then proceed under the current task authorization. Report the
+   exact goal with the run proof; ask only when the supplied outcome leaves an
+   essential product decision unresolved.
 4. Run the spec-generation pipeline from the target project's cwd:
 
    ```bash
@@ -169,11 +171,10 @@ through to `$DARK_FACTORY_HOME/pipelines/`, so an operator in the target
 repo can pass `--pipeline my_repo_lane.dot` and the runner finds it
 locally.
 
-**When `--pipeline` is omitted (auto-select path),** `/f` and `/factory`
-list the contents of `<workdir>/dark-factory/pipelines/` **before**
-falling back to the built-in decision table, so repo-specific graphs
-surface in the auto-select output. The convention is therefore
-discoverable, not just documentable.
+**When `--pipeline` is omitted,** `/f` and `/factory` use the canonical
+`pipelines/slim/two_node.dot` default. A repo-specific graph is an explicit
+opt-in: pass its name with `--pipeline`; the runner resolves that name against
+`<workdir>/dark-factory/pipelines/` before `$DARK_FACTORY_HOME/pipelines/`.
 
 Execution command (from target repo cwd):
 
@@ -311,19 +312,23 @@ start ──▶ holdout_eval ──(success)──▶ gate_es ──(success)─
 
 **Use when:** already-implemented diff needs Attractor-style 4-gate validation (requires holdout).
 
-### 3.5 `pr_gates.dot` — 3-Gate PR Validation (No Holdout)
+### 3.5 `pr_gates.dot` — PR Validation (Sealed Holdout + 3 Gates)
 
-```
-start ──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ gate_cs ──▶ exit
-             │                      │
-             └──(fail)──▶ exit      └──(fail)──▶ exit
-```
+`pipelines/factory/pr_gates.dot` is the canonical branch topology. Its success
+sequence is `start → holdout → gate_skeptic → adversarial_reviewer → gate_es →
+gate_er → gate_cs → web_advice → exit`. `web_advice` is fail-open. Actionable
+failures route to `fix → holdout`; no-verdict and infrastructure outcomes exit
+as the graph defines.
 
 | Node | Type | Handler | What it does |
 |------|------|---------|-------------|
+| `holdout` | `holdout_eval` | Sealed evaluator | Runs behavioral holdouts first |
+| `gate_skeptic` | `gate_skeptic` | Adversarial skeptic | Produces a review verdict or no-verdict exit |
+| `adversarial_reviewer` | `parallel_reviewer` | Primary + shadow Codex | Reviews after skeptic success |
 | `gate_es` | `gate_es` | `claude --print /es` | Evidence standards check |
 | `gate_er` | `gate_er` | `claude --print /er` | Evidence review check |
 | `gate_cs` | `gate_code_standards` | `claude --print /code_standards` | ZFC + leveling + root-cause-first |
+| `web_advice` | `web_advice` | Browser reviewers | Fail-open final advisory node |
 
 **Use when:** validating an in-flight PR diff (like gates.dot; the actual `.dot` runs holdout as the first node per the Holdout-always policy, so pass `--feature <name>`).
 
@@ -351,7 +356,7 @@ fix ──▶ test (loop)
 
 **Use when:** full production pipeline from scratch: test → review → holdout → evidence gates.
 
-### 6. `minimal_pr.dot` — Slim PR Iteration Factory (No Holdout)
+### 6. `minimal_pr.dot` — Slim PR Iteration Factory (Sealed Holdout)
 
 ```
 start ──▶ explore ──▶ research ──▶ plan ──▶ implement ──▶ test ──(success)──▶ review ──(success)──▶ holdout ──(success)──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ exit
