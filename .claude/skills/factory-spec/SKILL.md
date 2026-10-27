@@ -297,18 +297,12 @@ prompt, only the spec and the code diff.
 
 ### 3. `gates.dot` — 4-Gate Validation
 
-```
-start ──▶ holdout_eval ──(success)──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ gate_cs ──▶ exit
-                 │                      │                      │
-                 └──(fail)──▶ exit      └──(fail)──▶ exit     └──(fail)──▶ exit
-```
-
-| Node | Type | Handler | What it does |
-|------|------|---------|-------------|
-| `holdout` | `holdout_eval` | Sealed evaluator at `$DARK_FACTORY_HOLDOUTS/evaluator/run.py` | Runs hidden test scenarios against the diff |
-| `gate_es` | `gate_es` | `claude --print /es` | Evidence standards check |
-| `gate_er` | `gate_er` | `claude --print /er` | Evidence review check |
-| `gate_cs` | `gate_code_standards` | `claude --print /code_standards` | ZFC + leveling + root-cause-first |
+`pipelines/factory/gates.dot` is the canonical branch topology. Its success
+sequence is `start → holdout → gate_skeptic → adversarial_reviewer → gate_es →
+gate_er → gate_cs → web_advice → exit`; `web_advice` is fail-open. Every
+non-success holdout result and actionable failure verdicts route to `fix →
+holdout`. The graph separately exits for non-actionable no-verdict and error
+outcomes; consult its edges for the authoritative distinction.
 
 **Use when:** already-implemented diff needs Attractor-style 4-gate validation (requires holdout).
 
@@ -316,9 +310,10 @@ start ──▶ holdout_eval ──(success)──▶ gate_es ──(success)─
 
 `pipelines/factory/pr_gates.dot` is the canonical branch topology. Its success
 sequence is `start → holdout → gate_skeptic → adversarial_reviewer → gate_es →
-gate_er → gate_cs → web_advice → exit`. `web_advice` is fail-open. Actionable
-failures route to `fix → holdout`; no-verdict and infrastructure outcomes exit
-as the graph defines.
+gate_er → gate_cs → web_advice → exit`. `web_advice` is fail-open. Every
+non-success holdout result and actionable failure verdicts route to `fix →
+holdout`; the graph separately exits for non-actionable no-verdict and error
+outcomes.
 
 | Node | Type | Handler | What it does |
 |------|------|---------|-------------|
@@ -329,6 +324,7 @@ as the graph defines.
 | `gate_er` | `gate_er` | `claude --print /er` | Evidence review check |
 | `gate_cs` | `gate_code_standards` | `claude --print /code_standards` | ZFC + leveling + root-cause-first |
 | `web_advice` | `web_advice` | Browser reviewers | Fail-open final advisory node |
+| `fix` | `codergen` | Fix prompt | Re-enters the holdout loop after an actionable failure |
 
 **Use when:** validating an in-flight PR diff (like gates.dot; the actual `.dot` runs holdout as the first node per the Holdout-always policy, so pass `--feature <name>`).
 
@@ -357,6 +353,9 @@ fix ──▶ test (loop)
 **Use when:** full production pipeline from scratch: test → review → holdout → evidence gates.
 
 ### 6. `minimal_pr.dot` — Slim PR Iteration Factory (Sealed Holdout)
+
+The following is an abridged happy-path summary. `pipelines/slim/minimal_pr.dot`
+is canonical for its full edges, including `web_advice` and every fix route.
 
 ```
 start ──▶ explore ──▶ research ──▶ plan ──▶ implement ──▶ test ──(success)──▶ review ──(success)──▶ holdout ──(success)──▶ gate_es ──(success)──▶ gate_er ──(success)──▶ exit
