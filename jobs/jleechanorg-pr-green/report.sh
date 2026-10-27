@@ -190,6 +190,58 @@ push_lines="$(jq -r '
 ' <<<"$summary")"
 [[ -n "$push_lines" ]] || push_lines='(none; no push receipt is available)'
 
+# Lane freshness. Zero runs inside the window means the sweep lane is DOWN, not
+# that the queue is empty: the timer can be disabled while this reporter keeps
+# firing. Surface the outage instead of a table of zeros.
+last_any_run_ts="$(jq -s -r 'map((.ts // 0) | select(type == "number")) | max // 0' "$RUNS_FILE" 2>/dev/null || printf '0')"
+[[ "$last_any_run_ts" =~ ^[0-9]+$ ]] || last_any_run_ts=0
+lane_fresh=0
+if (( last_any_run_ts >= SINCE )); then lane_fresh=1; fi
+
+if (( lane_fresh == 0 )); then
+  newest_discovery_path="$(ls -1t "$METRICS_DIR"/discovery-*.tsv 2>/dev/null | head -1 || true)"
+  if [[ -n "$newest_discovery_path" ]]; then
+    newest_discovery_name="${newest_discovery_path##*/}"
+    newest_discovery_time="$(date -r "$newest_discovery_path" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || printf 'unknown')"
+  else
+    newest_discovery_name='none'
+    newest_discovery_time='n/a'
+  fi
+  if (( last_any_run_ts > 0 )); then
+    last_sweep_time="$(date -d "@$last_any_run_ts" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || date -r "$last_any_run_ts" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || printf '%s' "$last_any_run_ts")"
+    last_sweep_age="$(( (NOW - last_any_run_ts) / 3600 ))h ago"
+  else
+    last_sweep_time='none recorded'
+    last_sweep_age='n/a'
+  fi
+  lane_state='unknown'
+  if command -v systemctl >/dev/null 2>&1; then
+    lane_state="$(systemctl --user is-enabled jleechanorg-pr-green-daily.timer 2>/dev/null || true)"
+    [[ -n "$lane_state" ]] || lane_state='unknown'
+  fi
+  last_summary_line='unavailable'
+  if command -v journalctl >/dev/null 2>&1; then
+    last_summary_line="$(journalctl --user -u jleechanorg-pr-green-daily.service --no-pager 2>/dev/null \
+      | grep 'summary run_status' | tail -1 | sed 's/.*\[pr-green-daily\] //' || true)"
+    [[ -n "$last_summary_line" ]] || last_summary_line='unavailable'
+  fi
+  body="PR green repair report (last ${WINDOW_HOURS}h) — LANE DOWN
+
+No PR repair sweep ran in the last ${WINDOW_HOURS}h, so every counter in the normal
+report would be unknown rather than zero. This message is the outage notice.
+
+Last completed sweep: ${last_sweep_time} (${last_sweep_age})
+Newest discovery snapshot: ${newest_discovery_name} (${newest_discovery_time})
+Sweep lane state (jleechanorg-pr-green-daily.timer): ${lane_state}
+Last sweep summary: ${last_summary_line}
+
+The sweep lane is stopped or disabled, so no repair work is being attempted.
+A stop is owner-gated; this report does not restart the lane.
+
+Policy: only explicit red CI or merge conflicts; no merges or force-pushes.
+Note: dispatches and session reuse are attempts, never fixes."
+else
+
 body="PR green repair report (last ${WINDOW_HOURS}h)
 
 PRs analyzed: ${analyzed_label}
@@ -211,6 +263,7 @@ Caveat: uncovered snapshots, legacy outcomes, and native-ack/push attribution no
 
 Policy: only explicit red CI or merge conflicts; no merges or force-pushes.
 Note: dispatches and session reuse are attempts, never fixes."
+fi
 
 should_send() {
   local last
