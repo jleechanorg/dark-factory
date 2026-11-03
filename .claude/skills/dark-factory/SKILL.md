@@ -1,6 +1,6 @@
 ---
 name: dark-factory
-description: "Run the Dark Factory DOT pipeline runner against a goal. Slash command: /f (aliases /factory, /df, /f-pr). Implements StrongDM's Attractor pattern as an external Python runner — .dot files are the versioned artifact, sealed holdouts live in a separate repo, every step is recorded to CXDB, and the Healer clusters failures into diagnoses. Use when you want the goal_harness idea executed as a reproducible external pipeline instead of in-Claude subagent dispatch."
+description: "Run the Dark Factory DOT pipeline runner against a goal. Slash command: /f (aliases /factory, /df; /f-pr forces PR-mode). Implements StrongDM's Attractor pattern as an external Python runner — .dot files are the versioned artifact, sealed holdouts live in a separate repo, every step is recorded to CXDB, and the Healer clusters failures into diagnoses. Use when you want the goal_harness idea executed as a reproducible external pipeline instead of in-Claude subagent dispatch."
 ---
 
 # /f — Dark Factory Pipeline Runner
@@ -41,8 +41,8 @@ the command files only load it. Run `/fs` (the `factory-spec` skill,
 **What "binary-first" bans**: an in-Claude prose-only workflow that claims a
 factory run without a logged binary invocation is not a valid run — see
 **Honesty rules** below. The default `two_node` graph guarantees a worker, a
-fresh Codex reviewer running in the worker's worktree, and a bounded fix loop
-(`max_visits=3`). It has no spec producer, no evidence gates, and no exit
+fresh Codex reviewer on an isolated runner-minted snapshot, and a bounded fix
+loop (`max_visits=3`). It has no spec producer, no evidence gates, and no exit
 summary; pass `--pipeline gates`, `minimal_feature`, or `pr_gates` when the run
 needs evidence gates.
 
@@ -67,17 +67,17 @@ through silently to another graph. Full decision guide:
 
 | Short name | Path | Flow | When to use |
 |------------|------|------|-------------|
-| **`two_node`** ⭐ default | `pipelines/slim/two_node.dot` | worker → fresh Codex reviewer → exit | Default when no `--pipeline` is passed. The reviewer is a fresh fully tooled `codex exec --ephemeral --yolo` process in the worker's worktree; its response is copied to the worker on failure. |
+| **`two_node`** ⭐ default | `pipelines/slim/two_node.dot` | worker → fresh Codex reviewer → exit | Default when no `--pipeline` is passed. The reviewer is a fresh fully tooled `codex exec --ephemeral --yolo` process in a detached worktree at the pin minted after the worker's last visit (agent-config files quarantined, never the live workdir); on failure only typed `{path, claim, required_fix}` findings reach the worker, never the raw response. |
 | `two_node_holdout` | `pipelines/slim/two_node_holdout.dot` | worker → fresh Codex reviewer → holdout → exit | Two-node plus behavioral holdouts (opt-in) |
 | `hello` | `pipelines/factory/hello.dot` | plan → implement → holdout → fix-loop → exit | New feature with a holdout scenario; wiring smoke with `--backend echo` |
-| `gates` | `pipelines/factory/gates.dot` | start → holdout → /es → /er → /code_standards → exit | Validate an already-implemented diff (fixed `hello` holdout) |
-| `pr_gates` | `pipelines/factory/pr_gates.dot` | start → holdout → /es → /er → /code_standards → exit | Validate an in-flight PR diff (holdout from `--feature <name>`) |
+| `gates` | `pipelines/factory/gates.dot` | holdout → skeptic → adversarial reviewer → /es → /er → /code_standards → web advice → exit; failures loop fix → holdout | Validate an already-implemented diff (holdout defaults to `hello`; `--feature` overrides) |
+| `pr_gates` | `pipelines/factory/pr_gates.dot` | same flow as `gates` | Validate an in-flight PR diff (holdout from `--feature <name>`) |
 | `minimal_feature` | `pipelines/slim/minimal_feature.dot` | explore → plan → implement → test → review → holdout → gates → exit | Full production pipeline from scratch with a holdout |
 | `minimal_pr` | `pipelines/slim/minimal_pr.dot` | explore → plan → implement → test → review → holdout → gates → exit | In-flight PR iteration with `--state slim.test_command=...` (requires `--feature <name>`) |
 | `ready` | `pipelines/slim/ready.dot` | test → /es → /er → /advice → holdout → fix (max 3) | PR `/ready` enforcement + fix iteration |
 | `bug_fix` | `pipelines/bug_fix.dot` | reproduce → red gate → fix → green gate → holdout → evidence | Bug fix with red/green discipline |
-| `spec_gen` | `pipelines/slim/spec_gen.dot` | explore → plan → cold spec review → fix loop | Reviewed spec only (the `/fs` pipeline) |
-| `minimal_research` | `pipelines/slim/minimal_research.dot` | explore fanout → research → exit | Research report only |
+| `spec_gen` | `pipelines/slim/spec_gen.dot` | explore → plan_main → review_main (fix loop) → plan_attractor → review_attractor (fix loop) → exit | Reviewed main + attractor specs (the `/fs` pipeline) |
+| `minimal_research` | `pipelines/slim/minimal_research.dot` | explore fanout → research → /er → exit; failures loop fix → research | Research report only |
 | `review_slim` | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer | Spec review (slim) |
 | `review_full` | `benchmarks/attractor-spec-review/pipelines/review_full.dot` | review_slim + fullstack smoke | Spec review with stack smoke |
 | `level5_feature` | `pipelines/factory/level5_feature.dot` | full reference pipeline | Level-5 reference pipeline with hard-tier gates |
@@ -137,16 +137,23 @@ task, not a deterministic rule table (no `if is_draft then X`, no
 5. Report the outcome per **Output contract** below.
 
 `/f-pr` honesty rules (in addition to the shared ones under **Honesty
-rules**): the `gate_er` priority queue (`codex > minimax > agy >
-claude-sonnet`) still resolves the reviewer even when `--backend claude`
+rules**): the `gate_er` priority queue (default `codex > minimax > agy >
+claude-sonnet`; a node's `backend_priority` attribute, then
+`DARK_FACTORY_ADVERSARIAL_PRIORITY`, overrides it) still resolves the reviewer even when `--backend claude`
 was passed for the run itself — passing `--backend claude` does not mean
 `gate_er` uses claude by default.
 
 ### Step 0b — Backend
 
-Always pass `--backend`. Precedence: explicit flag > invoking wrapper
-(`clauded`, `codex`, `claude`) > `ANTHROPIC_BASE_URL` > parent process >
-`claude`. Echo the choice and its source in the proof block.
+Always pass `--backend`. Precedence: explicit flag > invoking `~/.bashrc`
+wrapper > `ANTHROPIC_BASE_URL` > parent process name > `claude`. A wrapper
+(`clauded`, `claude`, `codex`, `agy`) exports `BASH_FUNC_<wrapper>%%`; read it
+with `printenv 'BASH_FUNC_<wrapper>%%'`, because `%%` breaks `${X:-default}` and
+`${!key}` expansion (`clauded` maps to `claude`, the others to themselves).
+`ANTHROPIC_BASE_URL`: `*anthropic.com*` → `claude`, `*openai.com*` → `codex`.
+Parent process (`ps -o comm= -p "$PPID"`): `*claude*` → `claude`, `*codex*` →
+`codex`, `*agy*`/`*antigrav*` → `agy`. Echo the choice and its source in the
+proof block; when `--backend` was explicit, note the override.
 
 ### Arg parsing
 
@@ -266,8 +273,8 @@ dispatch against a read-only workdir, response validation, and
 non-empty `evidence_checked` and `commands_executed: []`. Never author reviewer
 instructions, inline prompts, or pass vendor CLI flags. Each lane's controller
 receipt digest binds the prompt SHA-256, envelope SHA-256, task, diff,
-changed-files and evidence-manifest SHA-256, response SHA-256, and the head and
-base SHA; hashing `controller-receipt.json` gives the receipt digest.
+changed-files and evidence-manifest SHA-256, response SHA-256, the head and
+base SHA, and the reviewed tree SHA; hashing `controller-receipt.json` gives the receipt digest.
 `prompt.txt` is a binary-emitted audit capture, not an authority file; the static
 `prompts/catalog/controller_cold_review_v1.md` is bound by its SHA-256 of the controller receipt.
 Artifacts: `evidence/<run-id>/reviewer-calibration/`. The in-graph `two_node`
@@ -346,10 +353,10 @@ To add a new sealed-holdout feature `foo`:
 ## Honesty rules
 
 - Quote the **actual command** (`dark-factory ...` or `df-healer ...`), the
-  runner's exit code, and the review verdict (`pass` / `fail`) verbatim, as the
-  proof block's literal lines. No paraphrasing.
-- Never claim `/green` while CI checks are pending/failing, and never claim a PR
-  is `/ready`, `/green`, or "All gates passing" when the review verdict is `fail`.
+  runner's exit code, and the actual review verdict (`pass` / `fail`)
+  verbatim. No paraphrasing.
+- Never claim a PR is `/ready`, `/green`, or "All gates passing" while CI
+  checks are pending or failing, or when the review verdict is `fail`.
 - Never auto-merge, and never retry an unchanged failing approach merely to get
   a pass; preserve the failed verdict.
 - Never claim a holdout passed if you read the scenarios — that breaks the
@@ -361,8 +368,7 @@ To add a new sealed-holdout feature `foo`:
   more specific exists — confirm its directory too.
 - If `--backend echo` was used, label the run as a wiring smoke, not a real
   validation.
-- Reviewer calibration is default-on. If `--reviewer-calibration=false` is
-  passed, quote the explicit opt-out reason and do not imply raw-Codex-vs-
+- If `--reviewer-calibration=false` is passed, quote the explicit opt-out reason and do not imply raw-Codex-vs-
   subagent quality was measured.
 - Do not claim a factory run based on an in-Claude workflow, `Skill()` call,
   or prose summary. The only valid proof is an actual `dark-factory` binary
