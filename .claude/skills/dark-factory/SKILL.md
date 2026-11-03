@@ -115,7 +115,7 @@ echo "$ARGUMENTS"
 Reasoning (LLM, not rules):
 - **No open PR** → feature-mode (new work).
 - **Open PR exists** AND goal relates to it → PR-mode (drive the existing PR to green).
-- **Open PR exists** AND goal is unrelated → **ask the user** which mode they meant. Do not silently route.
+- **Open PR exists** AND the goal does not relate to it → see **Honesty rules** (mode ambiguity).
 
 ### `/f-pr` — explicit PR-mode entry point
 
@@ -138,13 +138,8 @@ task, not a deterministic rule table (no `if is_draft then X`, no
 3. **Reason about**: what kind of work this is (new feature / bug fix /
    refactor / docs / test-only / infra — from diff+body+files, never
    pre-bucketed by label alone); whether a spec already covers the
-   change (if so, `/fs` is skippable; if needed, report the prerequisite
-   and carry out its already-authorized preparation or return it to the
-   parent task under active repository role and execution constraints.
-   Do not force a pipeline run before it is ready); holdout
-   eligibility (pass `--feature <name>` only if
-   `~/projects/dark-factory-holdouts/holdouts/<feature>/` actually
-   exists — never invent one); and what evidence mix (`/es` + `/er` +
+   change (if not, see **Honesty rules** on `/fs`); holdout eligibility
+   (see **Honesty rules** on `--feature`); and what evidence mix (`/es` + `/er` +
    `/code_standards` minimum, `holdout_eval` for behavior-grade) the
    pipeline needs to deliver without over-running.
 4. Execute only after needed preparation is complete and a pipeline
@@ -153,11 +148,7 @@ task, not a deterministic rule table (no `if is_draft then X`, no
    `claude` unless the PR's reviewer queue or `gate_er` priority queue
    says otherwise), then construct, show, and run the command — same
    shape as Step 3 below, run from the PR's target repo.
-5. Report the outcome: when a pipeline ran, report the verdict per
-   **Output contract** below; otherwise report the unmet prerequisite or
-   no-fitting-pipeline limitation and return to the parent task with no
-   fabricated run ID, exit code, or review verdict, preserving authorized
-   parent continuation.
+5. Report the outcome per **Output contract** below.
 
 `/f-pr` honesty rules (in addition to the shared ones under **Honesty
 rules**): the `gate_er` priority queue (`codex > minimax > agy >
@@ -182,7 +173,7 @@ and never passed to the runner.
 | `--pipeline <name>` | Graph to run | Short name from **Pipelines** (mapped to its path) or a `.dot` path; omit for `two_node` |
 | `--goal <text>` | Goal text | Whatever is left after flag parsing; mutually exclusive with `--target` |
 | `--target <locator>` / `--target-intent <text>` | Review a resolved target (`PR 811`, path, SHA) instead of a goal | Use for review-only runs; the run refuses to start if the locator does not resolve |
-| `--feature <name>` | Holdout feature for `holdout_eval` nodes | Pass only after confirming `~/projects/dark-factory-holdouts/holdouts/<name>/` exists; `hello` is a real feature-agnostic holdout when nothing more specific exists. Never invent one |
+| `--feature <name>` | Holdout feature for `holdout_eval` nodes | Holdout name; see **Honesty rules** |
 | `--backend echo\|claude\|codex\|ao\|agy` | LLM backend for codergen nodes | Skill default: always passed explicitly (Step 0b). `echo` is a cost-free wiring smoke |
 | `--cxdb <path>` | CXDB SQLite step log | Skill default: always pass `~/.dark-factory/cxdb.sqlite` so the Healer clusters across runs |
 | `--max-steps <N>` | Step budget (default 100) | — |
@@ -275,13 +266,12 @@ resolve_dark_factory_home() {
    with a prescription template the user can act on.
 
 6. **Sealed holdouts reminder**. If the run included a `holdout_eval` node,
-   remind the user that you (and any subagent) did NOT see the scenarios at
-   `~/projects/dark-factory-holdouts/holdouts/<feature>/` — only the
-   PASS/FAIL verdict per scenario name leaked back.
+   remind the user that you (and any subagent) did NOT see the sealed
+   scenarios — only the PASS/FAIL verdict per scenario name leaked back.
 
 7. **Reviewer calibration** (default on). Run `dark-factory review` per
    **Reviewer calibration** below against the run's base and head SHAs, and
-   report the result per **Review Result Surface Requirements**.
+   report the result per **Verdicts**.
 
 ## Reviewer calibration (default on)
 
@@ -357,45 +347,43 @@ To add a new sealed-holdout feature `foo`:
    passing `--feature foo`, or write `pipelines/factory/foo.dot` with custom
    nodes.
 
-## Review Verdict Interpretation Contract (Zero Inversion)
+## Verdicts
 
-- `status: "valid"` / `backend_returncode: 0`: Indicates only that the reviewer CLI/transport executed cleanly and emitted valid JSON matching the schema. It does **NOT** indicate that the code passed.
-- `verdict: "fail"` / `exit_code: 2`: Indicates the independent review **REJECTED** the change.
-- `verdict: "pass"` / `exit_code: 0`: Indicates the review **ACCEPTED** the change.
-- **NEVER** treat `status: "valid"` or a successful LLM invocation as a passing verdict when `verdict == "fail"`.
-
-### Review Result Surface Requirements
-
-Whenever `dark-factory review` completes, the agent MUST immediately report:
-- **If `verdict: fail` (exit code 2)**:
-  1. `VERDICT: REJECTED (FAIL)`
-  2. The exact reviewed `HEAD_SHA` and `BASE_SHA`.
-  3. All `findings` and `caveats` from the response, verbatim.
-  4. Explicit statement that the PR is NOT `/ready` and CANNOT be merged.
-- **If `verdict: pass` (exit code 0)**:
-  1. `VERDICT: ACCEPTED (PASS)`
-  2. The exact reviewed `HEAD_SHA` and `controller-receipt.json` digest.
-
-### Loop Exhaustion Invariant
-
-- Reaching the maximum cycle budget (e.g., 3/3 cycles) without achieving `verdict: pass` constitutes a **FAILED RUN**.
-- The agent MUST report `STATUS: REVIEW FAILED / EXHAUSTED AFTER N CYCLES` and
-  end that factory invocation and return its failure evidence to the parent task.
-  The parent continues authorized work within the mission deadline and the
-  active repository's role and execution rules. Where coding must run through
-  auto-factory, route repairs through a fresh or adjusted factory run.
-  An invocation's cycle budget is not a mission stop.
-- An agent must **NEVER** summarize cycle exhaustion as "addressed findings", "all gates passing", or "/ready".
+- `status: "valid"` / `backend_returncode: 0` means only that the reviewer
+  transport ran and emitted schema-valid JSON, **not** that the code passed.
+  `verdict: "pass"` / exit 0 = ACCEPTED; `verdict: "fail"` / exit 2 = REJECTED.
+  Never treat a valid status or a successful LLM call as a pass, and never
+  rewrite or summarize a failed review as a success, pass, or confirmation.
+- When `dark-factory review` completes, report at once. On fail:
+  `VERDICT: REJECTED (FAIL)`, the reviewed `HEAD_SHA` and `BASE_SHA`, all
+  `findings` and `caveats` from the response verbatim, and that the PR is NOT
+  `/ready` and cannot be merged. On pass: `VERDICT: ACCEPTED (PASS)`, the
+  reviewed `HEAD_SHA`, and the `controller-receipt.json` digest.
+- **Loop exhaustion**: reaching the cycle budget (e.g. 3/3) without
+  `verdict: pass` is a **FAILED RUN**. Report
+  `STATUS: REVIEW FAILED / EXHAUSTED AFTER N CYCLES`, end that invocation, and
+  return its failure evidence and diagnosis to the parent task, which continues
+  authorized work within the mission deadline and the active repository's role
+  and execution rules; where coding must run through auto-factory, route repairs
+  through a fresh or adjusted factory run. A cycle budget is not a mission stop.
+  Never call exhaustion "addressed findings", "all gates passing", or "/ready".
 
 ## Honesty rules
 
-- Always tell the user the **actual command** you ran (`dark-factory ...` or `df-healer ...`). No paraphrasing.
-- Always quote the **runner's exit code** and **actual review verdict** (`pass` / `fail`) verbatim.
-- Never rewrite or summarize a failed review (`verdict: fail`, exit code 2) as a success, pass, or confirmation.
-- Never claim a PR is `/ready`, `/green`, or "All gates passing" when the review verdict is `fail` or when CI checks are pending/failing.
+- Quote the **actual command** (`dark-factory ...` or `df-healer ...`), the
+  runner's exit code, and the review verdict (`pass` / `fail`) verbatim, as the
+  proof block's literal lines. No paraphrasing.
+- Never claim `/green` while CI checks are pending/failing, and never claim a PR
+  is `/ready`, `/green`, or "All gates passing" when the review verdict is `fail`.
+- Never auto-merge, and never retry an unchanged failing approach merely to get
+  a pass; preserve the failed verdict.
 - Never claim a holdout passed if you read the scenarios — that breaks the
   adversarial guarantee. If you read `~/projects/dark-factory-holdouts/`,
   declare the run **invalid** and rerun the pipeline.
+- `--feature` is required when the pipeline has a `holdout_eval` node, but pass
+  it only when `~/projects/dark-factory-holdouts/holdouts/<feature>/` exists;
+  never invent a value. `hello` is a real feature-agnostic holdout when nothing
+  more specific exists — confirm its directory too.
 - If `--backend echo` was used, label the run as a wiring smoke, not a real
   validation.
 - Reviewer calibration is default-on. If `--reviewer-calibration=false` is
@@ -404,21 +392,23 @@ Whenever `dark-factory review` completes, the agent MUST immediately report:
 - Do not claim a factory run based on an in-Claude workflow, `Skill()` call,
   or prose summary. The only valid proof is an actual `dark-factory` binary
   invocation plus the proof block above.
-- If `/fs` is needed first, follow `/f-pr` item 3: report the prerequisite and
-  carry out its already-authorized preparation or return it to the parent task
-  under active repository role and execution constraints. Ask only for missing
-  authority; do not silently fall through to `gates.dot` and pretend the PR is green.
+- If `/fs` is needed first, report the prerequisite and carry out its
+  already-authorized preparation or return it to the parent task under active
+  repository role and execution constraints. Ask only for missing authority; do
+  not force a run before it is ready or silently fall through to `gates.dot`
+  and pretend the PR is green.
 - If no pipeline fits (e.g. docs-only PR), report that limitation and return to
   the parent task for authorized diagnosis or preparation. A materially different
   requested method needs authorization; do not silently substitute a
   holdout-bearing pipeline.
-- Do not invent `--feature` values. If there's no holdout directory at
-  `~/projects/dark-factory-holdouts/holdouts/<feature>/`, don't pass `--feature`.
 - When the goal is unrelated to the open PR (Step 0a), **ask the user** which
-  mode they meant. Do not silently route to PR-mode for unrelated work.
-- When the fix loop exhausts (3 attempts), surface its failure diagnosis and
-  return control to the parent as above. Preserve the failed verdict; never
-  auto-merge or retry an unchanged failing approach merely to get a pass.
+  mode they meant. Do not silently route to PR-mode.
+- Pinning proves authority, not parity: `/f` source pinning, fail-closed
+  receipts, and historical replays prove reviewer authority and regression
+  coverage, not equal quality to a fresh terminal. Claim parity only after an
+  independent `/f` run and a fresh-terminal run receive the same input and are
+  scored by a predeclared rule against a predeclared acceptance threshold;
+  otherwise report the narrower result.
 
 ## Known limits
 
@@ -429,11 +419,3 @@ Whenever `dark-factory review` completes, the agent MUST immediately report:
   token; if the gate command emits a debug line with just "PASS" the runner
   will trust it. For high-stakes gates require explicit `VERDICT:` markers.
 - CXDB is per-process — don't share one across threads.
-
-## Pinning proves authority, not parity
-
-`/f` source pinning, fail-closed receipts, and historical replays prove reviewer
-authority and regression coverage — they do NOT prove equal quality to a fresh
-terminal. Claim parity only after an independent `/f` run and a fresh-terminal run
-receive the same input and are scored by a predeclared rule against a predeclared
-acceptance threshold. Otherwise report the narrower result.
