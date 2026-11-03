@@ -11,13 +11,6 @@ Run a goal through the Dark Factory `.dot` pipeline runner. The runner is the
 Python implementation of StrongDM's Attractor pattern (cf. brynary/attractor,
 strongdm/attractor).
 
-**Never assume where the runner lives — resolve it.** `DARK_FACTORY_HOME`
-comes from the `dark-factory` binary on PATH (see the resolution block below),
-which today puts it at `$HOME/Snapchat/Dev/jleechanorg-dark-factory-main-latest`.
-It has never been under `$HOME/projects/`. A `ls` of a guessed path that comes
-back empty says nothing about whether the runner is available — the binary
-being on PATH is what decides that.
-
 Versus `/h` / `/goal_harness`:
 
 | Aspect | `/h` (goal_harness) | `/factory` (this skill) |
@@ -56,19 +49,13 @@ needs evidence gates.
 
 ## Repos
 
-- `$DARK_FACTORY_HOME` — the runner (factory code; agent can see this).
-  Resolved from the binary on PATH, not hardcoded; currently
-  `$HOME/Snapchat/Dev/jleechanorg-dark-factory-main-latest`. Several other
-  `$HOME/Snapchat/Dev/*dark*factory*` directories exist (worktrees, run
-  archives, patch-refresh clones) — none of them is the runner. Trust the
-  symlink, not the name.
-- `~/projects/dark-factory-holdouts/` — sealed scenarios (agent must NEVER read).
-  This path is correct as written; only the runner moved.
-- Pushed: `https://github.com/jleechanorg/dark-factory` + `dark-factory-holdouts`
-
-Not to be confused with Snap's own holdout repo,
-`$HOME/Snapchat/Dev/dark_factory_holdback` (`Snapchat/dark_factory_holdback`),
-which belongs to `snap_factory` and is a different set of packs.
+- The runner is `$DARK_FACTORY_HOME`, the repo root of the `dark-factory` binary
+  on PATH (Step 1 resolves it); never guess it, and an empty `ls` of a guessed
+  path proves nothing. The other `$HOME/Snapchat/Dev/*dark*factory*` directories
+  (worktrees, run archives, clones) are not the runner. Sealed holdouts stay at
+  `~/projects/dark-factory-holdouts/` (agent must NEVER read), which is not
+  Snap's `Snapchat/dark_factory_holdback`. Pushed:
+  `https://github.com/jleechanorg/dark-factory` + `dark-factory-holdouts`.
 
 ## Pipelines
 
@@ -147,7 +134,7 @@ task, not a deterministic rule table (no `if is_draft then X`, no
    using that reasoning, pick the backend (`echo` for wiring smoke;
    `claude` unless the PR's reviewer queue or `gate_er` priority queue
    says otherwise), then construct, show, and run the command — same
-   shape as Step 3 below, run from the PR's target repo.
+   shape as Step 2 below, run from the PR's target repo.
 5. Report the outcome per **Output contract** below.
 
 `/f-pr` honesty rules (in addition to the shared ones under **Honesty
@@ -191,37 +178,32 @@ Whatever is left after flag parsing is the **goal description**.
 
 ### Steps
 
-Before Steps 1–2, define this resolver. It preserves an explicit
-`DARK_FACTORY_HOME`; otherwise it resolves the `dark-factory` binary selected
-from `PATH`, follows symlinks, derives its repository root, and exports that
-same source for pipeline and prompt resolution:
+Step 1 must run in the same Bash invocation as Step 2 (or be re-sourced first),
+because its exports do not survive between shell calls.
 
-```bash
-resolve_dark_factory_home() {
-  if [ -z "${DARK_FACTORY_HOME:-}" ]; then
-    DARK_FACTORY_BIN="$(command -v dark-factory 2>/dev/null)" || {
-      echo "ERROR: dark-factory is not on PATH; run ./install.sh first"
-      return 1
-    }
-    DARK_FACTORY_BIN="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$DARK_FACTORY_BIN")" || {
-      echo "ERROR: unable to resolve the installed dark-factory binary"
-      return 1
-    }
-    DARK_FACTORY_HOME="$(cd "$(dirname "$DARK_FACTORY_BIN")/.." && pwd -P)" || return 1
-  fi
-  export DARK_FACTORY_HOME
-}
-```
-
-1. **Verify binary install**. The factory runs via the **`dark-factory` binary**
-   (not `python -m runner` from source). If missing, report the unmet prerequisite
-   and inspect the existing installation before cloning or reinstalling. Complete
-   setup within the current authorized scope and repository execution rules, or
-   return the limitation to the parent for other authorized work. Ask only for
-   missing authority or access; an unavailable binary is not a completed run.
-   The following check runs as a tool command; its failure ends that command,
-   then the parent follows the prerequisite guidance above:
+1. **Setup**. The factory runs via the installed **`dark-factory` binary** (not
+   `python -m runner` from source). If it is missing, report the unmet
+   prerequisite and inspect the existing installation before cloning or
+   reinstalling. Complete setup within the current authorized scope, or return
+   the limitation to the parent for other authorized work; ask only for missing
+   authority or access. An unavailable binary is not a completed run. The
+   resolver keeps an explicit `DARK_FACTORY_HOME`; otherwise it follows the
+   PATH-selected binary's symlinks to its repository root:
    ```bash
+   resolve_dark_factory_home() {
+     if [ -z "${DARK_FACTORY_HOME:-}" ]; then
+       DARK_FACTORY_BIN="$(command -v dark-factory 2>/dev/null)" || {
+         echo "ERROR: dark-factory is not on PATH; run ./install.sh first"
+         return 1
+       }
+       DARK_FACTORY_BIN="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$DARK_FACTORY_BIN")" || {
+         echo "ERROR: unable to resolve the installed dark-factory binary"
+         return 1
+       }
+       DARK_FACTORY_HOME="$(cd "$(dirname "$DARK_FACTORY_BIN")/.." && pwd -P)" || return 1
+     fi
+     export DARK_FACTORY_HOME
+   }
    export PATH="$HOME/.local/bin:$PATH"
    resolve_dark_factory_home || exit 1
    command -v dark-factory || exit 1
@@ -230,16 +212,10 @@ resolve_dark_factory_home() {
      echo "ERROR: run $DARK_FACTORY_HOME/install.sh first"
      exit 1
    }
-   ```
-
-2. **Environment**:
-   ```bash
-   resolve_dark_factory_home || exit 1
    export DARK_FACTORY_HOLDOUTS="${DARK_FACTORY_HOLDOUTS:-$HOME/projects/dark-factory-holdouts}"
-   export PATH="$HOME/.local/bin:$PATH"
    ```
 
-3. **Run the pipeline** from the **target repo** (implementation workdir = cwd).
+2. **Run the pipeline** from the **target repo** (implementation workdir = cwd).
    Pipelines and prompts resolve from `$DARK_FACTORY_HOME`; code changes land in cwd:
    ```bash
    cd "<TARGET_REPO>"   # e.g. the product repo being built
@@ -252,24 +228,24 @@ resolve_dark_factory_home() {
      --state <KEY>=<VALUE>
    ```
 
-4. **Surface the verdict**. The last line of stdout is a JSON summary with
+3. **Surface the verdict**. The last line of stdout is a JSON summary with
    `final_outcome`, `pipeline`, `goal`, `steps`, `trace`. Report:
    - Pipeline name + final outcome
    - Per-node trace (one line each: `node  outcome  preview`)
    - Exit code of the runner
 
-5. **Run the Healer** (only if `final_outcome != "success"`):
+4. **Run the Healer** (only if `final_outcome != "success"`):
    ```bash
    df-healer --cxdb <CXDB_PATH>
    ```
    Render the resulting markdown table inline. Each row is a failure cluster
    with a prescription template the user can act on.
 
-6. **Sealed holdouts reminder**. If the run included a `holdout_eval` node,
+5. **Sealed holdouts reminder**. If the run included a `holdout_eval` node,
    remind the user that you (and any subagent) did NOT see the sealed
    scenarios — only the PASS/FAIL verdict per scenario name leaked back.
 
-7. **Reviewer calibration** (default on). Run `dark-factory review` per
+6. **Reviewer calibration** (default on). Run `dark-factory review` per
    **Reviewer calibration** below against the run's base and head SHAs, and
    report the result per **Verdicts**.
 
@@ -277,7 +253,7 @@ resolve_dark_factory_home() {
 
 `--reviewer-calibration=true` is the default for every real `/f`/`/factory` run;
 only `--reviewer-calibration=false` with a stated reason turns it off, and the
-final response then says `Reviewer calibration: disabled <reason>`. Step 7 runs:
+final response then says `Reviewer calibration: disabled <reason>`. Step 6 runs:
 
 ```bash
 dark-factory review \
