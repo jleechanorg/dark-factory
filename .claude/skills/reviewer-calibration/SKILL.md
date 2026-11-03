@@ -16,7 +16,7 @@ Calibration is default-on for real `/f` runs. Treat
 
 Do not claim one reviewer underperformed another unless controller receipts
 prove both reviewed the same frozen base/head pair, task digest, prompt digest,
-and envelope digest.
+and envelope digest, and the gap is a `confirmed_miss` (see **Adjudication**).
 
 ## Frozen Envelope
 
@@ -59,9 +59,22 @@ evidence manifest. Do not add model names, inline prompts, or vendor CLI
 flags. Factory/in-graph results may be compared only when their controller
 receipt proves the same bindings.
 
-## Artifacts
+Controller limits:
 
-The binary, not this skill, writes each lane directory:
+- The Codex lane reviews a read-only workdir. Exit status: `0` valid pass,
+  `2` valid fail, `1` invalid or infrastructure failure.
+- `--workdir` must not be a symlink, contain a symlink component, or resolve
+  inside a sealed holdout root.
+- Task text, evidence files, and the frozen envelope and prompt are each capped
+  at 1 MiB.
+- The Base64 envelope gives delimiter safety, not prompt-injection isolation.
+  The model still owns evidence sufficiency; the controller owns shape and
+  digest invariants only.
+
+## A/B artifacts
+
+The binary, not this skill, writes each lane directory; `comparison.json` and
+`adjudication.md` are the A/B layer this skill adds:
 
 ```text
 evidence/<run-id>/reviewer-calibration/
@@ -89,8 +102,8 @@ Before using a lane, require `controller-receipt.json` to bind:
 
 Recompute the emitted `prompt.txt` and `envelope.json` SHA-256 digests and
 compare them to the receipt. Record the controller receipt file's own SHA-256
-in `comparison.json`. A missing receipt/digest, mismatch, nonzero controller
-exit, or stale SHA makes that lane `inconclusive`. If a backend is unavailable,
+in `comparison.json`. A missing receipt/digest, mismatch, controller exit `1`,
+or stale SHA makes that lane `inconclusive`. If a backend is unavailable,
 record `unavailable` in `comparison.json`; do not fabricate a replacement
 result.
 
@@ -132,9 +145,9 @@ Classify reviewer deltas:
 - `unconfirmed_delta`: reviewers disagree, but no ground truth exists yet.
 - `false_positive`: reviewer claimed a blocker later disproven by evidence.
 
-## Final /f Output
+## A/B output
 
-Include:
+When A/B lanes ran, add to the `/f` final response:
 
 ```text
 Reviewer calibration: enabled <artifact-path>

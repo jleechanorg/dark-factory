@@ -279,69 +279,35 @@ resolve_dark_factory_home() {
    `~/projects/dark-factory-holdouts/holdouts/<feature>/` — only the
    PASS/FAIL verdict per scenario name leaked back.
 
+7. **Reviewer calibration** (default on). Run `dark-factory review` per
+   **Reviewer calibration** below against the run's base and head SHAs, and
+   report the result per **Review Result Surface Requirements**.
+
 ## Reviewer calibration (default on)
 
-`--reviewer-calibration=true` is the default for every real `/f`/`/factory`
-run. Treat the flag as present unless the user explicitly passes
-`--reviewer-calibration=false`.
-
-Calibration routes the Codex backend through the binary-owned controller
-command:
+`--reviewer-calibration=true` is the default for every real `/f`/`/factory` run;
+only `--reviewer-calibration=false` with a stated reason turns it off, and the
+final response then says `Reviewer calibration: disabled <reason>`. Step 7 runs:
 
 ```bash
 dark-factory review \
-  --workdir <repo> \
-  --base-sha <full-40-hex-sha> \
-  --head-sha <full-40-hex-sha> \
-  --task-file <path> \
-  --output-dir <dir> \
-  --backend codex
+  --workdir <repo> --base-sha <full-40-hex-sha> --head-sha <full-40-hex-sha> \
+  --task-file <path> --output-dir <dir> --backend codex
 ```
 
-`dark-factory review` owns the static prompt, canonical envelope, backend
-dispatch, response validation, and `controller-receipt.json`. Controller v1
-accepts only Codex through its tool-free JSONL transport. A valid PASS requires
-non-empty `evidence_checked` and `commands_executed: []`; the
-`ReviewTransportReceipt` and controller terminal receipt bind the prompt,
-envelope, response, reviewed revision/tree, and evidence manifest. Do not
-author reviewer instructions, do not inline prompts, do not pass vendor CLI
-flags. The controller binds `prompt SHA-256`, `envelope SHA-256`, `task
-SHA-256`, `diff SHA-256`, `changed-files SHA-256`, and
-`evidence-manifest SHA-256` in the controller receipt so calibration lanes can
-hash the receipt itself for provenance.
-
-Each accepted lane must expose a controller receipt digest containing
-the prompt SHA-256, envelope SHA-256, task SHA-256, diff SHA-256,
-changed-files SHA-256, evidence-manifest SHA-256, head SHA, base SHA,
-and the response's own response SHA-256 digest. Hashing the
-`controller-receipt.json` file itself gives a stable SHA-256 digest for
-the controller receipt.
-
-`prompt.txt` is a binary-emitted audit capture, not an authority file.
-The static authority lives in `prompts/catalog/controller_cold_review_v1.md`
-and is bound by its SHA-256 of the controller receipt.
-
-```text
-evidence/<run-id>/reviewer-calibration/
-  <backend>/
-    controller-receipt.json
-    envelope.json
-    prompt.txt
-    reviewer.output.md
-    findings.json
-  comparison.json
-  adjudication.md
-```
-
-Do not claim delegated subagents underperformed raw Codex unless the same
-envelope and prompt were reviewed at the same SHA and raw Codex found a
-later-confirmed blocker the delegated reviewer missed. If calibration is
-disabled, the final response must say `Reviewer calibration: disabled` and
-give the explicit reason.
-
-The `gate_er` priority queue is `codex > minimax > agy > claude-sonnet` by
-default; passing `--backend claude` for the run itself does not change how
-`gate_er` resolves its reviewer.
+The controller owns the static prompt, envelope, Codex-only tool-free JSONL
+dispatch against a read-only workdir, response validation, and
+`controller-receipt.json`; it exits 0 pass, 2 fail, 1 invalid. A valid PASS needs
+non-empty `evidence_checked` and `commands_executed: []`. Never author reviewer
+instructions, inline prompts, or pass vendor CLI flags. Each lane's controller
+receipt digest binds the prompt SHA-256, envelope SHA-256, task, diff,
+changed-files and evidence-manifest SHA-256, response SHA-256, and the head and
+base SHA; hashing `controller-receipt.json` gives the receipt digest.
+`prompt.txt` is a binary-emitted audit capture, not an authority file; the static
+`prompts/catalog/controller_cold_review_v1.md` is bound by its SHA-256 of the controller receipt.
+Artifacts: `evidence/<run-id>/reviewer-calibration/`. The in-graph `two_node`
+reviewer (`codex exec --yolo`) is not this read-only controller; A/B reviewer
+comparison belongs to the `reviewer-calibration` skill.
 
 ## Output contract
 
@@ -404,9 +370,8 @@ Whenever `dark-factory review` completes, the agent MUST immediately report:
 - **If `verdict: fail` (exit code 2)**:
   1. `VERDICT: REJECTED (FAIL)`
   2. The exact reviewed `HEAD_SHA` and `BASE_SHA`.
-  3. List of all failing Criteria Gates (`C0`–`C7`) and Evidence Gates (`E0`–`E14`).
-  4. Full verbatim list of Critical, High, and Blocker findings from `reviewer.output.md`.
-  5. Explicit statement that the PR is NOT `/ready` and CANNOT be merged.
+  3. All `findings` and `caveats` from the response, verbatim.
+  4. Explicit statement that the PR is NOT `/ready` and CANNOT be merged.
 - **If `verdict: pass` (exit code 0)**:
   1. `VERDICT: ACCEPTED (PASS)`
   2. The exact reviewed `HEAD_SHA` and `controller-receipt.json` digest.
