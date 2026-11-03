@@ -7,9 +7,16 @@ description: "Run the Dark Factory DOT pipeline runner against a goal. Slash com
 
 ## Purpose
 
-Run a goal through the Dark Factory `.dot` pipeline runner at
-`~/projects/dark-factory/`. The runner is the Python implementation of
-StrongDM's Attractor pattern (cf. brynary/attractor, strongdm/attractor).
+Run a goal through the Dark Factory `.dot` pipeline runner. The runner is the
+Python implementation of StrongDM's Attractor pattern (cf. brynary/attractor,
+strongdm/attractor).
+
+**Never assume where the runner lives — resolve it.** `DARK_FACTORY_HOME`
+comes from the `dark-factory` binary on PATH (see the resolution block below),
+which today puts it at `$HOME/Snapchat/Dev/jleechanorg-dark-factory-main-latest`.
+It has never been under `$HOME/projects/`. A `ls` of a guessed path that comes
+back empty says nothing about whether the runner is available — the binary
+being on PATH is what decides that.
 
 Versus `/h` / `/goal_harness`:
 
@@ -49,9 +56,19 @@ echoed in the run evidence.
 
 ## Repos
 
-- `~/projects/dark-factory/` — the runner (factory code; agent can see this)
-- `~/projects/dark-factory-holdouts/` — sealed scenarios (agent must NEVER read)
+- `$DARK_FACTORY_HOME` — the runner (factory code; agent can see this).
+  Resolved from the binary on PATH, not hardcoded; currently
+  `$HOME/Snapchat/Dev/jleechanorg-dark-factory-main-latest`. Several other
+  `$HOME/Snapchat/Dev/*dark*factory*` directories exist (worktrees, run
+  archives, patch-refresh clones) — none of them is the runner. Trust the
+  symlink, not the name.
+- `~/projects/dark-factory-holdouts/` — sealed scenarios (agent must NEVER read).
+  This path is correct as written; only the runner moved.
 - Pushed: `https://github.com/jleechanorg/dark-factory` + `dark-factory-holdouts`
+
+Not to be confused with Snap's own holdout repo,
+`$HOME/Snapchat/Dev/dark_factory_holdback` (`Snapchat/dark_factory_holdback`),
+which belongs to `snap_factory` and is a different set of packs.
 
 ## Available pipelines
 
@@ -418,7 +435,7 @@ For executed pipeline runs, provide this proof block:
 ```bash
 # CLI backend: <detected-or-override> (source: <BASH_FUNC_X%%|explicit --backend|default>)
 # Literal command run:
-cd /Users/jleechan/projects/<target-repo>
+cd "<TARGET_REPO>"
 DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts \
 PATH="$HOME/.local/bin:$PATH" \
 dark-factory \
@@ -443,8 +460,8 @@ Plus the per-node trace and, on failure, the Healer report.
 
 To add a new sealed-holdout feature `foo`:
 
-1. Write `~/projects/dark-factory/specs/foo.md` (agent-visible).
-2. Write `~/projects/dark-factory/prompts/foo/{plan,implement,fix}.md`.
+1. Write `$DARK_FACTORY_HOME/specs/foo.md` (agent-visible).
+2. Write `$DARK_FACTORY_HOME/prompts/foo/{plan,implement,fix}.md`.
 3. Write `~/projects/dark-factory-holdouts/holdouts/foo/scenarios.yaml`
    in the sealed repo (the implementing agent must never read this).
 4. Either reuse `pipelines/factory/hello.dot` (which is feature-agnostic) by
@@ -524,3 +541,11 @@ Whenever `dark-factory review` completes, the agent MUST immediately report:
   token; if the gate command emits a debug line with just "PASS" the runner
   will trust it. For high-stakes gates require explicit `VERDICT:` markers.
 - CXDB is per-process — don't share one across threads.
+
+## Pinning proves authority, not parity
+
+`/f` source pinning, fail-closed receipts, and historical replays prove reviewer
+authority and regression coverage — they do NOT prove equal quality to a fresh
+terminal. Claim parity only after an independent `/f` run and a fresh-terminal run
+receive the same input and are scored by a predeclared rule against a predeclared
+acceptance threshold. Otherwise report the narrower result.
