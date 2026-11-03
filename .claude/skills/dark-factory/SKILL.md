@@ -39,7 +39,7 @@ pipeline; use `/h` when you want an interactive in-session loop.
 | `/f` | Full loop, auto-routes PR-mode vs feature-mode (Step 0a below) |
 | `/factory` | Alias for `/f`, identical behavior |
 | `/f-pr` | Explicit PR-mode entry point (skips auto-route, always PR-mode) |
-| `/fs` | Spec-generation entry point; runs `pipelines/slim/spec_gen.dot` or a binary-owned dynamic spec graph — run this first when the goal needs a spec |
+| `/fs` | Spec-generation entry point; runs `pipelines/slim/spec_gen.dot` — run this first when the goal needs a spec |
 
 This skill file is the single source of truth for the binary-first contract;
 `.claude/commands/f.md` is the canonical command entry point, with `/factory`
@@ -52,9 +52,7 @@ factory run without a logged binary invocation is not a valid run — see
 fresh Codex reviewer running in the worker's worktree, and a bounded fix loop
 (`max_visits=3`). It has no spec producer, no evidence gates, and no exit
 summary; pass `--pipeline gates`, `minimal_feature`, or `pr_gates` when the run
-needs evidence gates. Dynamic graph
-generation is valid only when the generated/selected DOT graph is saved or
-echoed in the run evidence.
+needs evidence gates.
 
 ## Repos
 
@@ -167,71 +165,36 @@ claude-sonnet`) still resolves the reviewer even when `--backend claude`
 was passed for the run itself — passing `--backend claude` does not mean
 `gate_er` uses claude by default.
 
-### Step 0b — Auto-detect CLI backend
+### Step 0b — Backend
 
-When the user invokes Claude via a `~/.bashrc` wrapper (`claudem`, `clauded`,
-`codex`, `agy`), bash exports a `BASH_FUNC_<wrapper>%%` env var. Read these to
-pick the right `--backend` flag so the LLM that runs the audit is the same
-one the user picked from their shell. `%%` in the var name breaks
-`${BASH_FUNC_X%%:-default}` and `${!key}` expansion, so use `printenv`:
-
-```bash
-detect_cli_backend() {
-  local key parent_comm ppid
-  for key in 'BASH_FUNC_claudem%%' 'BASH_FUNC_clauded%%' 'BASH_FUNC_agy%%' 'BASH_FUNC_codex%%' 'BASH_FUNC_claude%%'; do
-    if [ -n "$(printenv "$key" 2>/dev/null)" ]; then
-      case "$key" in
-        *claudem%%) echo "minimax"; return ;;
-        *clauded%%) echo "claude";  return ;;
-        *agy%%)     echo "agy";     return ;;
-        *codex%%)   echo "codex";   return ;;
-        *claude%%)  echo "claude";  return ;;
-      esac
-    fi
-  done
-  case "${ANTHROPIC_BASE_URL:-}" in
-    *api.minimax.io*) echo "minimax"; return ;;
-    *anthropic.com*)  echo "claude";  return ;;
-    *openai.com*)     echo "codex";   return ;;
-  esac
-  ppid="${PPID:-}"
-  if [ -n "$ppid" ]; then
-    parent_comm="$(ps -o comm= -p "$ppid" 2>/dev/null | tr -d ' ')"
-    case "$parent_comm" in
-      *claude*|*claudem*) echo "claude"; return ;;
-      *codex*)            echo "codex";  return ;;
-      *agy*|*antigrav*)   echo "agy";    return ;;
-    esac
-  fi
-  echo "claude"
-}
-DETECTED_BACKEND="$(detect_cli_backend)"
-```
-
-Override precedence (highest to lowest): explicit `--backend <x>` flag >
-`BASH_FUNC_*` wrapper signal > `ANTHROPIC_BASE_URL` > parent process name >
-hardcoded default (`claude`). Always echo the detected backend + source in
-the proof block (see **Output contract**). If `--backend` was passed
-explicitly, note the override rather than the raw detection.
+Always pass `--backend`. Precedence: explicit flag > invoking wrapper
+(`clauded`, `codex`, `claude`) > `ANTHROPIC_BASE_URL` > parent process >
+`claude`. Echo the choice and its source in the proof block.
 
 ### Arg parsing
 
-Honor these flags inside `$ARGUMENTS`:
+Honor these flags inside `$ARGUMENTS`. Every runner flag below appears in
+`dark-factory --help`; rows marked *skill convention* are parsed by this skill
+and never passed to the runner.
 
-- `--pipeline <name>` — short name from the **Pipelines** table, or a `.dot` path.
-- `--feature <name>` — holdout feature. Required when the pipeline includes a
-  `holdout_eval` node, but never default it blindly: pass it only after
-  confirming `~/projects/dark-factory-holdouts/holdouts/<name>/` actually
-  exists (`hello` is a real, feature-agnostic holdout and a reasonable choice
-  when the goal has no more specific holdout, but confirm the directory
-  exists before passing it rather than defaulting unconditionally — see
-  Honesty rules below on not inventing `--feature` values)
-- `--backend echo|claude|codex|ao|agy` — default `claude`. Use `echo` for cost-free
-  dry-runs that verify wiring without LLM calls.
-- `--max-steps <N>` — default 100
-- `--cxdb <path>` — default `~/.dark-factory/cxdb.sqlite` (shared across runs
-  so the Healer can cluster across history)
-- `--state KEY=VALUE` — pre-seed context variables; repeatable. Extremely useful for setting parameterized test commands (e.g. `--state slim.test_command="pytest tests/..."`) during PR iteration loops.
+| Flag | Meaning | Skill convention |
+|------|---------|------------------|
+| `--pipeline <name>` | Graph to run | Short name from **Pipelines** (mapped to its path) or a `.dot` path; omit for `two_node` |
+| `--goal <text>` | Goal text | Whatever is left after flag parsing; mutually exclusive with `--target` |
+| `--target <locator>` / `--target-intent <text>` | Review a resolved target (`PR 811`, path, SHA) instead of a goal | Use for review-only runs; the run refuses to start if the locator does not resolve |
+| `--feature <name>` | Holdout feature for `holdout_eval` nodes | Pass only after confirming `~/projects/dark-factory-holdouts/holdouts/<name>/` exists; `hello` is a real feature-agnostic holdout when nothing more specific exists. Never invent one |
+| `--backend echo\|claude\|codex\|ao\|agy` | LLM backend for codergen nodes | Skill default: always passed explicitly (Step 0b). `echo` is a cost-free wiring smoke |
+| `--cxdb <path>` | CXDB SQLite step log | Skill default: always pass `~/.dark-factory/cxdb.sqlite` so the Healer clusters across runs |
+| `--max-steps <N>` | Step budget (default 100) | — |
+| `--state KEY=VALUE` | Pre-seed `ctx.state`; repeatable | e.g. `--state slim.test_command="pytest tests/..."` in PR loops |
+| `--preflight` | Validate the pipeline, print diagnostics, exit | — |
+| `--resume <checkpoint>` | Resume from a checkpoint file | — |
+| `--evidence-bundle <dir>` | Per-run evidence bundle (default `evidence/<run-id>`) | — |
+| `--events <path>` | JSONL structured event log | — |
+| `--workdir <dir>` | Implementation workdir (default cwd) | — |
+| `--require-holdouts` | Fail fast when the feature has no `scenarios.yaml` | — |
+| `--allow-live-pr-target` / `--allow-push` | Run on a branch with an open PR / let codergen nodes `git push` | Both default off; pass only when the task authorizes it |
+| `--reviewer-calibration=true\|false` | — | *Skill convention*, default on (**Reviewer calibration**) |
 
 Whatever is left after flag parsing is the **goal description**.
 
@@ -393,13 +356,13 @@ continuation.
 For executed pipeline runs, provide this proof block:
 
 ```bash
-# CLI backend: <detected-or-override> (source: <BASH_FUNC_X%%|explicit --backend|default>)
+# CLI backend: <backend> (source: <explicit --backend|wrapper|ANTHROPIC_BASE_URL|parent process|default>)
 # Literal command run:
 cd "<TARGET_REPO>"
 DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts \
 PATH="$HOME/.local/bin:$PATH" \
 dark-factory \
-  --pipeline <chosen-or-generated-dot> \
+  --pipeline <chosen-dot> \
   --goal "<echo of $ARGUMENTS>" \
   --backend <backend> \
   --feature <feature-if-any> \

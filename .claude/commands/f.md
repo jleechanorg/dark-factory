@@ -23,8 +23,6 @@ the proof-block output contract all live there.
 /f --backend echo <goal>                       # wiring smoke (no LLM)
 /f --feature <name> <goal>                     # override holdout feature key
 /f --reviewer-calibration=false <goal>         # explicit opt-out; must explain why
-/f --dynamic-graph <goal>                      # binary-owned dynamic DOT/workflow builder
-/f --phase spec_validation <goal>              # binary-owned dynamic/phase run, if supported
 ```
 
 ## See also
