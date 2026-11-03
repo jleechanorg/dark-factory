@@ -22,7 +22,6 @@ off by an independent cold codex review before exit.
 ```text
 /fs <spec description>                  # DEFAULT: binary spec_gen run (main + attractor)
 /fs --pipeline spec_gen <description>   # explicit static binary pipeline
-/fs --skip-attractor <description>      # main spec only, still binary-first
 /fs --review <spec_path>                # review an existing main spec
 /fs --review-attractor <path>           # review an existing attractor spec
 ```

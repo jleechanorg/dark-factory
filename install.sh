@@ -398,10 +398,10 @@ if [[ "${CMDS}" -eq 1 ]]; then
   CLAUDE_DIR="${HOME}/.claude"
   mkdir -p "${CLAUDE_DIR}/commands" "${CLAUDE_DIR}/skills"
 
-  # 4 factory commands — point at the installed runtime. On Linux this keeps
+  # Factory commands — point at the installed runtime. On Linux this keeps
   # every executable prompt payload inside the immutable release rather than
   # reaching back into the Git checkout.
-  for cmd in f fs factory factory-spec fr factory-review; do
+  for cmd in f f-pr fs factory factory-spec fr factory-review; do
     src="${RUNTIME_ROOT}/.claude/commands/${cmd}.md"
     dst="${CLAUDE_DIR}/commands/${cmd}.md"
     if [[ -f "${src}" ]]; then

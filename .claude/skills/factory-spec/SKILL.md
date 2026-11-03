@@ -33,8 +33,9 @@ main spec describes the implementation path (acceptance criteria, test
 command, non-goals, lane-independence matrix). The attractor spec
 describes the convergence goal (stable end state the system must reach,
 plus the anti-attractor states it must NOT converge to). A cold
-adversarial codex reviewer signs off on **both** before exit. Pass
-`--skip-attractor` to produce only the main spec.
+adversarial codex reviewer signs off on **both** before exit. There is no
+main-spec-only option: `spec_gen.dot` has no skip branch (`review_main`
+success always proceeds to `plan_attractor`).
 
 1. Run **Step 0** (below): classify greenfield vs brownfield. Mandatory.
    The classification output feeds the goal/context string passed to the pipeline.
@@ -70,7 +71,7 @@ adversarial codex reviewer signs off on **both** before exit. Pass
    codex-signed-off `spec.md` for the consistency check. Both phases
    must sign off before exit. The pipeline produces a reviewed `spec.md`
    AND a reviewed `attractor_spec.md` without running any implement
-   node. Pass `--skip-attractor` to short-circuit the attractor phase.
+   node.
 
 ### Review mode (`/fs --review [spec_path]`)
 
@@ -81,6 +82,15 @@ adversarial codex reviewer signs off on **both** before exit. Pass
    (a PR, a passing named test, a deleted path — not "improve X").
 3. Report findings with line references and a verdict: `ready` or
    `needs-changes` with the specific gaps. Do **not** run a pipeline.
+
+### Attractor review mode (`/fs --review-attractor <path>`)
+
+1. Read the attractor spec at `<path>` and its sibling `spec.md`.
+2. Check, line-by-line: the stable end state is stated as an observable,
+   checkable condition; anti-attractor states (wrong end states the system
+   must NOT converge to) are listed; nothing contradicts the main spec.
+3. Report findings with line references and a verdict (`ready` /
+   `needs-changes`), same as review mode. Do **not** run a pipeline.
 
 ### Show mode (`/fs --show`)
 
