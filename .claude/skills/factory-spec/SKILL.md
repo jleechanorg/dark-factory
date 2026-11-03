@@ -50,8 +50,12 @@ success always proceeds to `plan_attractor`).
 
    ```bash
    export PATH="$HOME/.local/bin:$PATH"
-   dark-factory --pipeline slim/spec_gen.dot --goal "<Step-0 context + description>"
+   dark-factory --pipeline slim/spec_gen.dot --goal "<Step-0 context + description>" \
+     --backend <backend> --cxdb ~/.dark-factory/cxdb.sqlite
    ```
+
+   Pick `<backend>` per `/f` Step 0b; `--cxdb` lets the Healer cluster
+   failures across runs.
 
    The pipeline runs:
 
@@ -99,7 +103,7 @@ writes, no run.
 
 ## Proof block (create mode, binary-backed)
 
-The default graph must preserve these nodes or their generated equivalents:
+The `spec_gen.dot` graph contains:
 main spec plan, independent cold review, bounded main-spec fix loop,
 attractor-spec plan, independent cold review, bounded attractor fix loop,
 and exit. An in-Claude prose-only workflow that claims a spec run without a
@@ -115,7 +119,8 @@ PATH="$HOME/.local/bin:$PATH" \
 dark-factory \
   --pipeline slim/spec_gen.dot \
   --goal "<echo of $ARGUMENTS>" \
-  [--backend <backend>] [--cxdb ~/.dark-factory/cxdb.sqlite]   # only if actually passed
+  --backend <backend> \
+  --cxdb ~/.dark-factory/cxdb.sqlite
 # Run ID: <id>
 # CXDB SHA: <sha>
 # Final outcome: <success|failure|exhausted|error>
