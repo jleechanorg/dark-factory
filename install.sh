@@ -389,9 +389,10 @@ if [[ "${LINK}" -eq 1 ]]; then
   echo "==> linked ${LOCAL_BIN}/df-funnel-lanes"
 fi
 
-# Mirror repo-scope commands + skills to user-scope (~/.claude/) so /f /fs
-# /factory /factory-spec /fr /factory-review and the dark-factory /
-# factory-spec / factory-review skills resolve from any cwd. The repo is
+# Mirror repo-scope commands + skills to user-scope (~/.claude/) so /f /f-pr
+# /fs /factory /factory-spec /fr /factory-review and the dark-factory /
+# factory-spec / factory-review / reviewer-calibration / auto-factory skills
+# resolve from any cwd (each skill directory, sub-files included). The repo is
 # the single source of truth — any drift in ~/.claude/ is overwritten on
 # re-run. Pass --no-cmds to skip.
 if [[ "${CMDS}" -eq 1 ]]; then
@@ -412,11 +413,11 @@ if [[ "${CMDS}" -eq 1 ]]; then
     fi
   done
 
-  # 2 factory skills — directory symlinks (cp -R would break on next run).
+  # Factory skills — directory symlinks (cp -R would break on next run).
   # Existing regular directories are backed up to <dst>.bak.<unix-ts> so the
   # operator can recover user-scope edits; subsequent runs replace the symlink
   # cleanly with `ln -sfn`.
-  for skill in dark-factory factory-spec factory-review; do
+  for skill in dark-factory factory-spec factory-review reviewer-calibration auto-factory; do
     src="${RUNTIME_ROOT}/.claude/skills/${skill}"
     dst="${CLAUDE_DIR}/skills/${skill}"
     if [[ ! -d "${src}" ]]; then
