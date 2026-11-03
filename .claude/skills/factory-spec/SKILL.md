@@ -153,7 +153,7 @@ evidence envelope — same reasoning as `/f`.
 
 When `--pipeline` is omitted, `/f` and `/factory` default to `two_node` (`pipelines/slim/two_node.dot`). To opt into a non-default pipeline, pass explicit `--pipeline <name>`.
 `/fs` create mode runs `pipelines/slim/spec_gen.dot`. The short-name table is
-the `dark-factory` skill's **Pipelines** section; the full decision guide is
+the `dark-factory` skill's `pipelines.md`; the full decision guide is
 `$DARK_FACTORY_HOME/docs/pipeline-selection.md`.
 
 **Repo-specific pipelines (target-repo subdir convention):** graphs that

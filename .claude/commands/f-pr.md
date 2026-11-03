@@ -10,7 +10,8 @@ aliases: [pr-f, f-on-pr, factory-pr]
 Explicit PR-mode entry point for the dark-factory binary-first contract —
 skips the `/f` auto-route and always runs PR-mode. Read
 `.claude/skills/dark-factory/SKILL.md` (this repo; installed as
-`~/.claude/skills/dark-factory/SKILL.md`) and execute its `/f-pr` section:
+`~/.claude/skills/dark-factory/SKILL.md`) and execute its `/f-pr` section, which loads
+`pr-mode.md` from the same directory:
 PR-number resolution, PR-context reasoning (not a deterministic rule
 table), pipeline/backend selection, and the shared proof-block output
 contract.

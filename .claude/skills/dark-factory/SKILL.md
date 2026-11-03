@@ -7,40 +7,28 @@ description: "Run the Dark Factory DOT pipeline runner against a goal. Slash com
 
 ## Purpose
 
-Run a goal through the Dark Factory `.dot` pipeline runner. The runner is the
-Python implementation of StrongDM's Attractor pattern (cf. brynary/attractor,
-strongdm/attractor).
-
-Versus `/h` / `/goal_harness`:
-
-| Aspect | `/h` (goal_harness) | `/factory` (this skill) |
-|--------|---------------------|-------------------------|
-| Engine | Claude session dispatches subagents | **`dark-factory` binary** (uv install) |
-| Artifact | Skill prose + tool calls | `.dot` graphviz file |
-| Recording | Conversation transcript | SQLite CXDB row-per-step |
-| Holdouts | Adversarial subagent reads diff | Sealed repo agent never sees |
-| Reuse | Tied to this session | Replayable from `.dot` alone |
-| Cost | High (multi-agent context) | Low (one CLI per node) |
-
-Use `/factory` when you want the goal_harness idea as a reproducible external
-pipeline; use `/h` when you want an interactive in-session loop.
+Run a goal through the Dark Factory `.dot` pipeline runner, the Python
+implementation of StrongDM's Attractor pattern (cf. brynary/attractor,
+strongdm/attractor). Use `/factory` for a reproducible external pipeline and
+`/h` for an interactive in-session loop
+([goal-harness-comparison.md](goal-harness-comparison.md)).
 
 ## Entry points
 
 | Command | Behavior |
 |---------|----------|
-| `/f` | Full loop, auto-routes PR-mode vs feature-mode (Step 0a below) |
-| `/factory` | Alias for `/f`, identical behavior |
-| `/df` | User-scope alias for `/f`, identical behavior |
+| `/f` | Full loop, auto-routes PR-mode vs feature-mode (Step 0a) |
+| `/factory`, `/df` (user scope) | Aliases for `/f`, identical behavior |
 | `/f-pr` | Explicit PR-mode entry point (skips auto-route, always PR-mode) |
 
-This skill file is the single source of truth for the binary-first contract;
-the command files only load it. Run `/fs` (the `factory-spec` skill,
+The user types `/f $ARGUMENTS` (or an alias); parse args per **Arg parsing**
+and run the steps below. This skill file is the single source of truth for the
+binary-first contract; the command files only load it. Run `/fs` (the `factory-spec` skill,
 `pipelines/slim/spec_gen.dot`) first when the goal needs a spec.
 
 **What "binary-first" bans**: an in-Claude prose-only workflow that claims a
 factory run without a logged binary invocation is not a valid run — see
-**Honesty rules** below. The default `two_node` graph guarantees a worker, a
+**Honesty rules**. The default `two_node` graph guarantees a worker, a
 fresh Codex reviewer on an isolated runner-minted snapshot, and a bounded fix
 loop (`max_visits=3`). It has no spec producer, no evidence gates, and no exit
 summary; pass `--pipeline gates`, `minimal_feature`, or `pr_gates` when the run
@@ -55,38 +43,20 @@ needs evidence gates.
   `~/projects/dark-factory-holdouts/` (agent must NEVER read), which is not
   Snap's `Snapchat/dark_factory_holdback`. Pushed:
   `https://github.com/jleechanorg/dark-factory` + `dark-factory-holdouts`.
+- To add a sealed-holdout feature, follow [adding-a-feature.md](adding-a-feature.md).
 
 ## Pipelines
 
-`--pipeline` takes a short name from this table or a `.dot` path. The runner
+`--pipeline` takes a short name or a `.dot` path; with no `--pipeline` the
+runner runs the default `two_node` (`pipelines/slim/two_node.dot`). The runner
 does not expand short names (`runner/paths.py::resolve_pipeline_path`), so the
-skill passes the path. A custom `--pipeline` always wins; `/f` never falls
-through silently to another graph. Full decision guide:
-`$DARK_FACTORY_HOME/docs/pipeline-selection.md`. Any other `.dot` under
-`$DARK_FACTORY_HOME/pipelines/` runs by path.
-
-| Short name | Path | Flow | When to use |
-|------------|------|------|-------------|
-| **`two_node`** ⭐ default | `pipelines/slim/two_node.dot` | worker → fresh Codex reviewer → exit | Default when no `--pipeline` is passed. The reviewer is a fresh fully tooled `codex exec --ephemeral --yolo` process in a detached worktree at the pin minted after the worker's last visit (agent-config files quarantined, never the live workdir); on failure only typed `{path, claim, required_fix}` findings reach the worker, never the raw response. |
-| `two_node_holdout` | `pipelines/slim/two_node_holdout.dot` | worker → fresh Codex reviewer → holdout → exit | Two-node plus behavioral holdouts (opt-in) |
-| `hello` | `pipelines/factory/hello.dot` | plan → implement → holdout → fix-loop → exit | New feature with a holdout scenario; wiring smoke with `--backend echo` |
-| `gates` | `pipelines/factory/gates.dot` | holdout → skeptic → adversarial reviewer → /es → /er → /code_standards → web advice → exit; failures loop fix → holdout | Validate an already-implemented diff (holdout defaults to `hello`; `--feature` overrides) |
-| `pr_gates` | `pipelines/factory/pr_gates.dot` | same flow as `gates` | Validate an in-flight PR diff (holdout from `--feature <name>`) |
-| `minimal_feature` | `pipelines/slim/minimal_feature.dot` | explore → plan → implement → test → review → holdout → gates → exit | Full production pipeline from scratch with a holdout |
-| `minimal_pr` | `pipelines/slim/minimal_pr.dot` | explore → plan → implement → test → review → holdout → gates → exit | In-flight PR iteration with `--state slim.test_command=...` (requires `--feature <name>`) |
-| `ready` | `pipelines/slim/ready.dot` | test → /es → /er → /advice → holdout → fix (max 3) | PR `/ready` enforcement + fix iteration |
-| `bug_fix` | `pipelines/bug_fix.dot` | reproduce → red gate → fix → green gate → holdout → evidence | Bug fix with red/green discipline |
-| `spec_gen` | `pipelines/slim/spec_gen.dot` | explore → plan_main → review_main (fix loop) → plan_attractor → review_attractor (fix loop) → exit | Reviewed main + attractor specs (the `/fs` pipeline) |
-| `minimal_research` | `pipelines/slim/minimal_research.dot` | explore fanout → research → /er → exit; failures loop fix → research | Research report only |
-| `review_slim` | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer | Spec review (slim) |
-| `review_full` | `benchmarks/attractor-spec-review/pipelines/review_full.dot` | review_slim + fullstack smoke | Spec review with stack smoke |
-| `level5_feature` | `pipelines/factory/level5_feature.dot` | full reference pipeline | Level-5 reference pipeline with hard-tier gates |
-| **no pipeline** | — | — | No pipeline fits the inspected PR: see **Honesty rules**; do not force an inapplicable holdout pipeline |
-
-### How to invoke this skill
-
-The user types `/f $ARGUMENTS` (or `/factory $ARGUMENTS`). Parse args per
-**Arg parsing** and run the steps below.
+skill maps each short name to its path from [pipelines.md](pipelines.md), which
+lists every short name, path, flow, and when to use it. A custom `--pipeline`
+always wins; `/f` never falls through silently to another graph. Full decision
+guide: `$DARK_FACTORY_HOME/docs/pipeline-selection.md`. Any other `.dot` under
+`$DARK_FACTORY_HOME/pipelines/` runs by path. When no pipeline fits the
+inspected PR, see **Honesty rules**; never force an inapplicable holdout
+pipeline.
 
 ### Step 0a — Auto-route PR-mode vs feature-mode (applies to `/f` and `/factory`; `/f-pr` skips this and forces PR-mode)
 
@@ -105,43 +75,9 @@ Reasoning (LLM, not rules):
 
 ### `/f-pr` — explicit PR-mode entry point
 
-`/f-pr` skips Step 0a and always runs PR-mode. Use the LLM to **read the
-PR's actual context and pick the right pipeline** — this is a reasoning
-task, not a deterministic rule table (no `if is_draft then X`, no
-`if labels contains 'bug' then bug_fix.dot`, no keyword-routing).
-
-1. **Resolve the PR number**: from `$ARGUMENTS` if present, else
-   `gh pr list --head "$(git rev-parse --abbrev-ref HEAD)" --json number --jq '.[0].number'`,
-   else ask the user.
-2. **Read PR context as facts, not routing rules**:
-   ```bash
-   gh pr view <N> --json number,title,state,isDraft,additions,deletions,changedFiles,baseRefName,headRefName,body,files,labels
-   gh pr view <N> --json statusCheckRollup
-   gh pr diff <N> --name-only
-   gh pr view <N> --comments   # optional
-   ls specs/ roadmap*/ docs/design/ 2>/dev/null   # optional
-   ```
-3. **Reason about**: what kind of work this is (new feature / bug fix /
-   refactor / docs / test-only / infra — from diff+body+files, never
-   pre-bucketed by label alone); whether a spec already covers the
-   change (if not, see **Honesty rules** on `/fs`); holdout eligibility
-   (see **Honesty rules** on `--feature`); and what evidence mix (`/es` + `/er` +
-   `/code_standards` minimum, `holdout_eval` for behavior-grade) the
-   pipeline needs to deliver without over-running.
-4. Execute only after needed preparation is complete and a pipeline
-   actually fits: pick the pipeline from **Pipelines** above
-   using that reasoning, pick the backend (`echo` for wiring smoke;
-   `claude` unless the PR's reviewer queue or `gate_er` priority queue
-   says otherwise), then construct, show, and run the command — same
-   shape as Step 2 below, run from the PR's target repo.
-5. Report the outcome per **Output contract** below.
-
-`/f-pr` honesty rules (in addition to the shared ones under **Honesty
-rules**): the `gate_er` priority queue (default `codex > minimax > agy >
-claude-sonnet`; a node's `backend_priority` attribute, then
-`DARK_FACTORY_ADVERSARIAL_PRIORITY`, overrides it) still resolves the reviewer even when `--backend claude`
-was passed for the run itself — passing `--backend claude` does not mean
-`gate_er` uses claude by default.
+`/f-pr` skips Step 0a and always runs PR-mode: read and follow
+[pr-mode.md](pr-mode.md) (PR resolution, context reasoning, pipeline and
+backend choice, and its extra honesty rule).
 
 ### Step 0b — Backend
 
@@ -157,30 +93,14 @@ proof block; when `--backend` was explicit, note the override.
 
 ### Arg parsing
 
-Honor these flags inside `$ARGUMENTS`. Every runner flag below appears in
-`dark-factory --help`; rows marked *skill convention* are parsed by this skill
-and never passed to the runner.
-
-| Flag | Meaning | Skill convention |
-|------|---------|------------------|
-| `--pipeline <name>` | Graph to run | Short name from **Pipelines** (mapped to its path) or a `.dot` path; omit for `two_node` |
-| `--goal <text>` | Goal text | Whatever is left after flag parsing; mutually exclusive with `--target` |
-| `--target <locator>` / `--target-intent <text>` | Review a resolved target (`PR 811`, path, SHA) instead of a goal | Use for review-only runs; the run refuses to start if the locator does not resolve |
-| `--feature <name>` | Holdout feature for `holdout_eval` nodes | Holdout name; see **Honesty rules** |
-| `--backend echo\|claude\|codex\|ao\|agy` | LLM backend for codergen nodes | Skill default: always passed explicitly (Step 0b). `echo` is a cost-free wiring smoke |
-| `--cxdb <path>` | CXDB SQLite step log | Skill default: always pass `~/.dark-factory/cxdb.sqlite` so the Healer clusters across runs |
-| `--max-steps <N>` | Step budget (default 100) | — |
-| `--state KEY=VALUE` | Pre-seed `ctx.state`; repeatable | e.g. `--state slim.test_command="pytest tests/..."` in PR loops |
-| `--preflight` | Validate the pipeline, print diagnostics, exit | — |
-| `--resume <checkpoint>` | Resume from a checkpoint file | — |
-| `--evidence-bundle <dir>` | Per-run evidence bundle (default `evidence/<run-id>`) | — |
-| `--events <path>` | JSONL structured event log | — |
-| `--workdir <dir>` | Implementation workdir (default cwd) | — |
-| `--require-holdouts` | Fail fast when the feature has no `scenarios.yaml` | — |
-| `--allow-live-pr-target` / `--allow-push` | Run on a branch with an open PR / let codergen nodes `git push` | Both default off; pass only when the task authorizes it |
-| `--reviewer-calibration=true\|false` | — | *Skill convention*, default on (**Reviewer calibration**) |
-
-Whatever is left after flag parsing is the **goal description**.
+Honor the flags in `$ARGUMENTS` per [arguments.md](arguments.md); every runner
+flag there appears in `dark-factory --help`. Skill conventions: always pass
+`--backend` (Step 0b) and `--cxdb ~/.dark-factory/cxdb.sqlite` (so the Healer
+clusters across runs); `--feature` follows **Honesty rules**;
+`--allow-live-pr-target` and `--allow-push` stay off unless the task authorizes
+them; `--reviewer-calibration=true|false` is parsed by this skill, never passed
+to the runner, and defaults on (**Reviewer calibration**). Whatever is left
+after flag parsing is the **goal description**.
 
 ### Steps
 
@@ -224,7 +144,7 @@ because its exports do not survive between shell calls.
 2. **Run the pipeline** from the **target repo** (implementation workdir = cwd).
    Pipelines and prompts resolve from `$DARK_FACTORY_HOME`; code changes land in cwd:
    ```bash
-   cd "<TARGET_REPO>"   # e.g. the product repo being built
+   cd "<TARGET_REPO>"
    dark-factory \
      --pipeline pipelines/<PATH_TO_DOT>.dot \
      --goal "<GOAL>" \
@@ -234,18 +154,17 @@ because its exports do not survive between shell calls.
      --state <KEY>=<VALUE>
    ```
 
-3. **Surface the verdict**. The last line of stdout is a JSON summary with
-   `final_outcome`, `pipeline`, `goal`, `steps`, `trace`. Report:
-   - Pipeline name + final outcome
-   - Per-node trace (one line each: `node  outcome  preview`)
-   - Exit code of the runner
+3. **Surface the verdict**. The last stdout line is a JSON summary
+   (`final_outcome`, `pipeline`, `goal`, `steps`, `trace`). Report the pipeline
+   name and final outcome, the per-node trace (one `node  outcome  preview`
+   line each), and the runner's exit code.
 
 4. **Run the Healer** (only if `final_outcome != "success"`):
    ```bash
    df-healer --cxdb <CXDB_PATH>
    ```
-   Render the resulting markdown table inline. Each row is a failure cluster
-   with a prescription template the user can act on.
+   Render its markdown table inline: one failure cluster per row, each with
+   an actionable prescription template.
 
 5. **Sealed holdouts reminder**. If the run included a `holdout_eval` node,
    remind the user that you (and any subagent) did NOT see the sealed
@@ -283,15 +202,12 @@ comparison belongs to the `reviewer-calibration` skill.
 
 ## Output contract
 
-When a pipeline ran, end the `/f`/`/factory` invocation with this proof block
-(missing any required line means the run is unproven and must be reported as
-such). When no pipeline ran because a prerequisite was unmet or no applicable
-pipeline fits, report the unmet prerequisite or no-fitting-pipeline limitation
-and return to the parent task without fabricated run metadata (no fabricated
-run ID, exit code, or review verdict), preserving authorized parent
-continuation.
-
-For executed pipeline runs, provide this proof block:
+When no pipeline ran because a prerequisite was unmet or no applicable
+pipeline fits, report that limitation and return to the parent task without
+fabricated run metadata (no fabricated run ID, exit code, or review verdict),
+preserving authorized parent continuation. When a pipeline ran, end the
+invocation with this proof block; a missing required line means the run is
+unproven and must be reported as such:
 
 ```bash
 # CLI backend: <backend> (source: <explicit --backend|wrapper|ANTHROPIC_BASE_URL|parent process|default>)
@@ -316,18 +232,6 @@ dark-factory \
 ```
 
 Plus the per-node trace and, on failure, the Healer report.
-
-## Adding a new feature
-
-To add a new sealed-holdout feature `foo`:
-
-1. Write `$DARK_FACTORY_HOME/specs/foo.md` (agent-visible).
-2. Write `$DARK_FACTORY_HOME/prompts/foo/{plan,implement,fix}.md`.
-3. Write `~/projects/dark-factory-holdouts/holdouts/foo/scenarios.yaml`
-   in the sealed repo (the implementing agent must never read this).
-4. Either reuse `pipelines/factory/hello.dot` (which is feature-agnostic) by
-   passing `--feature foo`, or write `pipelines/factory/foo.dot` with custom
-   nodes.
 
 ## Verdicts
 
@@ -368,8 +272,8 @@ To add a new sealed-holdout feature `foo`:
   more specific exists — confirm its directory too.
 - If `--backend echo` was used, label the run as a wiring smoke, not a real
   validation.
-- If `--reviewer-calibration=false` is passed, quote the explicit opt-out reason and do not imply raw-Codex-vs-
-  subagent quality was measured.
+- If `--reviewer-calibration=false` is passed, quote the explicit opt-out
+  reason and do not imply raw-Codex-vs-subagent quality was measured.
 - Do not claim a factory run based on an in-Claude workflow, `Skill()` call,
   or prose summary. The only valid proof is an actual `dark-factory` binary
   invocation plus the proof block above.
