@@ -7,12 +7,13 @@ description: "Dark Factory two-phase spec workflow (/factory-spec, /fs): create 
 
 ## Install vs source
 
-Dark Factory runs via the **`dark-factory` binary**, not `python -m runner` from
-a raw checkout:
+Dark Factory runs via the **`dark-factory` binary** on PATH, not
+`python -m runner` from a raw checkout. Run its repo's `install.sh` once; the
+binary resolves its own home, so never export a literal `DARK_FACTORY_HOME`
+(an explicit value overrides that resolution). Setup and runner location are
+owned by the `dark-factory` skill (**Repos**, Step 1):
 
 ```bash
-~/projects/dark-factory/install.sh
-export DARK_FACTORY_HOME=~/projects/dark-factory
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
@@ -21,9 +22,6 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Pipelines and prompts resolve from `$DARK_FACTORY_HOME`; implementation work
 happens in the caller's cwd (`--workdir` defaults to cwd).
-
-This block is the **canonical install/setup copy** — the command files
-(`factory-spec.md`, `fs.md`) point here; do not maintain divergent copies.
 
 ## Modes — what `/fs` / `/factory-spec` execute
 
@@ -50,7 +48,6 @@ adversarial codex reviewer signs off on **both** before exit. Pass
 4. Run the spec-generation pipeline from the target project's cwd:
 
    ```bash
-   export DARK_FACTORY_HOME=~/projects/dark-factory
    export PATH="$HOME/.local/bin:$PATH"
    dark-factory --pipeline slim/spec_gen.dot --goal "<Step-0 context + description>"
    ```
@@ -103,16 +100,12 @@ required line means the run is unproven:
 
 ```bash
 # Literal command run:
-cd /Users/jleechan/projects/<target-repo>
-DARK_FACTORY_HOME=~/projects/dark-factory \
-DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts \
+cd "<TARGET_REPO>"
 PATH="$HOME/.local/bin:$PATH" \
 dark-factory \
-  --pipeline pipelines/slim/spec_gen.dot \
+  --pipeline slim/spec_gen.dot \
   --goal "<echo of $ARGUMENTS>" \
-  --backend <backend> \
-  --feature <feature> \
-  --cxdb ~/.dark-factory/cxdb.sqlite
+  [--backend <backend>] [--cxdb ~/.dark-factory/cxdb.sqlite]   # only if actually passed
 # Run ID: <id>
 # CXDB SHA: <sha>
 # Final outcome: <success|failure|exhausted|error>
@@ -123,7 +116,9 @@ dark-factory \
 ```
 
 Honesty rules:
-- Quote the **actual** `dark-factory` command run — no paraphrasing.
+- Quote the **actual** `dark-factory` command run — no paraphrasing. The
+  step-4 command is complete; `spec_gen.dot` has no holdout node, so
+  `--feature` and `DARK_FACTORY_HOLDOUTS` are not needed.
 - If the binary run fails, surface the trace and stop; don't assume "we can
   fix the spec later" without feeding the full review output into the next
   fix loop.
@@ -136,45 +131,24 @@ Honesty rules:
   are in-session helpers, not binary runs — they do not emit this proof
   block and must not be reported as a factory run.
 
-**Why binary-first is the default**: the user's 2026-06-27 clarification
-requires default binary invocation. Claude/workflow logic may build a
-dynamic DOT graph behind the binary, but the durable proof remains the DOT
-graph, CXDB, logs, and evidence envelope — same reasoning as `/f`.
+**Why binary-first**: the durable proof is the DOT graph, CXDB, logs, and
+evidence envelope — same reasoning as `/f`.
 
 ## Pipeline selection (mandatory before `/f` or `/factory`)
 
 When `--pipeline` is omitted, `/f` and `/factory` default to `two_node` (`pipelines/slim/two_node.dot`). To opt into a non-default pipeline, pass explicit `--pipeline <name>`.
-
-| Task | Pipeline |
-|------|----------|
-| **Default `/f` / `/factory` invocation** | `pipelines/slim/two_node.dot` (generic worker + controller cold reviewer) |
-| **Create a reviewed spec (main + attractor)** | `pipelines/slim/spec_gen.dot` ← `/fs` create mode (default) |
-| **Create only the main spec** | `pipelines/slim/spec_gen.dot` ← `/fs --skip-attractor` |
-| Smoke / wiring | `pipelines/factory/hello.dot` |
-| New feature (full loop) | `pipelines/slim/minimal_feature.dot` |
-| PR iteration (research + holdout) | `pipelines/slim/minimal_pr.dot` |
-| Validate diff + holdout | `pipelines/factory/gates.dot` |
-| PR gates only | `pipelines/factory/pr_gates.dot` |
-| Spec review slim (legacy attractor) | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` |
-| Spec review full (legacy attractor) | `benchmarks/attractor-spec-review/pipelines/review_full.dot` |
-| Brownfield replace/delete | custom goal + delete-first rules; often `minimal_feature.dot` or custom `.dot` |
-
-Short names for `--pipeline`: `two_node`, `spec_gen`, `gates`, `hello`, `pr_gates`,
-`minimal_pr`, `minimal_feature`, `review_slim`, `review_full`.
+`/fs` create mode runs `pipelines/slim/spec_gen.dot`. The short-name table is
+the `dark-factory` skill's **Pipelines** section; the full decision guide is
+`$DARK_FACTORY_HOME/docs/pipeline-selection.md`.
 
 **Repo-specific pipelines (target-repo subdir convention):** graphs that
 hardcode the target repo's own slash commands or repo-specific review
 lanes belong at `<target_repo>/dark-factory/pipelines/<name>.dot`, not
-in `~/projects/dark-factory/pipelines/`. The runner resolves bare
-filenames against `<workdir>/dark-factory/pipelines/` **before** falling
-through to `$DARK_FACTORY_HOME/pipelines/`, so an operator in the target
-repo can pass `--pipeline my_repo_lane.dot` and the runner finds it
-locally.
-
-**When `--pipeline` is omitted,** `/f` and `/factory` use the canonical
-`pipelines/slim/two_node.dot` default. A repo-specific graph is an explicit
-opt-in: pass its name with `--pipeline`; the runner resolves that name against
-`<workdir>/dark-factory/pipelines/` before `$DARK_FACTORY_HOME/pipelines/`.
+in `$DARK_FACTORY_HOME/pipelines/`. They are an explicit opt-in: the runner
+resolves a bare filename against `<workdir>/dark-factory/pipelines/`
+**before** falling through to `$DARK_FACTORY_HOME/pipelines/`, so an operator
+in the target repo can pass `--pipeline my_repo_lane.dot` and the runner finds
+it locally.
 
 Execution command (from target repo cwd):
 

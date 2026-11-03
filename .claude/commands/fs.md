@@ -1,5 +1,5 @@
 ---
-description: "/fs — generate main + attractor specs with codex cold review. DEFAULT: invoke the real dark-factory binary against spec_gen or a binary-owned dynamic spec graph, then echo proof metadata."
+description: "/fs — generate main + attractor specs with codex cold review. DEFAULT: invoke the real dark-factory binary against spec_gen, then echo proof metadata."
 type: skill
 execution_mode: immediate
 aliases: [fs]
@@ -22,7 +22,6 @@ off by an independent cold codex review before exit.
 ```text
 /fs <spec description>                  # DEFAULT: binary spec_gen run (main + attractor)
 /fs --pipeline spec_gen <description>   # explicit static binary pipeline
-/fs --dynamic-graph <description>       # binary-owned dynamic spec graph
 /fs --skip-attractor <description>      # main spec only, still binary-first
 /fs --review <spec_path>                # review an existing main spec
 /fs --review-attractor <path>           # review an existing attractor spec
