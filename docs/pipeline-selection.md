@@ -19,7 +19,7 @@ the default two-node graph does not select that contract.
 
 | Task | Pipeline | Notes |
 |------|----------|-------|
-| **Default `/f` / `/factory` invocation** | **`pipelines/slim/two_node.dot`** | Generic worker + fresh fully tooled Codex reviewer + verbatim feedback loop. The user-stated default since 2026-08-02. |
+| **Default `/f` / `/factory` invocation** | **`pipelines/slim/two_node.dot`** | Generic worker + fresh fully tooled Codex reviewer on an isolated snapshot + typed-findings fix loop. The user-stated default since 2026-08-02. |
 | Two-node with holdouts (opt-in) | `pipelines/slim/two_node_holdout.dot` | Optional opt-in: generic worker + fresh Codex reviewer + behavioral holdout eval. Does not alter the default `/f` / `/factory` pipeline. |
 | Wiring smoke / install verify | `pipelines/factory/hello.dot` | `--backend echo`; explore → plan → implement → holdout → fix (max 3) → exit |
 | New feature, full production loop | `pipelines/slim/minimal_feature.dot` | explore → plan → test → review → holdout → gates |
@@ -27,8 +27,8 @@ the default two-node graph does not select that contract.
 | In-flight PR iteration | `pipelines/slim/minimal_pr.dot` | explore → research → plan → … → review → holdout → gates; set `--state slim.test_command=...`; requires `$DARK_FACTORY_HOLDOUTS` |
 | PR `/ready` enforcement + fix iteration | `pipelines/slim/ready.dot` | test → /es → /er → /advice → holdout → fix (max 3 visits); enforces all /ready gates |
 | Bug fix with red/green discipline | `pipelines/bug_fix.dot` | reproduce (fresh test) → red gate → fix → green gate → holdout → adversarial evidence; max 3 fix visits |
-| Validate diff + sealed holdout | `pipelines/factory/gates.dot` | code already implemented (no fix loop; explore rollout intentionally skipped — see PR for rationale) |
-| Validate in-flight PR | `pipelines/factory/pr_gates.dot` | holdout + evidence gates (no fix loop) |
+| Validate diff + sealed holdout | `pipelines/factory/gates.dot` | code already implemented (failures loop fix → holdout; explore rollout intentionally skipped — see PR for rationale) |
+| Validate in-flight PR | `pipelines/factory/pr_gates.dot` | holdout + evidence gates (failures loop fix → holdout) |
 | Spec review (line-aware, slim) | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer |
 | Spec review (+ stack smoke) | `benchmarks/attractor-spec-review/pipelines/review_full.dot` | adds fullstack smoke |
 | Produce a reviewed spec only (no implementation) | `pipelines/slim/spec_gen.dot` | explore → plan → cold spec review → fix loop; no implement node; rejects specs with parallel lanes lacking a file-ownership matrix |
@@ -68,7 +68,8 @@ Current bounds:
 | Pipeline | fix node | max_visits |
 |----------|----------|------------|
 | `pipelines/factory/hello.dot` | `fix` | `3` |
-| `pipelines/factory/gates.dot` | n/a (no fix loop) | n/a |
+| `pipelines/factory/gates.dot` | `fix` | `3` |
+| `pipelines/factory/pr_gates.dot` | `fix` | `3` |
 | `pipelines/slim/minimal_feature.dot` | `fix` | `3` |
 | `pipelines/slim/minimal_pr.dot` | `fix` | `3` |
 | `pipelines/slim/ready.dot` | `fix` | `3` |

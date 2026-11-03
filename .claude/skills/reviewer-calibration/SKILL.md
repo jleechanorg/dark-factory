@@ -109,26 +109,24 @@ result.
 
 ## Finding Schema
 
-Each reviewer should return JSON plus free-form text:
+Each controller lane returns exactly one JSON object with these keys; the
+controller rejects missing or extra keys (`runner/review_controller.py`):
 
 ```json
 {
-  "reviewer": "<controller backend>",
-  "target_head_sha": "...",
-  "verdict": "blockers|no_blockers|inconclusive",
-  "findings": [
-    {
-      "severity": "blocker|major|minor",
-      "claim": "...",
-      "file": "...",
-      "line": 123,
-      "evidence": "...",
-      "repro_or_reason": "..."
-    }
-  ],
-  "confidence": "high|medium|low"
+  "verdict": "pass|fail",
+  "findings": ["<non-empty string>"],
+  "evidence_checked": ["<non-empty string>"],
+  "commands_executed": [],
+  "caveats": ["<non-empty string>"]
 }
 ```
+
+`pass` requires empty `findings` and `caveats`, non-empty `evidence_checked`,
+and `commands_executed: []` on the tool-free lane. A lane whose receipt fails
+the checks above is `inconclusive`. Reviewer identity, head SHA, and any
+per-finding file, line, or severity the adjudicator assigns belong in
+`comparison.json`, not in the response.
 
 ## Adjudication
 
