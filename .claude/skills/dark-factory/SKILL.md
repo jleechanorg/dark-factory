@@ -1,9 +1,9 @@
 ---
 name: dark-factory
-description: "Run the Dark Factory DOT pipeline runner against a goal. Slash command: /factory. Implements StrongDM's Attractor pattern as an external Python runner — .dot files are the versioned artifact, sealed holdouts live in a separate repo, every step is recorded to CXDB, and the Healer clusters failures into diagnoses. Use when you want the goal_harness idea executed as a reproducible external pipeline instead of in-Claude subagent dispatch."
+description: "Run the Dark Factory DOT pipeline runner against a goal. Slash command: /f (aliases /factory, /df, /f-pr). Implements StrongDM's Attractor pattern as an external Python runner — .dot files are the versioned artifact, sealed holdouts live in a separate repo, every step is recorded to CXDB, and the Healer clusters failures into diagnoses. Use when you want the goal_harness idea executed as a reproducible external pipeline instead of in-Claude subagent dispatch."
 ---
 
-# /factory — Dark Factory Pipeline Runner
+# /f — Dark Factory Pipeline Runner
 
 ## Purpose
 
@@ -31,13 +31,12 @@ pipeline; use `/h` when you want an interactive in-session loop.
 |---------|----------|
 | `/f` | Full loop, auto-routes PR-mode vs feature-mode (Step 0a below) |
 | `/factory` | Alias for `/f`, identical behavior |
+| `/df` | User-scope alias for `/f`, identical behavior |
 | `/f-pr` | Explicit PR-mode entry point (skips auto-route, always PR-mode) |
-| `/fs` | Spec-generation entry point; runs `pipelines/slim/spec_gen.dot` — run this first when the goal needs a spec |
 
 This skill file is the single source of truth for the binary-first contract;
-`.claude/commands/f.md` is the canonical command entry point, with `/factory`
-and `/f-pr` as thin aliases so auto-detect behavior stays identical across
-entry points.
+the command files only load it. Run `/fs` (the `factory-spec` skill,
+`pipelines/slim/spec_gen.dot`) first when the goal needs a spec.
 
 **What "binary-first" bans**: an in-Claude prose-only workflow that claims a
 factory run without a logged binary invocation is not a valid run — see
