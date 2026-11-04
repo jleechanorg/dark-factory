@@ -294,9 +294,9 @@ def main(argv: list[str] | None = None) -> int:
                 "Pipeline `.dot` to run. Defaults to the slim two-node graph "
                 "(`two_node.dot`) — a generic worker + fresh Codex "
                 "reviewer — which is the standing rule for /f and /factory "
-                "invocations (set 2026-08-02). Pass a short name (e.g. "
-                "`gates`, `minimal_feature`, `bug_fix`) or an absolute path "
-                "to opt into a richer pipeline."
+                "invocations (set 2026-08-02). Pass a `.dot` filename or "
+                "path (e.g. `gates.dot`, `slim/minimal_feature.dot`) to opt "
+                "into a richer pipeline; bare short names are not expanded."
             ),
         )
         p.add_argument("--goal")

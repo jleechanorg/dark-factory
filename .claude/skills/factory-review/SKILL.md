@@ -32,7 +32,7 @@ node with the worker node removed.
 ## Prerequisite
 
 `dark-factory` on PATH (`./install.sh` once; see
-`.claude/skills/dark-factory/SKILL.md`'s "Steps" §1-2 for the
+`.claude/skills/dark-factory/SKILL.md`'s "Steps" §1 for the
 `resolve_dark_factory_home` helper — reuse it verbatim here).
 
 ## Step 1 — resolve what to review (`--target`)
@@ -72,7 +72,7 @@ do not try to steer the verdict.
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
-resolve_dark_factory_home || exit 1   # from dark-factory/SKILL.md Step 1-2
+resolve_dark_factory_home || exit 1   # from dark-factory/SKILL.md Step 1
 dark-factory \
   --pipeline pipelines/slim/review_only.dot \
   --target "$TARGET" \
