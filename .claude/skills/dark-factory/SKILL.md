@@ -70,14 +70,14 @@ echo "$ARGUMENTS"
 
 Reasoning (LLM, not rules):
 - **No open PR** → feature-mode (new work).
-- **Open PR exists** AND goal relates to it → PR-mode (drive the existing PR to green).
+- **Open PR exists** AND goal relates to it → PR-mode (drive the existing PR to
+  green): read and follow [pr-mode.md](pr-mode.md).
 - **Open PR exists** AND the goal does not relate to it → see **Honesty rules** (mode ambiguity).
 
 ### `/f-pr` — explicit PR-mode entry point
 
 `/f-pr` skips Step 0a and always runs PR-mode: read and follow
-[pr-mode.md](pr-mode.md) (PR resolution, context reasoning, pipeline and
-backend choice, and its extra honesty rule).
+[pr-mode.md](pr-mode.md) (PR resolution, context reasoning, pipeline choice).
 
 ### Step 0b — Backend
 
@@ -199,6 +199,11 @@ base SHA, and the reviewed tree SHA; hashing `controller-receipt.json` gives the
 Artifacts: `evidence/<run-id>/reviewer-calibration/`. The in-graph `two_node`
 reviewer (`codex exec --yolo`) is not this read-only controller; A/B reviewer
 comparison belongs to the `reviewer-calibration` skill.
+
+The `gate_er` priority queue (default `codex > minimax > agy > claude-sonnet`;
+a node's `backend_priority` attribute, then `DARK_FACTORY_ADVERSARIAL_PRIORITY`,
+overrides it) resolves that node's reviewer in every run; passing `--backend
+claude` for the run itself does not change how `gate_er` resolves its reviewer.
 
 ## Output contract
 

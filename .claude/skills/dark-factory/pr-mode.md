@@ -1,8 +1,9 @@
 <!-- On-demand detail for .claude/skills/dark-factory/SKILL.md (/f). -->
 
-# `/f-pr` — explicit PR-mode entry point
+# PR-mode (`/f-pr`, or `/f`/`/factory` auto-routed by Step 0a)
 
-`/f-pr` skips Step 0a and always runs PR-mode. Use the LLM to **read the
+`/f-pr` skips Step 0a and always runs PR-mode; `/f` and `/factory` reach it
+when Step 0a finds an open PR the goal relates to. Use the LLM to **read the
 PR's actual context and pick the right pipeline** — this is a reasoning
 task, not a deterministic rule table (no `if is_draft then X`, no
 `if labels contains 'bug' then bug_fix.dot`, no keyword-routing).
@@ -27,15 +28,9 @@ task, not a deterministic rule table (no `if is_draft then X`, no
    pipeline needs to deliver without over-running.
 4. Execute only after needed preparation is complete and a pipeline
    actually fits: pick the pipeline from SKILL.md **Pipelines**
-   using that reasoning, pick the backend (`echo` for wiring smoke;
-   `claude` unless the PR's reviewer queue or `gate_er` priority queue
-   says otherwise), then construct, show, and run the command — same
-   shape as SKILL.md Step 2, run from the PR's target repo.
+   using that reasoning, pick `--backend` per SKILL.md Step 0b (`echo`
+   only for a wiring smoke; the `gate_er` reviewer is resolved separately,
+   see SKILL.md **Reviewer calibration**), then construct, show, and run
+   the command — same shape as SKILL.md Step 2, run from the PR's target
+   repo.
 5. Report the outcome per SKILL.md **Output contract**.
-
-`/f-pr` honesty rules (in addition to the shared ones under SKILL.md **Honesty
-rules**): the `gate_er` priority queue (default `codex > minimax > agy >
-claude-sonnet`; a node's `backend_priority` attribute, then
-`DARK_FACTORY_ADVERSARIAL_PRIORITY`, overrides it) still resolves the reviewer even when `--backend claude`
-was passed for the run itself — passing `--backend claude` does not mean
-`gate_er` uses claude by default.
