@@ -38,10 +38,9 @@ needs evidence gates.
 
 - The runner is `$DARK_FACTORY_HOME`, the repo root of the `dark-factory` binary
   on PATH (Step 1 resolves it); never guess it, and an empty `ls` of a guessed
-  path proves nothing. The other `$HOME/Snapchat/Dev/*dark*factory*` directories
-  (worktrees, run archives, clones) are not the runner. Sealed holdouts stay at
-  `~/projects/dark-factory-holdouts/` (agent must NEVER read), which is not
-  Snap's `Snapchat/dark_factory_holdback`. Pushed:
+  path proves nothing. Other dark-factory directories (worktrees, run archives,
+  clones) are not the runner. Sealed holdouts stay at
+  `~/projects/dark-factory-holdouts/` (agent must NEVER read). Pushed:
   `https://github.com/jleechanorg/dark-factory` + `dark-factory-holdouts`.
 - To add a sealed-holdout feature, follow [adding-a-feature.md](adding-a-feature.md).
 
@@ -192,8 +191,8 @@ dispatch against a read-only workdir, response validation, and
 `controller-receipt.json`; it exits 0 pass, 2 fail, 1 invalid. A valid PASS needs
 non-empty `evidence_checked` and `commands_executed: []`. Never author reviewer
 instructions, inline prompts, or pass vendor CLI flags. Each lane's controller
-receipt digest binds the prompt SHA-256, envelope SHA-256, task, diff,
-changed-files and evidence-manifest SHA-256, response SHA-256, the head and
+receipt digest binds the prompt SHA-256, envelope SHA-256, task,
+changed-files and evidence-manifest SHA-256 (no diff digest; the tree SHA commits to the change), response SHA-256, the head and
 base SHA, and the reviewed tree SHA; hashing `controller-receipt.json` gives the receipt digest.
 `prompt.txt` is a binary-emitted audit capture, not an authority file; the static
 `prompts/catalog/controller_cold_review_v1.md` is bound by its SHA-256 of the controller receipt.

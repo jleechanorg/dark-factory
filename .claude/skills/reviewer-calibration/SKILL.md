@@ -34,7 +34,7 @@ Create a task file containing only the untrusted PR/work-item text. Determine:
 - output directory for each backend lane
 
 Do not create reviewer instructions. The controller constructs and binds the
-diff, changed files, task snapshot, evidence metadata, static prompt, and exact
+changed files, task snapshot, evidence metadata, static prompt, and exact
 response contract.
 
 ## Controller command
@@ -96,7 +96,7 @@ receipt digest are authoritative.
 Before using a lane, require `controller-receipt.json` to bind:
 
 - controller prompt ID and prompt SHA-256;
-- envelope SHA-256 and task/diff snapshot digests;
+- envelope SHA-256 and task snapshot digest (no diff digest; the tree SHA commits to the change);
 - exact base SHA and head SHA;
 - backend identity, exit status, and response SHA-256.
 
