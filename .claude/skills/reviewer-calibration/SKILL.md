@@ -26,7 +26,7 @@ Create a task file containing only the untrusted PR/work-item text. Determine:
 - `target_pr` or `work_item`
 - `head_sha`
 - `base_sha`
-- `diff_path` or embedded diff hash
+- `diff_path` or embedded diff hash (operator record only; not a receipt binding)
 - PR body / task text snapshot
 - evidence artifact paths and hashes
 - test log paths and hashes
