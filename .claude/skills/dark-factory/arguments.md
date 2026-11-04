@@ -10,7 +10,7 @@ left after flag parsing is the goal description.
 |------|---------|------------------|
 | `--pipeline <name>` | Graph to run | Short name from [pipelines.md](pipelines.md) (mapped to its path) or a `.dot` path; omit for `two_node` |
 | `--goal <text>` | Goal text | Whatever is left after flag parsing; mutually exclusive with `--target` |
-| `--target <locator>` / `--target-intent <text>` | Review a resolved target (`PR 811`, path, SHA) instead of a goal | Use for review-only runs; the run refuses to start if the locator does not resolve |
+| `--target <locator>` / `--target-intent <text>` | Review a resolved target (`PR 811`, path, SHA) instead of a goal | Pins the resolved locator into run state; the run refuses to start if it does not resolve. The default `two_node` graph does not yet route reviewer-first on it |
 | `--feature <name>` | Holdout feature for `holdout_eval` nodes | Holdout name; see SKILL.md **Honesty rules** |
 | `--backend echo\|claude\|codex\|ao\|agy` | LLM backend for codergen nodes | Skill default: always passed explicitly (SKILL.md Step 0b). `echo` is a cost-free wiring smoke |
 | `--cxdb <path>` | CXDB SQLite step log | Skill default: always pass `~/.dark-factory/cxdb.sqlite` so the Healer clusters across runs |

@@ -9,8 +9,8 @@ description: "Dark Factory two-phase spec workflow (/factory-spec, /fs): create 
 
 Dark Factory runs via the **`dark-factory` binary** on PATH, not
 `python -m runner` from a raw checkout. Run its repo's `install.sh` once; the
-binary resolves its own home, so never export a literal `DARK_FACTORY_HOME`
-(an explicit value overrides that resolution). Setup and runner location are
+installer and binary set `DARK_FACTORY_HOME` themselves, so never hand-export a
+guessed path (an explicit value overrides that resolution). Setup and runner location are
 owned by the `dark-factory` skill (**Repos**, Step 1):
 
 ```bash

@@ -155,7 +155,7 @@ because its exports do not survive between shell calls.
      --state <KEY>=<VALUE>
    ```
 
-3. **Surface the verdict**. The last stdout line is a JSON summary
+3. **Surface the verdict**. stdout ends with an indented JSON summary (parse it whole)
    (`final_outcome`, `pipeline`, `goal`, `steps`, `trace`). Report the pipeline
    name and final outcome, the per-node trace (one `node  outcome  preview`
    line each), and the runner's exit code.
@@ -198,15 +198,15 @@ base SHA, and the reviewed tree SHA; hashing `controller-receipt.json` gives the
 `prompt.txt` is a binary-emitted audit capture, not an authority file; the static
 `prompts/catalog/controller_cold_review_v1.md` is bound by its SHA-256 of the controller receipt.
 Artifacts: `evidence/<run-id>/reviewer-calibration/`. The in-graph `two_node`
-reviewer (`codex exec --yolo`) is not this read-only controller; A/B reviewer
-comparison belongs to the `reviewer-calibration` skill.
+reviewer (`codex exec --yolo`) is not this read-only controller. Every calibration
+run also follows `reviewer-calibration` (`comparison.json`, `adjudication.md`, and
+its underperformance-claim rule).
 
 A `gate_er` node with a `backend_priority` attribute resolves its reviewer from
 the priority queue (default `codex > minimax > agy > claude-sonnet`;
 `DARK_FACTORY_ADVERSARIAL_PRIORITY` overrides the node's list), so run-level
 `--backend` does not pick that reviewer. A node with an explicit `backend` uses
-it; a node with neither follows run-level `--backend`
-(`runner/handler_dispatch.py`).
+it; a node with neither follows run-level `--backend`.
 
 ## Output contract
 
