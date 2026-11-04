@@ -23,7 +23,7 @@ the default two-node graph does not select that contract.
 | Two-node with holdouts (opt-in) | `pipelines/slim/two_node_holdout.dot` | Optional opt-in: generic worker + fresh Codex reviewer + behavioral holdout eval. Does not alter the default `/f` / `/factory` pipeline. |
 | Wiring smoke / install verify | `pipelines/factory/hello.dot` | `--backend echo`; explore → plan → implement → holdout → fix (max 3) → exit |
 | New feature, full production loop | `pipelines/slim/minimal_feature.dot` | explore → plan → test → review → holdout → gates |
-| New feature, minimal loop | `pipelines/factory/hello.dot` | plan → implement → holdout → fix |
+| New feature, minimal loop | `pipelines/factory/hello.dot` | explore → plan → implement → holdout → fix |
 | In-flight PR iteration | `pipelines/slim/minimal_pr.dot` | explore → research → plan → … → review → holdout → gates; set `--state slim.test_command=...`; requires `$DARK_FACTORY_HOLDOUTS` |
 | PR `/ready` enforcement + fix iteration | `pipelines/slim/ready.dot` | test → /es → /er → /advice → holdout → fix (max 3 visits); enforces all /ready gates |
 | Bug fix with red/green discipline | `pipelines/bug_fix.dot` | reproduce (fresh test) → red gate → fix → green gate → holdout → adversarial evidence; max 3 fix visits |
@@ -31,7 +31,7 @@ the default two-node graph does not select that contract.
 | Validate in-flight PR | `pipelines/factory/pr_gates.dot` | holdout + evidence gates (failures loop fix → holdout) |
 | Spec review (line-aware, slim) | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer |
 | Spec review (+ stack smoke) | `benchmarks/attractor-spec-review/pipelines/review_full.dot` | adds fullstack smoke |
-| Produce a reviewed spec only (no implementation) | `pipelines/slim/spec_gen.dot` | explore → plan → cold spec review → fix loop; no implement node; rejects specs with parallel lanes lacking a file-ownership matrix |
+| Produce a reviewed spec only (no implementation) | `pipelines/slim/spec_gen.dot` | explore → plan_main → review_main (fix loop) → plan_attractor → review_attractor (fix loop) → exit; no implement node; rejects specs with parallel lanes lacking a file-ownership matrix |
 | Research report only (no implementation) | `pipelines/slim/minimal_research.dot` | explore fanout → research → exit; writes `.dark-factory/research-findings.md`; no implement node |
 | Brownfield replace / delete | **custom goal + often `minimal_feature.dot` or custom `.dot`** | apply factory-spec delete-first rules; never treat as greenfield additive |
 | Repo-specific pipeline (in the target repo itself) | `<target_repo>/dark-factory/pipelines/<name>.dot` | dark-factory's runner looks up `--pipeline <name>` (bare filename only) under `<workdir>/dark-factory/pipelines/` **before** delegating to `resolve_factory_path(<name>)`, which itself checks cwd → `$DARK_FACTORY_HOME/<name>`. Use this for graphs that hardcode the target repo's slash commands (e.g. worldarchitect's `pr_gates_split_cs.dot` uses `/zfc`, `/zfclevel`, `/thermo`). The `<workdir>/dark-factory/pipelines/` lookup is the target-repo subdir convention; see `runner/paths.py::resolve_pipeline_path` for the canonical order. |
@@ -142,12 +142,11 @@ rationale and what to copy when authoring a new benchmark.
 Always use the installed binary from the **target repo** cwd:
 
 ```bash
-export PATH="$HOME/.local/bin:$PATH"
-export DARK_FACTORY_HOME=~/projects/dark-factory
+export PATH="$HOME/.local/bin:$PATH"   # dark-factory resolves its own home; do not export DARK_FACTORY_HOME
 export DARK_FACTORY_HOLDOUTS=~/projects/dark-factory-holdouts
 
 cd /path/to/target-repo
 dark-factory --pipeline pipelines/slim/minimal_pr.dot --goal "..." --backend claude
 ```
 
-Pipelines and prompts resolve from `$DARK_FACTORY_HOME`; code changes land in cwd.
+Pipelines and prompts resolve from `$DARK_FACTORY_HOME` (the binary's repo root); code changes land in cwd.
