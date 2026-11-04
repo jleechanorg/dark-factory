@@ -630,3 +630,5 @@ Dark Factory stands on the shoulders of groundbreaking work in agentic software 
 ---
 
 *“The pipeline definitions encode the development process itself. Rebuild the code, polish the dorodango, but keep the graph.”*
+
+<!-- baseline CI probe: environment check for skill-compaction PR 856; no code change -->
