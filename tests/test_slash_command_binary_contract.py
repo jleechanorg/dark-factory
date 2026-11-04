@@ -538,3 +538,14 @@ def test_df_healer_preflight_warn_replaces_or_adds_backend_arg(tmp_path: pathlib
     calls = _read_fake_runner_calls(call_log)
     healer_calls = [call for call in calls if call[:2] == ["-m", "runner.healer"]]
     assert healer_calls[0][2:] == ["--backend", "echo"]
+
+
+def test_short_aliases_have_single_owner() -> None:
+    """`/fs` and `/df` are advertised by the dark-factory skill; each must have exactly one owner."""
+    owners: dict[str, list[str]] = {}
+    for cmd in sorted((ROOT / ".claude" / "commands").glob("*.md")):
+        m = re.search(r"^aliases:\s*\[(.*?)\]", cmd.read_text(encoding="utf-8"), re.M)
+        for alias in (a.strip() for a in (m.group(1).split(",") if m else []) if a.strip()):
+            owners.setdefault(alias, []).append(cmd.name)
+    assert owners.get("fs") == ["fs.md"]
+    assert owners.get("df") == ["factory.md"]

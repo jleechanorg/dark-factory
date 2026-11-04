@@ -22,17 +22,17 @@ the default two-node graph does not select that contract.
 | **Default `/f` / `/factory` invocation** | **`pipelines/slim/two_node.dot`** | Generic worker + fresh fully tooled Codex reviewer on an isolated snapshot + typed-findings fix loop. The user-stated default since 2026-08-02. |
 | Two-node with holdouts (opt-in) | `pipelines/slim/two_node_holdout.dot` | Optional opt-in: generic worker + fresh Codex reviewer + behavioral holdout eval. Does not alter the default `/f` / `/factory` pipeline. |
 | Wiring smoke / install verify | `pipelines/factory/hello.dot` | `--backend echo`; explore → plan → implement → holdout → fix (max 3) → exit |
-| New feature, full production loop | `pipelines/slim/minimal_feature.dot` | explore → plan → test → review → holdout → gates |
+| New feature, full production loop | `pipelines/slim/minimal_feature.dot` | explore → plan → implement → test → review → holdout → /es → /er (`gate_er`) → exit |
 | New feature, minimal loop | `pipelines/factory/hello.dot` | explore → plan → implement → holdout → fix |
 | In-flight PR iteration | `pipelines/slim/minimal_pr.dot` | explore → research → plan → … → review → holdout → gates; set `--state slim.test_command=...`; requires `$DARK_FACTORY_HOLDOUTS` |
 | PR `/ready` enforcement + fix iteration | `pipelines/slim/ready.dot` | test → /es → /er → /advice → holdout → fix (max 3 visits); enforces all /ready gates |
-| Bug fix with red/green discipline | `pipelines/bug_fix.dot` | reproduce (fresh test) → red gate → fix → green gate → holdout → adversarial evidence; max 3 fix visits |
+| Bug fix with red/green discipline | `pipelines/bug_fix.dot` | explore → plan → reproduce (fresh test) → red gate → fix → green gate → holdout → adversarial evidence (`gate_er`); max 3 fix visits |
 | Validate diff + sealed holdout | `pipelines/factory/gates.dot` | code already implemented (failures loop fix → holdout; explore rollout intentionally skipped — see PR for rationale) |
 | Validate in-flight PR | `pipelines/factory/pr_gates.dot` | holdout + evidence gates (failures loop fix → holdout) |
 | Spec review (line-aware, slim) | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer |
 | Spec review (+ stack smoke) | `benchmarks/attractor-spec-review/pipelines/review_full.dot` | adds fullstack smoke |
 | Produce a reviewed spec only (no implementation) | `pipelines/slim/spec_gen.dot` | explore → plan_main → review_main (fix loop) → plan_attractor → review_attractor (fix loop) → exit; no implement node; rejects specs with parallel lanes lacking a file-ownership matrix |
-| Research report only (no implementation) | `pipelines/slim/minimal_research.dot` | explore fanout → research → exit; writes `.dark-factory/research-findings.md`; no implement node |
+| Research report only (no implementation) | `pipelines/slim/minimal_research.dot` | explore fanout → research → /er (`gate_er`) → exit; writes `.dark-factory/research-findings.md`; no implement node |
 | Brownfield replace / delete | **custom goal + often `minimal_feature.dot` or custom `.dot`** | apply factory-spec delete-first rules; never treat as greenfield additive |
 | Repo-specific pipeline (in the target repo itself) | `<target_repo>/dark-factory/pipelines/<name>.dot` | dark-factory's runner looks up `--pipeline <name>` (bare filename only) under `<workdir>/dark-factory/pipelines/` **before** delegating to `resolve_factory_path(<name>)`, which itself checks cwd → `$DARK_FACTORY_HOME/<name>`. Use this for graphs that hardcode the target repo's slash commands (e.g. worldarchitect's `pr_gates_split_cs.dot` uses `/zfc`, `/zfclevel`, `/thermo`). The `<workdir>/dark-factory/pipelines/` lookup is the target-repo subdir convention; see `runner/paths.py::resolve_pipeline_path` for the canonical order. |
 
@@ -130,8 +130,8 @@ plan→implement→verify→fix loops, one per sprint), while `amazon-clone` use
 a `slice × parallel × fix` shape (multiple disjoint slice graphs that can
 be dispatched concurrently, each with its own fix loop). The two shapes are
 **intentional and benchmark-owned**, not a canonical contract that needs
-harmonization. See [docs/benchmark-shape.md](benchmark-shape.md) for the
-rationale and what to copy when authoring a new benchmark.
+harmonization. When authoring a new benchmark, copy the shape of an existing
+pipeline under `benchmarks/`.
 
 ## Short names (expanded by skill)
 

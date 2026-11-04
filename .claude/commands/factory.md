@@ -2,6 +2,7 @@
 description: "/factory — alias for /f; auto-routes to PR-mode when a PR is open, otherwise feature-mode"
 type: skill
 execution_mode: immediate
+aliases: [df]
 ---
 
 # /factory — alias for /f

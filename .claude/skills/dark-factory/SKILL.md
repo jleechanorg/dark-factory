@@ -83,7 +83,8 @@ Reasoning (LLM, not rules):
 
 Always pass `--backend`. Precedence: explicit flag > invoking `~/.bashrc`
 wrapper > `ANTHROPIC_BASE_URL` > parent process name > `claude`. A wrapper
-(`clauded`, `claude`, `codex`, `agy`) exports `BASH_FUNC_<wrapper>%%`; read it
+exports `BASH_FUNC_<wrapper>%%`; check `clauded`, `agy`, `codex`, `claude` in
+that order and take the first one set. Read it
 with `printenv 'BASH_FUNC_<wrapper>%%'`, because `%%` breaks `${X:-default}` and
 `${!key}` expansion (`clauded` maps to `claude`, the others to themselves).
 `ANTHROPIC_BASE_URL`: `*anthropic.com*` → `claude`, `*openai.com*` → `codex`.
@@ -200,10 +201,12 @@ Artifacts: `evidence/<run-id>/reviewer-calibration/`. The in-graph `two_node`
 reviewer (`codex exec --yolo`) is not this read-only controller; A/B reviewer
 comparison belongs to the `reviewer-calibration` skill.
 
-The `gate_er` priority queue (default `codex > minimax > agy > claude-sonnet`;
-a node's `backend_priority` attribute, then `DARK_FACTORY_ADVERSARIAL_PRIORITY`,
-overrides it) resolves that node's reviewer in every run; passing `--backend
-claude` for the run itself does not change how `gate_er` resolves its reviewer.
+A `gate_er` node with a `backend_priority` attribute resolves its reviewer from
+the priority queue (default `codex > minimax > agy > claude-sonnet`;
+`DARK_FACTORY_ADVERSARIAL_PRIORITY` overrides the node's list), so run-level
+`--backend` does not pick that reviewer. A node with an explicit `backend` uses
+it; a node with neither follows run-level `--backend`
+(`runner/handler_dispatch.py`).
 
 ## Output contract
 

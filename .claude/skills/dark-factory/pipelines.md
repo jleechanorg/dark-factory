@@ -14,11 +14,11 @@ names. With no `--pipeline` the runner runs `two_node`.
 | `pr_gates` | `pipelines/factory/pr_gates.dot` | same flow as `gates` | Validate an in-flight PR diff (holdout from `--feature <name>`) |
 | `minimal_feature` | `pipelines/slim/minimal_feature.dot` | explore → plan → implement → test → review → holdout → /es → /er → exit; failures loop fix → test | Full production pipeline from scratch with a holdout |
 | `minimal_pr` | `pipelines/slim/minimal_pr.dot` | explore → research → plan → implement → test → review → holdout → /es → /er → web advice → exit; failures loop fix → test | In-flight PR iteration with `--state slim.test_command=...` (requires `--feature <name>`) |
-| `ready` | `pipelines/slim/ready.dot` | test → /es → /er → /advice → holdout → fix (max 3) | PR `/ready` enforcement + fix iteration |
-| `bug_fix` | `pipelines/bug_fix.dot` | reproduce → red gate → fix → green gate → holdout → evidence | Bug fix with red/green discipline |
+| `ready` | `pipelines/slim/ready.dot` | test → /es → /er → /advice → holdout → exit; any failure → fix (max 3) → test | PR `/ready` enforcement + fix iteration |
+| `bug_fix` | `pipelines/bug_fix.dot` | explore → plan → reproduce → red gate (fail → explore) → fix (max 3) → green gate → holdout → evidence (`gate_er`) → exit | Bug fix with red/green discipline |
 | `spec_gen` | `pipelines/slim/spec_gen.dot` | explore → plan_main → review_main (fix loop) → plan_attractor → review_attractor (fix loop) → exit | Reviewed main + attractor specs (the `/fs` pipeline) |
 | `minimal_research` | `pipelines/slim/minimal_research.dot` | explore fanout → research → /er → exit; failures loop fix → research | Research report only |
-| `review_slim` | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | acceptance + codex reviewer | Spec review (slim) |
-| `review_full` | `benchmarks/attractor-spec-review/pipelines/review_full.dot` | review_slim + fullstack smoke | Spec review with stack smoke |
+| `review_slim` | `benchmarks/attractor-spec-review/pipelines/review_slim.dot` | plan → implement → acceptance → review → exit; failures → fix → implement | Spec review (slim) |
+| `review_full` | `benchmarks/attractor-spec-review/pipelines/review_full.dot` | plan → implement → acceptance → stack_smoke → review → exit; failures → fix → implement | Spec review with stack smoke |
 | `level5_feature` | `pipelines/factory/level5_feature.dot` | full reference pipeline | Level-5 reference pipeline with hard-tier gates |
 | **no pipeline** | — | — | No pipeline fits the inspected PR: see SKILL.md **Honesty rules**; do not force an inapplicable holdout pipeline |
