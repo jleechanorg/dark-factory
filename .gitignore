@@ -75,3 +75,7 @@ test.db
 # exhausts retries. Not canonical history; regenerate per run.
 failed_run_log*.txt
 branch_fail_step_*
+
+# Raw agent run transcripts (PII: emails, local user paths; publication risk) - keep out of git
+evidence/*/events.jsonl
+evidence/*/node_io.jsonl
