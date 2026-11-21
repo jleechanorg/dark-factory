@@ -337,7 +337,12 @@ pr_green_apply_required_contract() {
 }
 
 pr_green_fetch_live_state() {
-  local url="$1" payload
+  local url="$1" payload diagnostics="${2:-}" phase="${3:-inspection}" helper
+  if [[ -n "$diagnostics" ]]; then
+    helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+    python3 "$helper/pr-inspection.py" --inspect "$url" "$diagnostics" "$helper/outcome-accounting.sh" "$phase"
+    return
+  fi
   payload="$(gh pr view "$url" --json headRefOid,mergeable,mergeStateStatus,statusCheckRollup,baseRefName,headRepository 2>/dev/null)" || return 1
   pr_green_state_from_pr_json <<<"$payload"
 }

@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=../../jobs/jleechanorg-pr-green/session-reuse.sh
 source "$ROOT/jobs/jleechanorg-pr-green/session-reuse.sh"
+pr_green_session_mode() { printf '%s\n' tui; }
 
 fixture_dir="$(mktemp -d)"
 live_pid=''
@@ -75,6 +76,7 @@ curl() {
   printf '%s\n' '{"status":"ok"}'
 }
 
+pr_green_tmux_socket_for_handle() { printf "default\n"; }
 tmux() {
   case "$1 $2" in
     "list-panes -t") printf '%s\n' "$live_pid" ;;
