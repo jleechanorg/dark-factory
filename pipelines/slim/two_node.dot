@@ -11,7 +11,7 @@
 //
 // Backend routing:
 //   - worker          honors the run-level --backend (the coder tier the user
-//                     chose; default = whatever /f's Step 0.5 detector picks).
+//                     chose; default = whatever /f's Step 0b detector picks).
 //   - cold_reviewer   always launches a fresh Codex CLI session.
 //
 // Reviewer identity and findings relay (typed targets / ungambeable reviewer,

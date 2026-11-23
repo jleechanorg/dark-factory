@@ -16,7 +16,6 @@ truth. Identical workflow to `/fs`; this is an alternate entry point name.
 /factory-spec <spec description>          # create mode — runs spec_gen (main + attractor)
 /factory-spec --review <spec_path>        # in-session review of an existing main spec
 /factory-spec --review-attractor <path>   # in-session review of an existing attractor spec
-/factory-spec --skip-attractor <desc>     # create mode but skip the attractor phase
 /factory-spec --show                      # show pipeline graphs (read-only reference)
 ```
 

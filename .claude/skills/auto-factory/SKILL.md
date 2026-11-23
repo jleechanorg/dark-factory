@@ -337,6 +337,9 @@ result (cooldown handling is unchanged from the original 7-gate design).
 - NEVER keyword-route — routing is model judgment (ZFC).
 - NEVER await coder subagents inside the tick — spawn parallel, in background.
 - NEVER push to a new `factory/*` branch when the bead body has drive-existing-pr fields — push to the existing branch.
+- NEVER default the target to a hardcoded repository or match a same-number issue/PR in another repository — resolve the exact repository from the supplied issue/PR URL or the current repository.
+- NEVER claim adoption because a daemon is running — require target-specific telemetry, worker metadata naming the exact repository, issue/PR, runtime and agent, or PR activity.
+- NEVER fall back to direct AO/Codex/Claude dispatch outside `/af` during an `/af` run when the factory cannot route the target repository — record a precise routing blocker against the target artifact and report `BLOCKED`.
 
 ## Failure modes & recovery
 
